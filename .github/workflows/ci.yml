@@ -1,0 +1,48 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      # macroquad/miniquad system libs (Linux only; Win/mac need none)
+      - if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev libx11-dev libxi-dev libgl1-mesa-dev
+      - run: cargo build --workspace
+      - run: cargo test --workspace
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo fmt --check
+
+  platform-quarantine:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # DESIGN.md §4.7: cfg(target_os)/cfg(windows|unix) only in ra-client/src/platform/
+      - name: platform cfg quarantine
+        run: |
+          hits=$(grep -rnE 'cfg\((target_os|windows|unix)' \
+            --include='*.rs' \
+            ra-formats ra-data ra-sim ra-net \
+            $(find ra-client/src -maxdepth 1 -name '*.rs') \
+            2>/dev/null || true)
+          if [ -n "$hits" ]; then
+            echo "Platform-specific cfg outside ra-client/src/platform/ (DESIGN.md §4.7):"
+            echo "$hits"
+            exit 1
+          fi

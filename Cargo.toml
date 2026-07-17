@@ -1,0 +1,20 @@
+[workspace]
+resolver = "2"
+members = [
+    "ra-formats",
+    "ra-data",
+    "ra-sim",
+    "ra-client",
+    "ra-net",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+publish = false
+
+[workspace.lints.clippy]
+# Guard against accidental floating point creeping into the deterministic core.
+# (Applied crate-by-crate via `[lints] workspace = true`; ra-sim additionally
+# denies float arithmetic at the crate root, see ra-sim/src/lib.rs.)

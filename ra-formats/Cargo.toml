@@ -1,0 +1,19 @@
+[package]
+name = "ra-formats"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+description = "Pure parsers for Command & Conquer: Red Alert data formats (MIX/SHP/PAL). No game knowledge, no I/O policy, fuzzable."
+
+# No external dependencies by design: these are pure byte-slice parsers and a
+# small self-contained crypto stack (Westwood public-key + Blowfish), so the
+# crate stays trivially auditable and fuzzable.
+[dependencies]
+
+[[bin]]
+name = "radump"
+path = "src/bin/radump.rs"
+
+[dev-dependencies]
+proptest = "1.11.0"
