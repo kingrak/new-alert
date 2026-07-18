@@ -15,12 +15,14 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use ra_data::house::{identity_remap, RemapTable};
 use ra_formats::tmpl::ICON_WIDTH;
-use ra_sim::coords::{CellCoord, WorldCoord, LEPTONS_PER_CELL};
-use ra_sim::{Handle, Passability, World};
+use ra_sim::coords::{CellCoord, Facing, WorldCoord, LEPTONS_PER_CELL};
+use ra_sim::{Handle, Passability, Target, World};
 
 use crate::compositor::{viewport_rgba, IndexedImage, Palette, RgbaImage};
 use crate::input::{InputEvent, Key, MouseButton, Rect};
-use crate::unit_render::{draw_rect_outline, draw_sprite_centered, UnitSprite};
+use crate::unit_render::{
+    draw_health_bar, draw_rect_outline, draw_sprite_centered, fill_rect, UnitSprite,
+};
 
 /// Sim commands the UI emits. Re-exported from the sim so the whole app speaks
 /// one command vocabulary (DESIGN.md §4.4).
@@ -225,7 +227,7 @@ impl AppCore {
                         cur: (x, y),
                     })
                 }
-                MouseButton::Right => self.issue_move(x, y),
+                MouseButton::Right => self.issue_order(x, y),
             },
             InputEvent::MouseUp { button, x, y } => {
                 if button == MouseButton::Left {
@@ -397,18 +399,42 @@ impl AppCore {
             let sx = (map_px as i64 - viewport.x) as i32;
             let sy = (map_py as i64 - viewport.y) as i32;
 
+            let remap = self
+                .remaps
+                .get(unit.house as usize)
+                .copied()
+                .unwrap_or_else(identity_remap);
+
             if let Some(sprite) = self.sprites.get(unit.type_id as usize) {
+                // Body sprite.
                 if let Some(sframe) = sprite.frame_for(unit.facing) {
-                    let remap = self
-                        .remaps
-                        .get(unit.house as usize)
-                        .copied()
-                        .unwrap_or_else(identity_remap);
                     draw_sprite_centered(frame, sx, sy, sframe, &remap, &self.palette);
+                }
+                // Turret overlay (turreted vehicles whose SHP has turret frames).
+                if unit.has_turret {
+                    if let Some(tframe) = sprite.turret_frame_for(unit.turret_facing) {
+                        draw_sprite_centered(frame, sx, sy, tframe, &remap, &self.palette);
+                    }
                 }
             }
 
-            if self.selected.contains(&h.index) {
+            // Muzzle flash: a brief bright spot at the barrel tip the tick(s)
+            // right after a shot (arm just reset to ROF). Covers hitscan
+            // weapons whose bullet never persists in the arena.
+            if let Some(w) = &unit.weapon {
+                if unit.has_target() && unit.arm + 2 >= w.rof && unit.arm != 0 {
+                    let aim = if unit.has_turret {
+                        unit.turret_facing
+                    } else {
+                        unit.facing
+                    };
+                    let (fx, fy) = offset_pixels(sx, sy, aim, CELL_PIXELS / 2);
+                    fill_rect(frame, fx - 1, fy - 1, fx + 1, fy + 1, [255, 230, 120]);
+                }
+            }
+
+            let selected = self.selected.contains(&h.index);
+            if selected {
                 let half = CELL_PIXELS / 2;
                 draw_rect_outline(
                     frame,
@@ -419,6 +445,35 @@ impl AppCore {
                     SELECT_RGB,
                 );
             }
+            // Health bar on selected or damaged units.
+            if selected || unit.health < unit.max_health {
+                draw_health_bar(
+                    frame,
+                    sx,
+                    sy - CELL_PIXELS / 2 - 4,
+                    CELL_PIXELS,
+                    unit.health_permille(),
+                );
+            }
+        }
+
+        self.draw_bullets(frame, viewport);
+    }
+
+    /// Draw projectiles in flight as short bright tracers. Invisible/hitscan
+    /// projectiles are represented by the muzzle flash instead, so they are
+    /// skipped here.
+    fn draw_bullets(&self, frame: &mut RgbaImage, viewport: Rect) {
+        for (_h, b) in self.world.bullets.iter() {
+            if b.invisible {
+                continue;
+            }
+            let px = (leptons_to_pixel(b.pos.x.0) as i64 - viewport.x) as i32;
+            let py = (leptons_to_pixel(b.pos.y.0) as i64 - viewport.y) as i32;
+            // Small tracer: a couple of pixels back along the flight direction.
+            let (tx, ty) = offset_pixels(px, py, Facing(b.facing.0.wrapping_add(128)), 4);
+            draw_line(frame, tx, ty, px, py, [255, 240, 160]);
+            fill_rect(frame, px - 1, py - 1, px + 1, py + 1, [255, 255, 200]);
         }
     }
 
@@ -465,17 +520,17 @@ impl AppCore {
         }
     }
 
-    /// Issue a move order for every selected unit toward the clicked cell.
-    fn issue_move(&mut self, x: i32, y: i32) {
+    /// Right-click order: if the click lands on an **enemy** unit, every
+    /// selected owned unit attacks it; otherwise it is a move to the clicked
+    /// cell. Ownership: you cannot attack your own units (ground force-fire is
+    /// deferred — the task's simplification). Emits `Command::Attack` or
+    /// `Command::Move` through the deterministic pipeline.
+    fn issue_order(&mut self, x: i32, y: i32) {
         if self.selected.is_empty() {
             return;
         }
         let (mx, my) = self.viewport_to_map(x, y);
-        let dest = CellCoord::new(
-            (mx / CELL_PIXELS as i64) as i32,
-            (my / CELL_PIXELS as i64) as i32,
-        );
-        // Collect live selected handles first (borrow discipline).
+        // Collect live selected handles + houses first (borrow discipline).
         let orders: Vec<(Handle, u8)> = self
             .world
             .units
@@ -484,11 +539,70 @@ impl AppCore {
             .filter(|h| self.selected.contains(&h.index))
             .filter_map(|h| self.world.units.get(h).map(|u| (h, u.house)))
             .collect();
-        for (unit, house) in orders {
-            let cmd = Command::Move { unit, dest, house };
-            self.pending.push(cmd);
-            self.emitted.push(cmd);
+        if orders.is_empty() {
+            return;
         }
+        // The controlling house is that of the selected units (single-house
+        // player). A click on a unit of a different house is an attack order.
+        let player_house = orders[0].1;
+        let picked = self.unit_at_map(mx, my);
+        let enemy = picked.and_then(|h| {
+            self.world
+                .units
+                .get(h)
+                .filter(|u| u.house != player_house)
+                .map(|_| h)
+        });
+
+        if let Some(target) = enemy {
+            for (unit, house) in orders {
+                // Only armed units get an attack order; unarmed selected units
+                // are simply left idle (the sim also rejects unarmed attackers).
+                let armed = self
+                    .world
+                    .units
+                    .get(unit)
+                    .map(|u| u.weapon.is_some())
+                    .unwrap_or(false);
+                if !armed {
+                    continue;
+                }
+                let cmd = Command::Attack {
+                    unit,
+                    target: Target::Unit(target),
+                    house,
+                };
+                self.pending.push(cmd);
+                self.emitted.push(cmd);
+            }
+        } else {
+            let dest = CellCoord::new(
+                (mx / CELL_PIXELS as i64) as i32,
+                (my / CELL_PIXELS as i64) as i32,
+            );
+            for (unit, house) in orders {
+                let cmd = Command::Move { unit, dest, house };
+                self.pending.push(cmd);
+                self.emitted.push(cmd);
+            }
+        }
+    }
+
+    /// The unit whose sprite is nearest a map-pixel point within the pick
+    /// radius, if any (slot order breaks ties deterministically).
+    fn unit_at_map(&self, mx: i64, my: i64) -> Option<Handle> {
+        let mut best: Option<(i64, Handle)> = None;
+        for (h, unit) in self.world.units.iter() {
+            let px = leptons_to_pixel(unit.coord.x.0) as i64;
+            let py = leptons_to_pixel(unit.coord.y.0) as i64;
+            let d2 = (px - mx) * (px - mx) + (py - my) * (py - my);
+            if d2 <= (PICK_RADIUS as i64) * (PICK_RADIUS as i64)
+                && best.map(|(bd, _)| d2 < bd).unwrap_or(true)
+            {
+                best = Some((d2, h));
+            }
+        }
+        best.map(|(_, h)| h)
     }
 
     /// Drain queued sim commands emitted since the last call (for the transport
@@ -502,6 +616,50 @@ impl AppCore {
 /// (`CELL_PIXELS` per `LEPTONS_PER_CELL`).
 fn leptons_to_pixel(leptons: i32) -> i32 {
     (leptons as i64 * CELL_PIXELS as i64 / LEPTONS_PER_CELL as i64) as i32
+}
+
+/// Offset a pixel point by `dist` pixels along a binary-angle facing (for muzzle
+/// tips / tracer tails). Uses the sim's own [`ra_sim::coords::coord_move`] on a
+/// scaled lepton point so the direction matches the sim exactly — this is
+/// presentation only, never fed back into the sim.
+fn offset_pixels(x: i32, y: i32, dir: Facing, dist: i32) -> (i32, i32) {
+    let leptons = dist * LEPTONS_PER_CELL / CELL_PIXELS;
+    let moved = ra_sim::coords::coord_move(WorldCoord::new(0, 0), dir, leptons);
+    (
+        x + leptons_to_pixel(moved.x.0),
+        y + leptons_to_pixel(moved.y.0),
+    )
+}
+
+/// Draw a bright line between two pixel points (Bresenham), clipped to `dst`.
+fn draw_line(dst: &mut RgbaImage, x0: i32, y0: i32, x1: i32, y1: i32, rgb: [u8; 3]) {
+    let dx = (x1 - x0).abs();
+    let dy = -(y1 - y0).abs();
+    let sx = if x0 < x1 { 1 } else { -1 };
+    let sy = if y0 < y1 { 1 } else { -1 };
+    let mut err = dx + dy;
+    let (mut x, mut y) = (x0, y0);
+    loop {
+        if x >= 0 && y >= 0 && (x as u32) < dst.width && (y as u32) < dst.height {
+            let di = ((y as u32 * dst.width + x as u32) * 4) as usize;
+            dst.pixels[di] = rgb[0];
+            dst.pixels[di + 1] = rgb[1];
+            dst.pixels[di + 2] = rgb[2];
+            dst.pixels[di + 3] = 255;
+        }
+        if x == x1 && y == y1 {
+            break;
+        }
+        let e2 = 2 * err;
+        if e2 >= dy {
+            err += dy;
+            x += sx;
+        }
+        if e2 <= dx {
+            err += dx;
+            y += sy;
+        }
+    }
 }
 
 #[cfg(test)]

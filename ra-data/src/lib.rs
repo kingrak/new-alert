@@ -9,9 +9,11 @@
 //! - [`scenario`]     — scenario INI: theater, map rectangle, the decoded
 //!   `[MapPack]` / `[OverlayPack]` terrain cells, and `[UNITS]` placements.
 //! - [`rules`]        — unit stats (Speed/ROT/Strength) from `rules.ini` (§3.8).
+//! - [`combat`]       — weapon/warhead/projectile rules + resolved unit combat.
 //! - [`house`]        — the eight countries and their colour-remap tables.
 //! - [`passability`]  — a coarse passable/impassable grid from terrain (§3.7).
 
+pub mod combat;
 pub mod house;
 pub mod passability;
 pub mod rules;

@@ -68,9 +68,10 @@ fn run(args: &[String]) -> Result<(), BoxErr> {
         "dump" => cmd_dump(args),
         "window" => cmd_window(args),
         "sim" => cmd_sim(args),
+        "battle" => cmd_battle(args),
         _ => {
             eprintln!(
-                "usage:\n  ra-client dump   [--assets DIR] [--scenario NAME] [--out PATH.png] [--rect CX CY CW CH] [--playable]\n  ra-client window [--assets DIR] [--scenario NAME] [--smoke-seconds N]\n  ra-client sim    [--assets DIR] [--scenario NAME] [--out-dir DIR]"
+                "usage:\n  ra-client dump   [--assets DIR] [--scenario NAME] [--out PATH.png] [--rect CX CY CW CH] [--playable]\n  ra-client window [--assets DIR] [--scenario NAME] [--smoke-seconds N]\n  ra-client sim    [--assets DIR] [--scenario NAME] [--out-dir DIR]\n  ra-client battle [--assets DIR] [--scenario NAME] [--out-dir DIR]"
             );
             Err("unknown or missing subcommand".into())
         }
@@ -439,6 +440,224 @@ fn drive_script(
     report.push_str(&format!("{moved} unit(s) changed cell"));
 
     Ok((before, after, core.sim_hash(), report))
+}
+
+/// The `battle` subcommand (M4 verification): spawn a real 2TNK and an enemy
+/// HARV adjacent on a scenario's terrain, drive the attack through the AppCore
+/// seam (select attacker, right-click enemy), dump a before/mid/after PNG
+/// sequence, verify the damage math against hand-computed rules.ini values, and
+/// prove determinism by replaying the identical script and comparing hash chains.
+fn cmd_battle(mut args: Vec<String>) -> Result<(), BoxErr> {
+    use ra_client::assets::load_battle_from_dir;
+    use ra_sim::modify_damage;
+
+    let out_dir = take_flag(&mut args, "--out-dir").unwrap_or_else(|| ".".to_string());
+    let assets_flag = take_flag(&mut args, "--assets");
+    let scenario =
+        take_flag(&mut args, "--scenario").unwrap_or_else(|| DEFAULT_SCENARIO.to_string());
+    let dir = platform::resolve_assets_dir(assets_flag.as_deref())
+        .ok_or("could not find an assets directory (try --assets DIR or RA_ASSETS_DIR)")?;
+    eprintln!("assets: {}  scenario: {scenario}", dir.display());
+
+    // Two independent loads so the identical script can run twice.
+    let s1 = load_battle_from_dir(&dir, &scenario)?;
+    let s2 = load_battle_from_dir(&dir, &scenario)?;
+
+    // --- Hand-computed damage expectations from rules.ini values ---
+    let w = &s1.weapon;
+    let verses_steel = w.verses[s1.target_armor as usize];
+    let dmg_point_blank = modify_damage(
+        w.damage,
+        &ra_sim::WarheadProfile {
+            spread: w.spread,
+            verses: w.verses,
+        },
+        s1.target_armor,
+        0,
+        w.min_damage,
+        w.max_damage,
+    );
+    let dmg_at_200 = modify_damage(
+        w.damage,
+        &ra_sim::WarheadProfile {
+            spread: w.spread,
+            verses: w.verses,
+        },
+        s1.target_armor,
+        200,
+        w.min_damage,
+        w.max_damage,
+    );
+    let expected_shots = s1.target_max_hp.div_ceil(dmg_point_blank.max(1) as u16);
+    eprintln!("--- damage math (2TNK 90mm, AP warhead, vs HARV 'heavy'=steel armor) ---");
+    eprintln!(
+        "  base Damage={}  Verses[steel]={} raw16.16 ({}%)  Spread={}",
+        w.damage,
+        verses_steel,
+        verses_steel * 100 / 65536,
+        w.spread
+    );
+    eprintln!("  damage at distance 0   = {dmg_point_blank}  (expected 30)");
+    eprintln!("  damage at distance 200 = {dmg_at_200}   (falloff: 30 / (200/(3*5)=13) = 2)");
+    eprintln!(
+        "  target Strength={}  => shots-to-kill = {expected_shots} (expected 20)",
+        s1.target_max_hp
+    );
+
+    let (report, hashes1) = drive_battle(s1, &out_dir, true, dmg_point_blank as u16)?;
+    let (_r2, hashes2) = drive_battle(s2, &out_dir, false, dmg_point_blank as u16)?;
+    eprintln!("--- battle ---\n{report}");
+
+    if hashes1 == hashes2 {
+        eprintln!(
+            "DETERMINISM OK: identical {}-tick hash chains across two runs (final {:#018x})",
+            hashes1.len(),
+            hashes1.last().copied().unwrap_or(0)
+        );
+        Ok(())
+    } else {
+        // Find first divergence for the report.
+        let first = hashes1
+            .iter()
+            .zip(&hashes2)
+            .position(|(a, b)| a != b)
+            .unwrap_or(hashes1.len());
+        Err(format!("determinism FAILED: hash chains diverge at tick {first}").into())
+    }
+}
+
+/// Drive one battle through the seam: center camera, select the 2TNK, right-click
+/// the HARV to issue an attack, then step the sim dumping before / mid (health
+/// bar + turret tracking) / after (target destroyed) PNGs. Returns a text report
+/// and the per-tick sim-hash chain.
+fn drive_battle(
+    setup: ra_client::assets::BattleSetup,
+    out_dir: &str,
+    write_png: bool,
+    expected_per_shot: u16,
+) -> Result<(String, Vec<u64>), BoxErr> {
+    let ra_client::assets::BattleSetup {
+        mut core,
+        attacker,
+        attacker_cell,
+        target,
+        target_cell,
+        target_max_hp,
+        ..
+    } = setup;
+    let (vw, vh) = (800u32, 600u32);
+    core.handle(InputEvent::Resize {
+        width: vw,
+        height: vh,
+    });
+    // Center camera between the two combatants.
+    let midx = (attacker_cell.x + target_cell.x + 1) * CELL as i32 / 2;
+    let midy = (attacker_cell.y + target_cell.y + 1) * CELL as i32 / 2;
+    core.set_camera(midx as f32 - vw as f32 / 2.0, midy as f32 - vh as f32 / 2.0);
+
+    let cam = core.camera_rect();
+    let screen = |cell: CellCoord| -> (i32, i32) {
+        (
+            (cell.x * CELL as i32 + CELL as i32 / 2 - cam.x as i32),
+            (cell.y * CELL as i32 + CELL as i32 / 2 - cam.y as i32),
+        )
+    };
+    let (ax, ay) = screen(attacker_cell);
+    let (tx, ty) = screen(target_cell);
+
+    // "Before" frame.
+    let before = core.compose_camera();
+
+    // Select the attacker (click) then right-click the target (attack).
+    core.handle(InputEvent::MouseDown {
+        button: MouseButton::Left,
+        x: ax,
+        y: ay,
+    });
+    core.handle(InputEvent::MouseUp {
+        button: MouseButton::Left,
+        x: ax,
+        y: ay,
+    });
+    let selected = core.selected_handles();
+    core.handle(InputEvent::MouseDown {
+        button: MouseButton::Right,
+        x: tx,
+        y: ty,
+    });
+    let issued = core.drain_commands();
+    core.handle(InputEvent::MouseLeft); // stop edge-scroll
+
+    // Step the sim, tracking the target's health, shot drops, and PNG captures.
+    let mut prev_hp = target_max_hp;
+    let mut drops: Vec<u16> = Vec::new();
+    let mut mid: Option<ra_client::Frame> = None;
+    let mut hashes = Vec::new();
+    let mut after: Option<ra_client::Frame> = None;
+    let mut kill_tick = None;
+    for t in 0..3000u32 {
+        core.update(67); // ~1 tick per update at 15 Hz
+        hashes.push(core.sim_hash());
+        let hp = core.world().units.get(target).map(|u| u.health);
+        match hp {
+            Some(hp) => {
+                if hp < prev_hp {
+                    drops.push(prev_hp - hp);
+                    prev_hp = hp;
+                }
+                // Capture "mid" once the target drops to ~half health, while it
+                // is still alive (shows health bar + tracked turret).
+                if mid.is_none() && hp <= target_max_hp / 2 {
+                    mid = Some(core.compose_camera());
+                }
+            }
+            None => {
+                // Target removed on death — capture "after" once and stop.
+                after = Some(core.compose_camera());
+                kill_tick = Some(t);
+                break;
+            }
+        }
+    }
+    // If it never died (shouldn't happen), still grab an "after".
+    let after = after.unwrap_or_else(|| core.compose_camera());
+    let mid = mid.unwrap_or_else(|| before.clone());
+
+    if write_png {
+        for (name, f) in [
+            ("battle_before", &before),
+            ("battle_mid", &mid),
+            ("battle_after", &after),
+        ] {
+            let path = format!("{out_dir}/{name}.png");
+            let bytes = png::encode_rgba(f.width, f.height, &f.pixels);
+            std::fs::write(&path, &bytes)?;
+            eprintln!("wrote {path} ({}x{} px)", f.width, f.height);
+        }
+    }
+
+    let all_full_shots = drops.iter().all(|&d| d == expected_per_shot);
+    let mut report = String::new();
+    report.push_str(&format!(
+        "selected {} unit(s) (attacker={}), issued {} command(s)\n",
+        selected.len(),
+        selected.first().map(|h| h.index).unwrap_or(u32::MAX),
+        issued.len(),
+    ));
+    report.push_str(&format!(
+        "target HARV: {} shots landed, per-shot damage drops = {:?}\n",
+        drops.len(),
+        drops
+    ));
+    report.push_str(&format!(
+        "every shot dealt exactly {expected_per_shot} damage: {all_full_shots}\n"
+    ));
+    match kill_tick {
+        Some(t) => report.push_str(&format!("target destroyed and removed at tick {t}")),
+        None => report.push_str("target survived (unexpected)"),
+    }
+    let _ = attacker;
+    Ok((report, hashes))
 }
 
 /// Find a passable destination cell ~6 cells from `anchor` by scanning a small

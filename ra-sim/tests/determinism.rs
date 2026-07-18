@@ -445,6 +445,100 @@ mod real {
         }
         Some((world, handles))
     }
+
+    /// Same as [`load_scg01ea`], but additionally resolves and attaches each
+    /// unit's real M4 combat stats (armor, primary weapon, turret) via
+    /// `ra_data::combat`, mirroring (again, a rendering-free reimplementation
+    /// of, for the same cross-crate-dependency reason) the combat-attach
+    /// slice of `ra_client::assets::load_game_from_bytes`. Used by the M4
+    /// combat-determinism suite's real-map variants.
+    pub fn load_scg01ea_with_combat(seed: u32) -> Option<(World, Vec<Handle>)> {
+        use ra_data::combat::resolve_unit_combat;
+
+        let dir = assets_dir();
+        if !dir.join("main.mix").is_file() || !dir.join("redalert.mix").is_file() {
+            return None;
+        }
+        let main_bytes = std::fs::read(dir.join("main.mix")).ok()?;
+        let redalert_bytes = std::fs::read(dir.join("redalert.mix")).ok()?;
+
+        let main = MixArchive::parse(&main_bytes).ok()?;
+        let general = main.open_nested("general.mix").ok()?;
+        let ini_bytes = general.get("scg01ea.ini")?;
+        let ini_text = String::from_utf8_lossy(ini_bytes);
+        let ini = Ini::parse(&ini_text);
+        let scenario = Scenario::from_ini(&ini).ok()?;
+        let placements = parse_units(&ini);
+
+        let redalert = MixArchive::parse(&redalert_bytes).ok()?;
+        let local = redalert.open_nested("local.mix").ok()?;
+        let rules_bytes = local.get("rules.ini")?;
+        let rules = Ini::parse(&String::from_utf8_lossy(rules_bytes));
+
+        let mask = passability::build(&scenario);
+        let grid = Passability::new(128, 128, mask);
+        let mut world = World::new(grid, seed);
+
+        let mut handles = Vec::new();
+        for p in &placements {
+            let key = p.unit_type.to_ascii_uppercase();
+            let Some(unit_stats) = unit_stats(&rules, &key) else {
+                continue;
+            };
+            let cell = CellCoord::from_index(p.cell);
+            let max_strength = unit_stats.strength.max(1);
+            let health =
+                ((p.strength as i32) * max_strength / 256).clamp(0, u16::MAX as i32) as u16;
+            let h = world.spawn_unit(
+                0,
+                p.house,
+                cell,
+                Facing(p.facing),
+                health,
+                MoveStats {
+                    max_speed: unit_stats.max_speed_leptons(),
+                    rot: unit_stats.rot,
+                },
+            );
+            if let Some(combat) = resolve_unit_combat(&rules, &key) {
+                world.set_unit_combat(
+                    h,
+                    combat.armor,
+                    combat.weapon.as_ref().map(weapon_to_profile),
+                    combat.has_turret,
+                );
+            }
+            handles.push(h);
+        }
+        Some((world, handles))
+    }
+
+    /// `ra_data::combat::WeaponDef` -> `ra_sim::WeaponProfile`, field-for-
+    /// field. Duplicated from `ra_client::assets::weapon_to_profile` for the
+    /// same no-reverse-dependency reason as the rest of this module — kept
+    /// tiny and mechanical on purpose so drift from the real conversion is
+    /// obvious on read.
+    pub fn weapon_to_profile(w: &ra_data::combat::WeaponDef) -> ra_sim::WeaponProfile {
+        ra_sim::WeaponProfile {
+            damage: w.damage,
+            rof: w.rof,
+            range: w.range,
+            proj_speed: w.proj_speed,
+            proj_rot: w.proj_rot,
+            invisible: w.invisible,
+            instant: w.instant,
+            warhead: ra_sim::WarheadProfile {
+                spread: w.spread,
+                verses: w.verses,
+            },
+            warhead_ap: w.warhead_ap,
+            arcing: w.arcing,
+            ballistic_scatter: w.ballistic_scatter,
+            homing_scatter: w.homing_scatter,
+            min_damage: w.min_damage,
+            max_damage: w.max_damage,
+        }
+    }
 }
 
 const REAL_SEED: u32 = 0x5CA1_AB1E;
@@ -530,21 +624,547 @@ fn real_scg01ea_hash_chain_prefix_golden() {
     // real_scg01ea_hash_chain_prefix_golden -- --nocapture` against the real
     // assets and copied from the printed output below (see the doc comment
     // above for the derivation policy).
+    //
+    // **Updated for M4 (combat).** These values changed from the M3 pin because
+    // the world/unit state hash now folds in the new per-unit combat fields
+    // (armor, turret facing, rearm timer, weapon presence, target) and the
+    // bullets arena — a deliberate state extension, not a movement/pathing
+    // regression. The scenario's units carry only default (unarmed) combat state
+    // in this test, so the *behavior* is identical to M3; only the hashed field
+    // set grew. Re-pinned deterministically.
     let golden: [u64; 10] = [
-        0x71ff_e80a_6812_e5c7,
-        0x109c_a760_d46d_51f4,
-        0xffd7_165b_7d9e_58fd,
-        0x7b28_06d6_7c3d_818a,
-        0x5dc4_c299_1695_dfeb,
-        0x441f_e883_6728_f380,
-        0x8b0d_9169_0892_8fea,
-        0x54c0_f314_6a8a_cb94,
-        0x56ef_3120_22fc_3aa2,
-        0xec88_27fc_6168_a408,
+        0xbfd0_d9e9_b2fe_dbbb,
+        0x46c5_9344_0ccb_50ec,
+        0x848a_853e_0945_fae1,
+        0x900e_375a_db81_a762,
+        0x974e_1408_cc0d_3057,
+        0x57d9_69bb_658c_77c8,
+        0xda5d_5abd_5a52_36c8,
+        0x40f8_0d19_bb7b_086c,
+        0xba64_7334_00c2_96f4,
+        0xcdf9_4064_5935_97b0,
     ];
     assert_eq!(
         chain, golden,
         "scg01ea hash-chain prefix changed — either a real determinism regression \
          (movement/pathing/hashing) or a deliberate change; update the pin with a comment"
     );
+}
+
+// ---------------------------------------------------------------------
+// 5. M4 combat determinism: unit-vs-unit and force-fire-at-cell battles,
+//    synthetic (always-run) + real-map (skip-clean) variants. Complements
+//    the movement-only suite above (sections 1-4) and the M4 combat unit
+//    tests colocated in `world.rs` (which pin the same RNG asymmetry and
+//    hash-chain equality at the *unit test* layer, over `World` directly);
+//    this is the integration-layer echo the M4 test plan calls for
+//    explicitly, using `ra_sim::world::Command`'s public surface exactly as
+//    a real replay/net client would, plus the real-map variants a colocated
+//    `#[cfg(test)]` module can't reach (no asset access by this repo's
+//    policy for `src`-internal unit tests).
+// ---------------------------------------------------------------------
+
+use ra_sim::{Target, WarheadProfile, WeaponProfile};
+
+fn pct5_det(p: [i32; 5]) -> [i32; 5] {
+    let mut o = [0i32; 5];
+    for (d, v) in o.iter_mut().zip(p) {
+        *d = v * 65536 / 100;
+    }
+    o
+}
+
+/// 2TNK's 90mm: AP, non-instant, so its shots at a ground cell scatter (draw
+/// the sim RNG) but its shots at a live enemy unit are accurate (no draw).
+fn ninety_mm_det() -> WeaponProfile {
+    WeaponProfile {
+        damage: 30,
+        rof: 50,
+        range: 1216,
+        proj_speed: 102,
+        proj_rot: 0,
+        invisible: false,
+        instant: false,
+        warhead: WarheadProfile {
+            spread: 3,
+            verses: pct5_det([30, 75, 75, 100, 50]),
+        },
+        warhead_ap: true,
+        arcing: false,
+        ballistic_scatter: 256,
+        homing_scatter: 512,
+        min_damage: 1,
+        max_damage: 1000,
+    }
+}
+
+/// A combat-capable `World` fixture: two house-1 tanks and two house-2
+/// targets on an open synthetic map, positioned so both an in-range
+/// unit-vs-unit fight and an in-range force-fire-at-cell fight are possible
+/// from tick 0 (no approach phase needed — that's `firing_fsm.rs`'s job).
+struct CombatFixture {
+    world: World,
+    tank_a: Handle, // house 1, will attack `victim` directly (unit target)
+    tank_b: Handle, // house 1, will force-fire at `victim_cell` (Target::Cell)
+    victim: Handle, // house 2, `tank_a`'s unit target
+    victim_cell: CellCoord,
+}
+
+fn build_combat_fixture(seed: u32) -> CombatFixture {
+    let mut world = World::new(Passability::all_passable(), seed);
+    let tank_a = world.spawn_unit(0, 1, CellCoord::new(10, 10), Facing(0), 400, stats(25, 10));
+    world.set_unit_combat(tank_a, 3, Some(ninety_mm_det()), true);
+    let tank_b = world.spawn_unit(1, 1, CellCoord::new(30, 10), Facing(0), 400, stats(25, 10));
+    world.set_unit_combat(tank_b, 3, Some(ninety_mm_det()), true);
+
+    let victim = world.spawn_unit(2, 2, CellCoord::new(11, 10), Facing(0), 600, stats(20, 8));
+    world.set_unit_combat(victim, 3, None, false);
+    // Force-fire target cell for `tank_b`: ~4.5 cells away (within 90mm's
+    // 4.75-cell range) and far enough that `scatterdist > 0`, so the AP
+    // scatter branch genuinely draws the sim RNG every shot (matching
+    // `world.rs`'s own `force_fire_at_cell_consumes_sim_rng_when_scattering`
+    // unit test's distance choice).
+    let victim_cell = CellCoord::new(34, 12);
+
+    CombatFixture {
+        world,
+        tank_a,
+        tank_b,
+        victim,
+        victim_cell,
+    }
+}
+
+/// `log[t]` are the commands applied at tick `t`: `tank_a` attacks `victim`
+/// (unit target, accurate) from tick 0; `tank_b` force-fires `victim_cell`
+/// (ground target, AP scatter) starting a few ticks later; at tick 40,
+/// `tank_b` is re-targeted from the cell to the live `victim` unit instead
+/// (switching an in-progress force-fire to a unit attack mid-battle, the
+/// same "re-issue" shape section 1-4's movement log exercises for `Move`).
+const COMBAT_TICKS: usize = 220;
+
+fn combat_command_log(f: &CombatFixture) -> Vec<Vec<Command>> {
+    let mut log = vec![Vec::new(); COMBAT_TICKS];
+    log[0].push(Command::Attack {
+        unit: f.tank_a,
+        target: Target::Unit(f.victim),
+        house: 1,
+    });
+    log[5].push(Command::Attack {
+        unit: f.tank_b,
+        target: Target::Cell(f.victim_cell),
+        house: 1,
+    });
+    log[40].push(Command::Attack {
+        unit: f.tank_b,
+        target: Target::Unit(f.victim),
+        house: 1,
+    });
+    log
+}
+
+fn run_combat_log(world: &mut World, log: &[Vec<Command>]) -> Vec<u64> {
+    log.iter().map(|cmds| world.tick(cmds)).collect()
+}
+
+#[test]
+fn synthetic_combat_battle_same_seed_twice_identical_chains() {
+    let fa = build_combat_fixture(0xBEEF_0001);
+    let fb = build_combat_fixture(0xBEEF_0001);
+    let log_a = combat_command_log(&fa);
+    let log_b = combat_command_log(&fb);
+    assert_eq!(log_a, log_b);
+
+    let mut wa = fa.world;
+    let mut wb = fb.world;
+    let chain_a = run_combat_log(&mut wa, &log_a);
+    let chain_b = run_combat_log(&mut wb, &log_b);
+    assert_eq!(
+        chain_a, chain_b,
+        "identical seed + combat command log must give an identical hash chain \
+         (covers unit-vs-unit fire, AP force-fire scatter, and the mid-battle re-target)"
+    );
+    assert_eq!(wa.state_hash(), wb.state_hash());
+    // Sanity: the battle actually happened (both fire modes did damage), so
+    // this is exercising real combat state, not an idle no-op script.
+    assert!(
+        wa.units.get(fa.victim).is_none_or(|u| u.health < 600),
+        "victim should have taken damage from the unit-target attack"
+    );
+}
+
+#[test]
+fn synthetic_combat_battle_command_log_replay_matches_live_run() {
+    let live_fixture = build_combat_fixture(0xBEEF_0002);
+    let log = combat_command_log(&live_fixture);
+    let mut live = live_fixture.world;
+    let live_chain = run_combat_log(&mut live, &log);
+
+    // Fresh world, same seed, replaying only the persisted log — the
+    // save/replay use case (DESIGN.md §4.4: "a replay is just the command
+    // log + initial seed").
+    let mut replay = World::new(Passability::all_passable(), 0xBEEF_0002);
+    let a = replay.spawn_unit(0, 1, CellCoord::new(10, 10), Facing(0), 400, stats(25, 10));
+    replay.set_unit_combat(a, 3, Some(ninety_mm_det()), true);
+    let b = replay.spawn_unit(1, 1, CellCoord::new(30, 10), Facing(0), 400, stats(25, 10));
+    replay.set_unit_combat(b, 3, Some(ninety_mm_det()), true);
+    let v = replay.spawn_unit(2, 2, CellCoord::new(11, 10), Facing(0), 600, stats(20, 8));
+    replay.set_unit_combat(v, 3, None, false);
+    let replay_chain = run_combat_log(&mut replay, &log);
+
+    assert_eq!(
+        live_chain, replay_chain,
+        "replayed combat log must reproduce the live hash chain exactly"
+    );
+    assert_eq!(live.state_hash(), replay.state_hash());
+}
+
+// ---------------------------------------------------------------------
+// 6. RNG-consumption asymmetry, pinned as a determinism-critical regression
+// (per the M4 task brief: "assert the RNG seed ADVANCES on AP force-fire at
+// a cell (scatter draw) and does NOT advance on accurate unit-target shots
+// — pin this asymmetry, it's the original's behavior and a prime desync
+// trap"). `world.rs` unit-tests this directly against `World`; this
+// integration-level echo re-derives it independently by running the *whole*
+// scripted battle above and inspecting `rng_seed()` at specific ticks, plus
+// adds a real-map variant.
+// ---------------------------------------------------------------------
+
+#[test]
+fn regression_accurate_unit_target_shot_never_advances_rng_seed() {
+    // Isolate `tank_a`'s accurate unit-target attack only (no force-fire in
+    // this script), so any seed change can only come from the accurate-shot
+    // path — a stricter isolation than the combined battle script above.
+    let mut w = World::new(Passability::all_passable(), 0x1357_ACE1);
+    let a = w.spawn_unit(0, 1, CellCoord::new(10, 10), Facing(0), 400, stats(25, 10));
+    w.set_unit_combat(a, 3, Some(ninety_mm_det()), true);
+    let victim = w.spawn_unit(0, 2, CellCoord::new(11, 10), Facing(0), 600, stats(20, 8));
+    w.set_unit_combat(victim, 3, None, false);
+
+    let seed0 = w.rng_seed();
+    w.tick(&[Command::Attack {
+        unit: a,
+        target: Target::Unit(victim),
+        house: 1,
+    }]);
+    for _ in 0..150 {
+        w.tick(&[]);
+    }
+    assert!(
+        w.units.get(victim).unwrap().health < 600,
+        "sanity: the accurate attack should have landed several shots"
+    );
+    assert_eq!(
+        seed0,
+        w.rng_seed(),
+        "an all-accurate unit-vs-unit battle must never advance the sim RNG seed"
+    );
+}
+
+#[test]
+fn regression_ap_force_fire_scatter_always_advances_rng_seed() {
+    let mut w = World::new(Passability::all_passable(), 0x1357_ACE2);
+    let a = w.spawn_unit(0, 1, CellCoord::new(10, 10), Facing(0), 400, stats(25, 10));
+    w.set_unit_combat(a, 3, Some(ninety_mm_det()), true);
+    let cell = CellCoord::new(14, 12); // ~4.5 cells: in range, scatterdist > 0
+
+    let seed0 = w.rng_seed();
+    w.tick(&[Command::Attack {
+        unit: a,
+        target: Target::Cell(cell),
+        house: 1,
+    }]);
+    let mut seeds_seen = vec![seed0];
+    for _ in 0..150 {
+        w.tick(&[]);
+        seeds_seen.push(w.rng_seed());
+    }
+    assert_ne!(
+        seed0,
+        w.rng_seed(),
+        "an AP force-fire-at-cell battle must advance the sim RNG seed"
+    );
+    // Stronger than just "changed once": since 90mm's ROF=50 gives 3 shots
+    // in 150 ticks and every AP-at-cell shot scatters, the seed should
+    // change at (at least) 3 distinct points, not just once coincidentally.
+    let distinct = seeds_seen.windows(2).filter(|w| w[0] != w[1]).count();
+    assert!(
+        distinct >= 3,
+        "expected the seed to change on every one of several scattering shots, saw {distinct} changes"
+    );
+}
+
+/// Real-map variant: one of scg01ea's real JEEPs (SA/M60mg, not AP — see
+/// below) attacking the scenario's real HARV must never advance the sim RNG,
+/// exercised over the real passability grid + real spawn placements (not
+/// just an all-passable synthetic map). Skips cleanly without assets.
+///
+/// M60mg is SA, not AP, so this is actually a *stronger* no-scatter case
+/// than the synthetic AP-vs-unit test above (SA never scatters regardless of
+/// target kind — `warhead_ap` gates the scatter branch in `fire()` — so this
+/// also cross-checks that a non-AP weapon is unconditionally accurate, not
+/// just "accurate when aimed at a unit").
+#[test]
+fn real_scg01ea_non_ap_weapon_never_advances_rng_seed() {
+    let Some((mut world, handles)) = real::load_scg01ea_with_combat(REAL_SEED) else {
+        eprintln!(
+            "SKIP: real assets not found (set RA_ASSETS_DIR or copy main.mix/redalert.mix into assets/ to run this test)"
+        );
+        return;
+    };
+    assert_eq!(handles.len(), 4);
+    // scg01ea's placement order: 3 Greece (house 1) JEEPs then 1 USSR
+    // (house 2) HARV (see `real_scg01ea_hash_chain_prefix_golden` above).
+    let jeep = handles[0];
+    let harv = handles[3];
+    assert!(
+        world.units.get(jeep).unwrap().weapon.is_some(),
+        "scg01ea's JEEP should have resolved a weapon (M60mg) from real rules.ini"
+    );
+
+    let seed0 = world.rng_seed();
+    world.tick(&[Command::Attack {
+        unit: jeep,
+        target: Target::Unit(harv),
+        house: 1,
+    }]);
+    for _ in 0..100 {
+        world.tick(&[]);
+    }
+    assert_eq!(
+        seed0,
+        world.rng_seed(),
+        "a non-AP (SA) weapon must never advance the sim RNG, even over the real map"
+    );
+}
+
+/// Real-map variant of the scatter side: attach a synthetic AP weapon (real
+/// weapons in scg01ea's default loadout are all SA/M60mg, which never
+/// scatters — see the test above) to one of the real JEEP spawns, force-fire
+/// a nearby real-map cell, and confirm the seed advances — proving the
+/// scatter path also fires correctly over real passability/spawn data, not
+/// only the synthetic all-passable grid. Skips cleanly without assets.
+#[test]
+fn real_scg01ea_ap_force_fire_scatter_advances_rng_seed() {
+    let Some((mut world, handles)) = real::load_scg01ea_with_combat(REAL_SEED) else {
+        eprintln!(
+            "SKIP: real assets not found (set RA_ASSETS_DIR or copy main.mix/redalert.mix into assets/ to run this test)"
+        );
+        return;
+    };
+    let jeep = handles[0];
+    world.set_unit_combat(jeep, 3, Some(ninety_mm_det()), true);
+    let jeep_cell = world.units.get(jeep).unwrap().cell();
+    // A force-fire cell a few cells away, clamped on-map, aiming to land
+    // within 90mm's range with a nonzero scatter distance.
+    let target_cell = CellCoord::new((jeep_cell.x + 4).min(126), (jeep_cell.y + 2).min(126));
+
+    let seed0 = world.rng_seed();
+    world.tick(&[Command::Attack {
+        unit: jeep,
+        target: Target::Cell(target_cell),
+        house: world.units.get(jeep).unwrap().house,
+    }]);
+    let mut advanced = false;
+    for _ in 0..80 {
+        world.tick(&[]);
+        if world.rng_seed() != seed0 {
+            advanced = true;
+            break;
+        }
+    }
+    assert!(
+        advanced,
+        "AP force-fire at a real-map cell never drew the sim RNG (no scatter observed)"
+    );
+}
+
+// ---------------------------------------------------------------------
+// 7. M3 golden re-pin audit. `real_scg01ea_hash_chain_prefix_golden` above
+// was re-pinned for M4 with the doc-comment claim "behavior is identical to
+// M3; only the hashed field set grew". This section *re-derives* that claim
+// from first principles instead of trusting the comment:
+//
+// (a) `run_combat` (`world.rs`) is a no-op for every unit in that golden's
+//     script: it decrements `arm` only `if arm > 0` (starts and stays 0
+//     here), then immediately `continue`s unless a unit has **both** a
+//     `target` and a `weapon` — and `real::load_scg01ea` (used by that
+//     golden, as opposed to `load_scg01ea_with_combat` used by section 5/6
+//     above) never calls `set_unit_combat`, so every unit's `weapon` stays
+//     `None` for the whole run. A no-op system cannot perturb movement.
+// (b) The new hashed fields (`armor`, `has_turret`, `turret_facing`, `arm`,
+//     `weapon` presence, `target`) are therefore constant — `0`, `false`,
+//     equal to spawn `facing`, `0`, `0` (absent), `0` (absent) — for every
+//     unit at every tick of that script. This test asserts that directly
+//     (not just by code-reading) at every tick, over every unit, rather than
+//     taking it on faith.
+// (c) Independent evidence, not just "the combat fields don't move the
+//     needle": this test pins its own hash chain over *only* the pre-M4
+//     field set (type_id/house/coord/facing/health/max_health/stats/path/
+//     dest — reimplemented here, not by calling `Unit::hash_into`), so a
+//     future movement/pathing regression is caught by a mechanism entirely
+//     independent of `state_hash`'s formula — exactly the failure mode a
+//     "hash formula changed" re-pin could otherwise hide.
+// ---------------------------------------------------------------------
+
+mod repin_audit {
+    use super::*;
+    use ra_sim::hash::Fnv1a;
+
+    /// Hash exactly the M3-era mutable field set of one unit — a
+    /// from-scratch reimplementation (not a call into `Unit::hash_into`,
+    /// which also hashes the M4 combat fields this audit is isolating away
+    /// from) so agreement with the *movement* portion of the real hash is a
+    /// genuine cross-check, not a tautology.
+    fn hash_unit_m3_fields(h: &mut Fnv1a, u: &ra_sim::Unit) {
+        h.write_u32(u.type_id);
+        h.write_u8(u.house);
+        h.write_i32(u.coord.x.0);
+        h.write_i32(u.coord.y.0);
+        h.write_u8(u.facing.0);
+        h.write_u16(u.health);
+        h.write_u16(u.max_health);
+        h.write_i32(u.stats.max_speed);
+        h.write_u8(u.stats.rot);
+        h.write_u32(u.path.len() as u32);
+        for cell in &u.path {
+            h.write_i32(cell.x);
+            h.write_i32(cell.y);
+        }
+        match u.dest {
+            Some(c) => {
+                h.write_u8(1);
+                h.write_i32(c.x);
+                h.write_i32(c.y);
+            }
+            None => h.write_u8(0),
+        }
+    }
+
+    /// The M3-shaped whole-world hash: same shape as `World::state_hash`
+    /// minus the bullets arena (didn't exist pre-M4) and minus each unit's
+    /// M4 combat tail.
+    fn state_hash_m3_shaped(world: &World) -> u64 {
+        let mut h = Fnv1a::new();
+        h.write_u32(world.tick_count());
+        h.write_u32(world.rng_seed());
+        h.write_u32(world.units.len());
+        for (handle, unit) in world.units.iter() {
+            h.write_u32(handle.index);
+            h.write_u32(handle.gen);
+            hash_unit_m3_fields(&mut h, unit);
+        }
+        h.finish()
+    }
+
+    #[test]
+    fn m4_repin_is_justified_movement_unaffected_by_combat_fields() {
+        let Some((mut world, handles)) = real::load_scg01ea(REAL_SEED) else {
+            eprintln!(
+                "SKIP: real assets not found (set RA_ASSETS_DIR or copy main.mix/redalert.mix into assets/ to run this test)"
+            );
+            return;
+        };
+        assert_eq!(handles.len(), 4);
+
+        // `turret_facing` is initialised equal to spawn `facing`
+        // (`Unit::new`) but — since these units are never armed/turreted —
+        // nothing in `run_combat` ever touches it again (that system
+        // `continue`s immediately for a weaponless unit); it is `facing`
+        // that changes as the unit turns to move. So the invariant these
+        // units actually hold is "`turret_facing` stays pinned at its
+        // *spawn* value", not "`turret_facing` tracks the current `facing`"
+        // — captured here before the first tick so the per-tick loop below
+        // can check the real invariant.
+        let spawn_turret_facing: std::collections::HashMap<u32, ra_sim::coords::Facing> = world
+            .units
+            .iter()
+            .map(|(h, u)| (h.index, u.turret_facing))
+            .collect();
+
+        // Exactly the golden test's script: same seed, same destination, same
+        // per-unit house assignment, same tick count.
+        let dest = CellCoord::new(70, 55);
+        let houses = [1u8, 2, 1, 1];
+        let cmds: Vec<Command> = handles
+            .iter()
+            .zip(houses)
+            .map(|(&unit, house)| Command::Move { unit, dest, house })
+            .collect();
+
+        let mut m3_shaped_chain = Vec::new();
+        let mut prod_chain = Vec::new();
+        for t in 0..10 {
+            let cmds_this_tick: &[Command] = if t == 0 { &cmds } else { &[] };
+            world.tick(cmds_this_tick);
+
+            // (b) Directly assert every M4 combat field is at its inert
+            // default for every unit, every tick — the claim this whole
+            // audit rests on, checked at runtime rather than by inspection.
+            for (h, unit) in world.units.iter() {
+                assert_eq!(unit.armor, 0, "tick {t}: armor should be untouched (0)");
+                assert!(!unit.has_turret, "tick {t}: has_turret should stay false");
+                assert_eq!(
+                    unit.turret_facing, spawn_turret_facing[&h.index],
+                    "tick {t}: an untouched (unarmed) unit's turret_facing must stay pinned at spawn"
+                );
+                assert_eq!(
+                    unit.arm, 0,
+                    "tick {t}: arm should never leave 0 (never fires)"
+                );
+                assert!(unit.weapon.is_none(), "tick {t}: weapon should stay unset");
+                assert!(unit.target.is_none(), "tick {t}: target should stay unset");
+            }
+
+            m3_shaped_chain.push(state_hash_m3_shaped(&world));
+            prod_chain.push(world.state_hash());
+        }
+
+        // (c) The independent M3-shaped chain, pinned as its own golden —
+        // derived once against the real assets during this audit, same
+        // "computed once, read back, and pinned" policy as every other
+        // golden hash in this repo (see the module docs on that policy).
+        // (c) The independent M3-shaped chain, pinned as its own golden —
+        // derived once against the real assets during this audit (same
+        // "computed once, read back, and pinned" policy as every other
+        // golden hash in this repo — see `real_scg01ea_hash_chain_prefix_golden`'s
+        // doc comment above).
+        let m3_shaped_golden: [u64; 10] = [
+            0xce98_2d5a_ca35_d87b,
+            0x82f9_8cb4_ec25_24f4,
+            0x4170_8686_c784_8b21,
+            0x82fc_ffb8_11c4_25ca,
+            0xcf3a_3496_8299_0177,
+            0x168f_a8cc_f70f_76fc,
+            0xfcb2_571a_f069_1b8a,
+            0x7350_ec3c_3981_89f0,
+            0xd994_2162_06de_4422,
+            0x03d2_04f5_a7f6_0334,
+        ];
+        assert_eq!(
+            m3_shaped_chain, m3_shaped_golden,
+            "movement-only (M3-field-shaped) hash chain changed — this is the real regression \
+             this audit exists to catch, independent of the M4 hash-formula change"
+        );
+
+        // And finally: the production hash chain must equal the golden
+        // pinned by `real_scg01ea_hash_chain_prefix_golden` above — tying
+        // this audit's conclusion back to the actual re-pinned test.
+        assert_eq!(
+            prod_chain,
+            [
+                0xbfd0_d9e9_b2fe_dbbb,
+                0x46c5_9344_0ccb_50ec,
+                0x848a_853e_0945_fae1,
+                0x900e_375a_db81_a762,
+                0x974e_1408_cc0d_3057,
+                0x57d9_69bb_658c_77c8,
+                0xda5d_5abd_5a52_36c8,
+                0x40f8_0d19_bb7b_086c,
+                0xba64_7334_00c2_96f4,
+                0xcdf9_4064_5935_97b0,
+            ],
+            "this audit's script diverged from real_scg01ea_hash_chain_prefix_golden's script"
+        );
+    }
 }

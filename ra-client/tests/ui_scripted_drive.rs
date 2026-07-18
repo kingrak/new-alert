@@ -152,6 +152,170 @@ fn synthetic_click_with_nothing_selected_emits_nothing() {
 }
 
 // ---------------------------------------------------------------------
+// Battle script (M4, new): select tank(s) -> attack enemy -> step to kill ->
+// assert health-bar rendering changes and the post-death frame no longer
+// draws the target. Complements the M3 move-only script above; uses
+// `support::synthetic_core_with_armed_units` (armed jeeps + a nearby
+// unarmed house-2 target — see that helper's docs on why the M3 unarmed
+// fixture can never generate an `Attack` at all).
+// ---------------------------------------------------------------------
+
+/// Pixels per cell edge, matching `ra_client::appcore`'s private
+/// `CELL_PIXELS` (== `ICON_WIDTH`) — duplicated here for the same reason
+/// `support::run_select_and_move_script` already duplicates it (no public
+/// accessor, and it's a stable, documented constant).
+const CELL_PIXELS: i32 = 24;
+
+/// The exact backing-rectangle pixel `draw_health_bar` always paints black
+/// (`fill_rect(dst, x0-1, y0-1, x1+1, y1+1, [0,0,0])`, unconditionally,
+/// regardless of the health fraction) for a unit centred at `(sx, sy)` —
+/// `(sx - CELL_PIXELS/2 - 1, sy - CELL_PIXELS/2 - 5)` inclusive is inside
+/// that rect for every case (`width.max(4)` keeps `x0` no further right than
+/// `sx - 2`). Used as an unambiguous "was a health bar drawn for the unit
+/// centred here, this frame" probe, independent of whatever sprite/terrain
+/// pixels would otherwise be there.
+fn health_bar_backing_pixel(frame: &ra_client::compositor::RgbaImage, sx: i32, sy: i32) -> [u8; 4] {
+    let x = sx - CELL_PIXELS / 2 - 1;
+    let y = sy - CELL_PIXELS / 2 - 5;
+    let idx = ((y as u32 * frame.width + x as u32) * 4) as usize;
+    [
+        frame.pixels[idx],
+        frame.pixels[idx + 1],
+        frame.pixels[idx + 2],
+        frame.pixels[idx + 3],
+    ]
+}
+
+#[test]
+fn synthetic_battle_attack_kill_and_health_bar_rendering() {
+    let seed = 0xBA77_1E00;
+    let (mut core, jeeps, target) = support::synthetic_core_with_armed_units(seed);
+    // Tall enough to actually include row-10 units (pixel y=252): a 320x240
+    // viewport at the origin would clip them below the visible area.
+    core.handle(ra_client::input::InputEvent::Resize {
+        width: 480,
+        height: 320,
+    });
+    core.set_camera(0.0, 0.0);
+    assert_eq!(jeeps.len(), 3);
+
+    // Target sits at cell (16,10) (see `support::synthetic_world_with_armed_units`);
+    // screen position with the camera at the origin.
+    let target_sx = 16 * CELL_PIXELS + CELL_PIXELS / 2;
+    let target_sy = 10 * CELL_PIXELS + CELL_PIXELS / 2;
+
+    // Before any order: unselected, undamaged — no health bar for the
+    // target, so its backing pixel must not be the bar's black.
+    let frame_before = core.compose(core.camera_rect());
+    let pixel_before = health_bar_backing_pixel(&frame_before, target_sx, target_sy);
+    assert_ne!(
+        pixel_before,
+        [0, 0, 0, 255],
+        "target's health-bar pixel is already black before any damage — test fixture assumption \
+         broken (terrain there happens to be black), pick a different probe pixel"
+    );
+
+    // Box-select the 3 jeeps only (their cells (10,10)-(14,10) map to pixels
+    // ~(240,240)-(348,264); a box out to x=370 stays short of the target at
+    // x=396, matching `support`'s armed-fixture layout).
+    core.handle(ra_client::input::InputEvent::MouseDown {
+        button: ra_client::input::MouseButton::Left,
+        x: 0,
+        y: 0,
+    });
+    core.handle(ra_client::input::InputEvent::MouseMoved { x: 370, y: 280 });
+    core.handle(ra_client::input::InputEvent::MouseUp {
+        button: ra_client::input::MouseButton::Left,
+        x: 370,
+        y: 280,
+    });
+    assert_eq!(
+        core.selected_handles().len(),
+        3,
+        "box-select should pick up exactly the 3 armed jeeps, not the target"
+    );
+
+    // Right-click the target: an Attack order for every armed selected unit.
+    core.handle(ra_client::input::InputEvent::MouseDown {
+        button: ra_client::input::MouseButton::Right,
+        x: target_sx,
+        y: target_sy,
+    });
+    let emitted = core.drain_commands();
+    assert_eq!(emitted.len(), 3, "all 3 armed jeeps should attack");
+    for cmd in &emitted {
+        match *cmd {
+            Command::Attack {
+                unit,
+                target: t,
+                house,
+            } => {
+                assert_eq!(house, 1);
+                assert!(jeeps.contains(&unit));
+                assert_eq!(t, ra_sim::Target::Unit(target));
+            }
+            other => panic!("expected only Attack commands, got {other:?}"),
+        }
+    }
+
+    // Step until the target has taken damage (still alive).
+    let mut damaged = false;
+    for _ in 0..60 {
+        core.update(67);
+        if core
+            .world()
+            .units
+            .get(target)
+            .map(|u| u.health)
+            .unwrap_or(0)
+            < 150
+        {
+            damaged = true;
+            break;
+        }
+    }
+    assert!(damaged, "target never took damage");
+    let frame_damaged = core.compose(core.camera_rect());
+
+    let pixel_damaged = health_bar_backing_pixel(&frame_damaged, target_sx, target_sy);
+    assert_eq!(
+        pixel_damaged,
+        [0, 0, 0, 255],
+        "a damaged, unselected unit should now be drawing a health bar (black backing pixel)"
+    );
+
+    // Step until the target dies (arena removal).
+    let mut died = false;
+    for _ in 0..500 {
+        core.update(67);
+        if !core.world().units.contains(target) {
+            died = true;
+            break;
+        }
+    }
+    assert!(died, "target should have been destroyed");
+    // A few more idle-ish updates so any transient muzzle-flash frame from
+    // the instant the killing shot landed has passed (the jeeps' TarCom
+    // clears the tick after the target dies — `run_combat`'s stale-target
+    // handling — so this is just settling, not masking a real signal).
+    for _ in 0..5 {
+        core.update(67);
+    }
+    let frame_after_death = core.compose(core.camera_rect());
+    let pixel_after_death = health_bar_backing_pixel(&frame_after_death, target_sx, target_sy);
+    assert_ne!(
+        pixel_after_death,
+        [0, 0, 0, 255],
+        "post-death frame must no longer draw the target's health bar"
+    );
+    assert_eq!(
+        pixel_after_death, pixel_before,
+        "post-death, the target's former position should look exactly like it did before combat \
+         (nothing left to draw there — the unit is gone from the arena)"
+    );
+}
+
+// ---------------------------------------------------------------------
 // Real-scenario variant: scg01ea's actual starting units.
 // ---------------------------------------------------------------------
 
@@ -257,4 +421,150 @@ fn pick_real_destination(core: &ra_client::appcore::AppCore, anchor: CellCoord) 
         }
     }
     anchor
+}
+
+// ---------------------------------------------------------------------
+// Real-asset battle variant: a real 2TNK vs a real HARV, real rules.ini
+// weapon/armor stats, driven through the same click path. Skips cleanly
+// without assets.
+// ---------------------------------------------------------------------
+
+#[test]
+fn real_battle_attack_kill_and_health_bar_rendering() {
+    if !support::real_assets_available() {
+        eprintln!(
+            "SKIP: real assets not found under {} (set RA_ASSETS_DIR or copy \
+             main.mix/redalert.mix into assets/ to run this test)",
+            support::assets_dir().display()
+        );
+        return;
+    }
+    let setup = match ra_client::assets::load_battle_from_dir(&support::assets_dir(), "scg01ea.ini")
+    {
+        Ok(s) => s,
+        Err(e) => panic!("real battle setup should load from present assets: {e}"),
+    };
+    let ra_client::assets::BattleSetup {
+        mut core,
+        attacker,
+        attacker_cell,
+        target,
+        target_cell,
+        weapon,
+        target_max_hp,
+        ..
+    } = setup;
+    assert!(weapon.warhead_ap, "2TNK's 90mm should be AP, per rules.ini");
+
+    // Camera framing both combatants with margin above for the health bar.
+    let cam_x = ((attacker_cell.x - 3) * CELL_PIXELS) as f32;
+    let cam_y = ((attacker_cell.y - 3) * CELL_PIXELS) as f32;
+    core.handle(ra_client::input::InputEvent::Resize {
+        width: 320,
+        height: 240,
+    });
+    core.set_camera(cam_x, cam_y);
+
+    let target_sx = (target_cell.x * CELL_PIXELS + CELL_PIXELS / 2) as i64 - cam_x as i64;
+    let target_sy = (target_cell.y * CELL_PIXELS + CELL_PIXELS / 2) as i64 - cam_y as i64;
+
+    let frame_before = core.compose(core.camera_rect());
+    let pixel_before = health_bar_backing_pixel(&frame_before, target_sx as i32, target_sy as i32);
+    assert_ne!(
+        pixel_before,
+        [0, 0, 0, 255],
+        "target's health-bar pixel is already black before any damage"
+    );
+
+    // Click-select the attacker directly (a single unit, not a box).
+    let attacker_sx = (attacker_cell.x * CELL_PIXELS + CELL_PIXELS / 2) as i64 - cam_x as i64;
+    let attacker_sy = (attacker_cell.y * CELL_PIXELS + CELL_PIXELS / 2) as i64 - cam_y as i64;
+    core.handle(ra_client::input::InputEvent::MouseDown {
+        button: ra_client::input::MouseButton::Left,
+        x: attacker_sx as i32,
+        y: attacker_sy as i32,
+    });
+    core.handle(ra_client::input::InputEvent::MouseUp {
+        button: ra_client::input::MouseButton::Left,
+        x: attacker_sx as i32,
+        y: attacker_sy as i32,
+    });
+    assert_eq!(core.selected_handles(), vec![attacker]);
+
+    core.handle(ra_client::input::InputEvent::MouseDown {
+        button: ra_client::input::MouseButton::Right,
+        x: target_sx as i32,
+        y: target_sy as i32,
+    });
+    let emitted = core.drain_commands();
+    assert_eq!(emitted.len(), 1);
+    match emitted[0] {
+        Command::Attack {
+            unit,
+            target: t,
+            house,
+        } => {
+            assert_eq!(unit, attacker);
+            assert_eq!(t, ra_sim::Target::Unit(target));
+            assert_eq!(house, core.world().units.get(attacker).unwrap().house);
+        }
+        other => panic!("expected an Attack command, got {other:?}"),
+    }
+
+    // Bound the wait generously: shots-to-kill * ROF * a safety factor, plus
+    // approach time (attacker/target are already 3 cells apart, inside
+    // 90mm's 4.75-cell range, so no approach is actually needed, but the
+    // margin costs nothing).
+    let shots_to_kill = (target_max_hp as i64 / weapon.damage.max(1) as i64) + 2;
+    let bound_ticks = (shots_to_kill * weapon.rof as i64 * 2 + 200) as u32;
+
+    let mut damaged = false;
+    let mut hp_at_damage = target_max_hp;
+    for _ in 0..bound_ticks {
+        core.update(67);
+        if let Some(u) = core.world().units.get(target) {
+            if u.health < target_max_hp {
+                damaged = true;
+                hp_at_damage = u.health;
+                break;
+            }
+        } else {
+            break; // died before we ever observed a partial-damage frame
+        }
+    }
+    if damaged {
+        let frame_damaged = core.compose(core.camera_rect());
+        let pixel_damaged =
+            health_bar_backing_pixel(&frame_damaged, target_sx as i32, target_sy as i32);
+        assert_eq!(
+            pixel_damaged,
+            [0, 0, 0, 255],
+            "a damaged, unselected real unit should now be drawing a health bar \
+             (health {hp_at_damage}/{target_max_hp})"
+        );
+    }
+
+    let mut died = false;
+    for _ in 0..bound_ticks {
+        core.update(67);
+        if !core.world().units.contains(target) {
+            died = true;
+            break;
+        }
+    }
+    assert!(
+        died,
+        "real target should have been destroyed within {bound_ticks} ticks"
+    );
+    for _ in 0..5 {
+        core.update(67);
+    }
+    let frame_after_death = core.compose(core.camera_rect());
+    let pixel_after_death =
+        health_bar_backing_pixel(&frame_after_death, target_sx as i32, target_sy as i32);
+    assert_ne!(
+        pixel_after_death,
+        [0, 0, 0, 255],
+        "post-death frame must no longer draw the real target's health bar"
+    );
 }

@@ -243,6 +243,91 @@ pub fn synthetic_core_with_units(seed: u32) -> (AppCore, Vec<Handle>) {
     (core, jeeps)
 }
 
+/// A hand-built weapon profile shaped like 2TNK's real 90mm cannon (AP,
+/// Damage 30, ROF 50, Range 4.75 cells, Speed 40 -> 102 leptons/tick,
+/// non-instant) — the same numbers `ra_sim::world`'s own combat unit tests
+/// and `ra-sim/tests/firing_fsm.rs` use, so a UI-level battle exercises
+/// realistic pacing (a shot roughly every 50 ticks, several ticks of
+/// straight bullet flight) rather than an instant one-shot kill.
+fn synthetic_ninety_mm() -> ra_sim::WeaponProfile {
+    fn pct5(p: [i32; 5]) -> [i32; 5] {
+        let mut o = [0i32; 5];
+        for (d, v) in o.iter_mut().zip(p) {
+            *d = v * 65536 / 100;
+        }
+        o
+    }
+    ra_sim::WeaponProfile {
+        damage: 30,
+        rof: 50,
+        range: 1216,
+        proj_speed: 102,
+        proj_rot: 0,
+        invisible: false,
+        instant: false,
+        warhead: ra_sim::WarheadProfile {
+            spread: 3,
+            verses: pct5([30, 75, 75, 100, 50]),
+        },
+        warhead_ap: true,
+        arcing: false,
+        ballistic_scatter: 256,
+        homing_scatter: 512,
+        min_damage: 1,
+        max_damage: 1000,
+    }
+}
+
+/// Like [`synthetic_world_with_units`], but every house-1 "jeep" is armed
+/// (a 90mm-shaped weapon, see [`synthetic_ninety_mm`]) and the house-2
+/// witness unit sits close enough (2 cells from the nearest jeep, well
+/// inside the weapon's 4.75-cell range) that an `Attack` order issued
+/// through `AppCore`'s real click path can actually converge into gunfire
+/// within a modest tick budget — unlike the unarmed
+/// [`synthetic_world_with_units`], which can never emit a well-formed
+/// `Attack` at all (`AppCore::issue_order` only orders *armed* selected
+/// units to attack), leaving that whole `Command` variant unexercised by
+/// any always-run (no-real-assets) UI suite. Returns the world, the 3
+/// house-1 jeep handles, and the house-2 target handle.
+pub fn synthetic_world_with_armed_units(seed: u32) -> (World, Vec<Handle>, Handle) {
+    let mut world = World::new(ra_sim::Passability::all_passable(), seed);
+    let jeep_stats = MoveStats {
+        max_speed: 25,
+        rot: 10,
+    };
+    let mut jeeps = Vec::new();
+    for i in 0..3i32 {
+        let h = world.spawn_unit(0, 1, synthetic_unit_cell(i), Facing(0), 400, jeep_stats);
+        world.set_unit_combat(h, 3 /* heavy */, Some(synthetic_ninety_mm()), true);
+        jeeps.push(h);
+    }
+    // 2 cells east of the third jeep (synthetic_unit_cell(2) = (14,10)):
+    // close enough to be in range almost immediately.
+    let target = world.spawn_unit(
+        1,
+        2,
+        CellCoord::new(16, 10),
+        Facing(0),
+        150,
+        MoveStats {
+            max_speed: 20,
+            rot: 8,
+        },
+    );
+    world.set_unit_combat(target, 3, None, false); // unarmed — a pure target
+    (world, jeeps, target)
+}
+
+/// [`synthetic_core`] plus [`synthetic_world_with_armed_units`], wrapped in
+/// an `AppCore`. Companion to [`synthetic_core_with_units`] for combat
+/// coverage (see that helper's docs on why sprites aren't needed).
+pub fn synthetic_core_with_armed_units(seed: u32) -> (AppCore, Vec<Handle>, Handle) {
+    let (raster, palette) = synthetic_fixture();
+    let (world, jeeps, target) = synthetic_world_with_armed_units(seed);
+    let core = AppCore::with_sim(raster.clone(), *palette, world, Vec::new(), Vec::new());
+    (core, jeeps, target)
+}
+
 /// Load the M2/M3 reference scenario (`scg01ea.ini`) as a fully playable
 /// [`LoadedGame`] (terrain + real spawned units) from the real assets, or
 /// print a skip notice and return `None`. Companion to [`load_real_core`]

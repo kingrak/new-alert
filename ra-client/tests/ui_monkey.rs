@@ -36,7 +36,7 @@ use proptest::test_runner::{Config as ProptestRunnerConfig, TestRunner};
 
 use ra_client::appcore::AppCore;
 use ra_client::input::{InputEvent, Key, MouseButton};
-use ra_sim::Command;
+use ra_sim::{Command, Target};
 
 /// One fuzzed operation: either an `InputEvent` or a virtual-time tick.
 /// `AppCore::update` isn't itself part of `InputEvent`, so the monkey
@@ -209,6 +209,9 @@ fn apply_op_with_units(core: &mut AppCore, op: MonkeyOp, index: usize) {
         let (unit, house) = match cmd {
             Command::Move { unit, house, .. } => (unit, house),
             Command::Stop { unit, house } => (unit, house),
+            // M4: an attack order also carries the issuing unit + house; the same
+            // liveness/ownership invariant applies.
+            Command::Attack { unit, house, .. } => (unit, house),
         };
         let owner = core.world().units.get(unit).unwrap_or_else(|| {
             panic!("drained {cmd:?} addresses a handle that isn't live in the world")
@@ -270,4 +273,92 @@ fn real_scg01ea_monkey_with_units_never_panics() {
     });
     result
         .expect("real-asset units monkey sequence should never panic or yield a malformed command");
+}
+
+// ---------------------------------------------------------------------
+// Armed-units variant (M4, new): both the existing units-variants above use
+// `synthetic_world_with_units`/`load_real_game`, whose *synthetic* fixture
+// has no armed unit at all — `AppCore::issue_order` only emits `Attack` for
+// an armed selected unit (unarmed ones are silently skipped), so
+// `synthetic_monkey_with_units_never_panics` can never actually generate an
+// `Attack` command; only the assets-gated real-scenario variant (JEEPs with
+// a real M60mg) ever could, and that one skips cleanly in CI without assets.
+// That leaves `Attack`'s well-formedness genuinely unexercised by any
+// always-run suite. `support::synthetic_world_with_armed_units` closes that
+// gap: armed house-1 jeeps within immediate range of a house-2 target, so
+// fuzzed click sequences can and do produce `Attack` orders without needing
+// real assets. Same invariant as `apply_op_with_units`, plus an explicit
+// check that no drained `Attack` ever targets a unit of the *same* house as
+// the issuing unit (self/friendly-fire targeting must be structurally
+// impossible via the click path — `AppCore::issue_order` only treats a
+// different-house unit as "enemy").
+// ---------------------------------------------------------------------
+
+fn apply_op_with_armed_units(core: &mut AppCore, op: MonkeyOp, index: usize) {
+    match op {
+        MonkeyOp::Event(ev) => core.handle(ev),
+        MonkeyOp::Update(dt) => core.update(dt),
+    }
+    for cmd in core.drain_commands() {
+        let (unit, house) = match cmd {
+            Command::Move { unit, house, .. } => (unit, house),
+            Command::Stop { unit, house } => (unit, house),
+            Command::Attack { unit, house, .. } => (unit, house),
+        };
+        let owner = core.world().units.get(unit).unwrap_or_else(|| {
+            panic!("drained {cmd:?} addresses a handle that isn't live in the world")
+        });
+        assert_eq!(
+            house, owner.house,
+            "drained {cmd:?} has house {house}, but the unit it addresses is owned by house {}",
+            owner.house
+        );
+        if let Command::Attack {
+            target: Target::Unit(target),
+            house,
+            ..
+        } = cmd
+        {
+            if let Some(target_unit) = core.world().units.get(target) {
+                assert_ne!(
+                    target_unit.house, house,
+                    "drained {cmd:?} orders house {house} to attack its own unit \
+                     (target is also house {house}) — self/friendly targeting must be \
+                     structurally unreachable through the click path"
+                );
+            }
+            // A stale/dead target handle is fine (the unit may have died
+            // between the click and the drain in a fuzzed sequence); only a
+            // *live* same-house target would be the structural bug.
+        }
+    }
+    if index.is_multiple_of(COMPOSE_EVERY) {
+        let frame = core.compose_camera();
+        let (vw, vh) = core.viewport_size();
+        assert_eq!(frame.width, vw);
+        assert_eq!(frame.height, vh);
+    }
+}
+
+fn apply_ops_with_armed_units(core: &mut AppCore, ops: &[MonkeyOp]) {
+    core.handle(InputEvent::Resize {
+        width: 64,
+        height: 48,
+    });
+    for (i, &op) in ops.iter().enumerate() {
+        apply_op_with_armed_units(core, op, i);
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(64))]
+
+    /// Always-run: fuzzed event sequences against the armed synthetic
+    /// fixture. No panic, every drained command well-formed, and no
+    /// self-targeting `Attack` ever slips through.
+    #[test]
+    fn synthetic_monkey_with_armed_units_never_panics(ops in ops_strategy(200..800)) {
+        let (mut core, _jeeps, _target) = support::synthetic_core_with_armed_units(0xA24E_D000);
+        apply_ops_with_armed_units(&mut core, &ops);
+    }
 }

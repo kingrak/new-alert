@@ -11,6 +11,7 @@ use std::collections::BTreeSet;
 use std::error::Error;
 use std::path::Path;
 
+use ra_data::combat::{resolve_unit_combat, WeaponDef};
 use ra_data::house::{build_house_remaps, identity_remap, RemapTable, HOUSE_COUNT};
 use ra_data::passability;
 use ra_data::rules::unit_stats;
@@ -23,7 +24,7 @@ use ra_formats::pal::Palette as PalFile;
 use ra_formats::tmpl::Template;
 
 use ra_sim::coords::{CellCoord, Facing};
-use ra_sim::{MoveStats, Passability, World};
+use ra_sim::{Handle, MoveStats, Passability, World};
 
 use crate::appcore::AppCore;
 use crate::compositor::Palette;
@@ -263,6 +264,16 @@ pub fn load_game_from_bytes(
                 rot: stats.rot,
             },
         );
+        world.set_unit_max_health(handle, max_strength.clamp(1, u16::MAX as i32) as u16);
+        // Combat stats (armor, primary weapon, turret) resolved from rules.ini.
+        if let Some(combat) = resolve_unit_combat(&rules, &key) {
+            world.set_unit_combat(
+                handle,
+                combat.armor,
+                combat.weapon.as_ref().map(weapon_to_profile),
+                combat.has_turret,
+            );
+        }
         spawned.push(SpawnInfo {
             handle,
             unit_type: p.unit_type.clone(),
@@ -284,4 +295,192 @@ pub fn load_game_from_bytes(
         playable,
         skipped,
     })
+}
+
+/// A scripted 1-v-1 battle set up for the M4 verification path: a real 2TNK
+/// attacker and an enemy HARV, spawned adjacent on a real scenario's terrain,
+/// with real rules-driven weapon/armor stats. The bin drives the attack through
+/// the [`AppCore`] seam and dumps a PNG sequence.
+pub struct BattleSetup {
+    /// Terrain + the two combatants, ready to drive.
+    pub core: AppCore,
+    /// The attacking 2TNK (house 0).
+    pub attacker: Handle,
+    /// The 2TNK's spawn cell.
+    pub attacker_cell: CellCoord,
+    /// The target HARV (house 1).
+    pub target: Handle,
+    /// The HARV's spawn cell.
+    pub target_cell: CellCoord,
+    /// The attacker's resolved primary weapon (for the damage-math report).
+    pub weapon: WeaponDef,
+    /// The target's armor class index (for the damage-math report).
+    pub target_armor: u8,
+    /// The target's max strength (for the shots-to-kill report).
+    pub target_max_hp: u16,
+}
+
+/// Load a scripted 2TNK-vs-HARV battle from the archives under `dir`.
+pub fn load_battle_from_dir(
+    dir: &Path,
+    scenario_name: &str,
+) -> Result<BattleSetup, Box<dyn Error>> {
+    let main_bytes =
+        std::fs::read(dir.join("main.mix")).map_err(|e| format!("reading main.mix: {e}"))?;
+    let redalert_bytes = std::fs::read(dir.join("redalert.mix"))
+        .map_err(|e| format!("reading redalert.mix: {e}"))?;
+    load_battle_from_bytes(&main_bytes, &redalert_bytes, scenario_name)
+}
+
+/// Build the scripted battle from in-memory archives. Terrain and palette come
+/// from `scenario_name`; the two combatants are spawned by this function (not
+/// from the scenario `[UNITS]`) so the fight is controlled and reproducible.
+pub fn load_battle_from_bytes(
+    main_bytes: &[u8],
+    redalert_bytes: &[u8],
+    scenario_name: &str,
+) -> Result<BattleSetup, Box<dyn Error>> {
+    let main = MixArchive::parse(main_bytes)?;
+    let redalert = MixArchive::parse(redalert_bytes)?;
+
+    // Terrain raster + palette.
+    let loaded = load_from_bytes(main_bytes, redalert_bytes, scenario_name)?;
+    let raster = rasterize(&loaded.scenario, &loaded.tiles);
+    let palette = loaded.palette;
+    let scenario = loaded.scenario;
+
+    // rules.ini + remaps.
+    let local = redalert.open_nested("local.mix")?;
+    let rules = Ini::parse(&String::from_utf8_lossy(
+        local.get("rules.ini").ok_or("rules.ini not found")?,
+    ));
+    let remaps: Vec<RemapTable> = match local.get("palette.cps") {
+        Some(cps_bytes) => match Cps::parse(cps_bytes) {
+            Ok(cps) => build_house_remaps(&cps).to_vec(),
+            Err(_) => vec![identity_remap(); HOUSE_COUNT],
+        },
+        None => vec![identity_remap(); HOUSE_COUNT],
+    };
+
+    let conquer = main.open_nested("conquer.mix")?;
+    let passable = passability::build(&scenario);
+    let grid = Passability::new(128, 128, passable);
+    let mut world = World::new(grid, 0x1234_5678);
+    let mut sprites: Vec<UnitSprite> = Vec::new();
+
+    // Place the two combatants two cells apart near the playable-rect centre, on
+    // passable ground (2TNK's 90mm range is 4.75 cells, so this starts in range).
+    let cx = scenario.map_x as i32 + scenario.map_width as i32 / 2;
+    let cy = scenario.map_y as i32 + scenario.map_height as i32 / 2;
+    let attacker_cell = CellCoord::new(cx - 1, cy);
+    let target_cell = CellCoord::new(cx + 2, cy);
+
+    let (attacker, weapon, _) = spawn_named(
+        &mut world,
+        &mut sprites,
+        &conquer,
+        &rules,
+        "2TNK",
+        0,
+        attacker_cell,
+    )?;
+    let (target, _, target_armor) = spawn_named(
+        &mut world,
+        &mut sprites,
+        &conquer,
+        &rules,
+        "HARV",
+        1,
+        target_cell,
+    )?;
+    let target_max_hp = world.units.get(target).map(|u| u.max_health).unwrap_or(1);
+    let weapon = weapon.ok_or("2TNK resolved without a weapon")?;
+
+    let core = AppCore::with_sim(raster, palette, world, sprites, remaps);
+    Ok(BattleSetup {
+        core,
+        attacker,
+        attacker_cell,
+        target,
+        target_cell,
+        weapon,
+        target_armor,
+        target_max_hp,
+    })
+}
+
+/// Spawn one named unit (resolving sprite, movement, and combat stats from the
+/// archives) at `cell`, returning its handle, resolved weapon, and armor. A new
+/// sprite is appended for each call; `type_id` is the sprite index.
+fn spawn_named(
+    world: &mut World,
+    sprites: &mut Vec<UnitSprite>,
+    conquer: &MixArchive,
+    rules: &Ini,
+    name: &str,
+    house: u8,
+    cell: CellCoord,
+) -> Result<(Handle, Option<WeaponDef>, u8), Box<dyn Error>> {
+    let key = name.to_ascii_uppercase();
+    let stats = unit_stats(rules, &key).ok_or_else(|| format!("no rules stats for {key}"))?;
+    let shp = format!("{}.shp", key.to_ascii_lowercase());
+    let sprite = conquer
+        .get(&shp)
+        .and_then(|b| UnitSprite::from_shp_bytes(b).ok())
+        .ok_or_else(|| format!("no sprite {shp}"))?;
+    let type_id = sprites.len() as u32;
+    sprites.push(sprite);
+
+    let max_hp = stats.strength.clamp(1, u16::MAX as i32) as u16;
+    let handle = world.spawn_unit(
+        type_id,
+        house,
+        cell,
+        Facing(0),
+        max_hp,
+        MoveStats {
+            max_speed: stats.max_speed_leptons(),
+            rot: stats.rot,
+        },
+    );
+    world.set_unit_max_health(handle, max_hp);
+    let combat = resolve_unit_combat(rules, &key);
+    let (weapon, armor) = match &combat {
+        Some(c) => {
+            world.set_unit_combat(
+                handle,
+                c.armor,
+                c.weapon.as_ref().map(weapon_to_profile),
+                c.has_turret,
+            );
+            (c.weapon, c.armor)
+        }
+        None => (None, 0),
+    };
+    Ok((handle, weapon, armor))
+}
+
+/// Lift a `ra-data` resolved [`WeaponDef`] (plain numbers) into the sim's
+/// runtime `WeaponProfile`, exactly as `MoveStats` is lifted from `UnitStats`.
+/// The crate split keeps `ra-sim` off the INI layer (DESIGN.md §4.1).
+pub fn weapon_to_profile(w: &WeaponDef) -> ra_sim::WeaponProfile {
+    ra_sim::WeaponProfile {
+        damage: w.damage,
+        rof: w.rof,
+        range: w.range,
+        proj_speed: w.proj_speed,
+        proj_rot: w.proj_rot,
+        invisible: w.invisible,
+        instant: w.instant,
+        warhead: ra_sim::WarheadProfile {
+            spread: w.spread,
+            verses: w.verses,
+        },
+        warhead_ap: w.warhead_ap,
+        arcing: w.arcing,
+        ballistic_scatter: w.ballistic_scatter,
+        homing_scatter: w.homing_scatter,
+        min_damage: w.min_damage,
+        max_damage: w.max_damage,
+    }
 }

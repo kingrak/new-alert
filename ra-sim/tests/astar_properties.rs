@@ -55,16 +55,15 @@ fn grid_and_endpoints() -> impl Strategy<Value = (Passability, CellCoord, CellCo
 /// agreement with `find_path`'s `Some`/`None` is a real cross-check of
 /// completeness (does A* find a path whenever one exists?), not a tautology.
 fn bfs_reachable(grid: &Passability, start: CellCoord, goal: CellCoord) -> bool {
-    // Mirror `find_path`'s own check order exactly: `start == goal`
-    // short-circuits *before* the passability check (see the doc comment on
-    // `off_grid_equal_start_and_goal_short_circuits_before_bounds_check` for
-    // why that's worth a second look, but it's the real, current contract
-    // this oracle needs to agree with).
-    if start == goal {
-        return true;
-    }
+    // Mirror `find_path`'s own check order exactly (post-fix): endpoint
+    // validity is checked *before* the `start == goal` short-circuit, so an
+    // off-grid or impassable cell asked to path to itself is `None`, not an
+    // empty path (see `off_grid_equal_start_and_goal_returns_none`).
     if !grid.is_passable(start) || !grid.is_passable(goal) {
         return false;
+    }
+    if start == goal {
+        return true;
     }
     use std::collections::VecDeque;
     let mut seen = std::collections::HashSet::new();
@@ -187,23 +186,27 @@ proptest! {
         let start = CellCoord::new(sx, sy);
         let goal = CellCoord::new(gx, gy);
         let on_grid = |c: CellCoord| c.x >= 0 && c.x < w && c.y >= 0 && c.y < h;
-        if start != goal && (!on_grid(start) || !on_grid(goal)) {
+        // Post-fix, endpoint validity is checked before the `start == goal`
+        // short-circuit, so *any* off-grid endpoint yields `None` — including
+        // the degenerate `start == goal` case (pinned separately below).
+        if !on_grid(start) || !on_grid(goal) {
             prop_assert_eq!(find_path(&grid, start, goal), None);
         }
     }
 
-    /// The specific degenerate case excluded above, pinned explicitly so the
-    /// current (documented-as-a-finding) behavior is visible and regression-
-    /// guarded rather than silently unexercised: an off-grid `start == goal`
-    /// returns `Some(empty)`, not `None`.
+    /// Pinned-finding fix (was
+    /// `off_grid_equal_start_and_goal_short_circuits_before_bounds_check`). An
+    /// off-grid `start == goal` used to short-circuit to `Some(empty)` *before*
+    /// the bounds check; it now returns `None`, because endpoint validity is
+    /// checked first. Guards the corrected contract.
     #[test]
-    fn off_grid_equal_start_and_goal_short_circuits_before_bounds_check(
+    fn off_grid_equal_start_and_goal_returns_none(
         w in 4i32..16, h in 4i32..16, x in 20i32..30, y in 20i32..30,
     ) {
         let n = (w * h) as usize;
         let grid = Passability::new(w, h, vec![true; n]);
         let c = CellCoord::new(x, y); // off-grid: x,y >= w,h by construction
-        prop_assert_eq!(find_path(&grid, c, c), Some(Vec::new()));
+        prop_assert_eq!(find_path(&grid, c, c), None);
     }
 }
 

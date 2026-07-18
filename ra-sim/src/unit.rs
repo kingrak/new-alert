@@ -4,6 +4,7 @@
 //! arena. All state is fixed-point / integer so the whole struct hashes
 //! bit-identically (§4.2).
 
+use crate::combat::{Target, WeaponProfile};
 use crate::coords::{CellCoord, Facing, WorldCoord};
 use crate::hash::Fnv1a;
 
@@ -34,15 +35,34 @@ pub struct Unit {
     pub coord: WorldCoord,
     /// Current body facing (binary angle).
     pub facing: Facing,
-    /// Current strength/health (0..=max). M3 never damages units; carried so
-    /// spawns from the scenario preserve it and it folds into the hash.
+    /// Current strength/health (0..=max_health).
     pub health: u16,
+    /// Maximum strength (`Strength=`). Constant per unit; used for the health
+    /// fraction the client renders. Defaults to the spawn health (full).
+    pub max_health: u16,
     /// Movement stats resolved from rules.ini.
     pub stats: MoveStats,
     /// Remaining path waypoints (cell centres to visit, in order). Empty = idle.
     pub path: Vec<CellCoord>,
     /// Final ordered destination, if any (kept for re-issue/debug).
     pub dest: Option<CellCoord>,
+
+    // --- Combat (M4) ---
+    /// Armor class index (0=none … 3=steel/"heavy" … 4=concrete), from `Armor=`.
+    /// Selects the column of an attacker's warhead `Verses` matrix.
+    pub armor: u8,
+    /// Resolved primary weapon, or `None` for unarmed units (e.g. HARV).
+    pub weapon: Option<WeaponProfile>,
+    /// Whether the unit aims an independently-rotating turret (1TNK/2TNK/JEEP)
+    /// versus rotating its whole body to aim (turretless — e.g. HARV, if armed).
+    pub has_turret: bool,
+    /// Turret facing (binary angle). Equals `facing` for turretless units.
+    pub turret_facing: Facing,
+    /// Current attack target (unit handle or force-fire cell), if any. This is
+    /// the TarCom equivalent (`techno.h`).
+    pub target: Option<Target>,
+    /// Rearm countdown in ticks (`Arm`): 0 = ready to fire, else counting down.
+    pub arm: u16,
 }
 
 impl Unit {
@@ -61,10 +81,49 @@ impl Unit {
             coord: cell.center(),
             facing,
             health,
+            max_health: health.max(1),
             stats,
             path: Vec::new(),
             dest: None,
+            armor: 0,
+            weapon: None,
+            has_turret: false,
+            turret_facing: facing,
+            target: None,
+            arm: 0,
         }
+    }
+
+    /// Attach combat stats to a freshly-spawned unit (resolved from rules.ini by
+    /// `ra-data`). Turretless units keep the turret facing locked to the body.
+    pub fn set_combat(&mut self, armor: u8, weapon: Option<WeaponProfile>, has_turret: bool) {
+        self.armor = armor;
+        self.weapon = weapon;
+        self.has_turret = has_turret;
+        if !has_turret {
+            self.turret_facing = self.facing;
+        }
+    }
+
+    /// Set the maximum strength (called by the loader when a unit spawns at a
+    /// scenario health percentage below full).
+    pub fn set_max_health(&mut self, max_health: u16) {
+        self.max_health = max_health.max(1);
+    }
+
+    /// Whether the unit is alive (health above zero).
+    pub fn is_alive(&self) -> bool {
+        self.health > 0
+    }
+
+    /// Health as integer permille (0..=1000) of max — for the client's bar.
+    pub fn health_permille(&self) -> i32 {
+        (self.health as i32 * 1000 / self.max_health.max(1) as i32).clamp(0, 1000)
+    }
+
+    /// Whether the unit currently has an attack target.
+    pub fn has_target(&self) -> bool {
+        self.target.is_some()
     }
 
     /// Whether the unit currently has somewhere to go.
@@ -86,6 +145,7 @@ impl Unit {
         h.write_i32(self.coord.y.0);
         h.write_u8(self.facing.0);
         h.write_u16(self.health);
+        h.write_u16(self.max_health);
         h.write_i32(self.stats.max_speed);
         h.write_u8(self.stats.rot);
         h.write_u32(self.path.len() as u32);
@@ -100,6 +160,32 @@ impl Unit {
                 h.write_i32(c.y);
             }
             None => h.write_u8(0),
+        }
+
+        // Combat state.
+        h.write_u8(self.armor);
+        h.write_u8(self.has_turret as u8);
+        h.write_u8(self.turret_facing.0);
+        h.write_u16(self.arm);
+        match &self.weapon {
+            Some(w) => {
+                h.write_u8(1);
+                w.hash_into(h);
+            }
+            None => h.write_u8(0),
+        }
+        match self.target {
+            None => h.write_u8(0),
+            Some(Target::Unit(handle)) => {
+                h.write_u8(1);
+                h.write_u32(handle.index);
+                h.write_u32(handle.gen);
+            }
+            Some(Target::Cell(c)) => {
+                h.write_u8(2);
+                h.write_i32(c.x);
+                h.write_i32(c.y);
+            }
         }
     }
 }

@@ -10,18 +10,22 @@
 //! commit: fixed-point arithmetic only — floating point is a compile error in
 //! this crate (see the crate-level attribute below). Keep it here permanently.
 //!
-//! Modules (M3):
+//! Modules:
 //! - [`coords`] — leptons, cells, world coordinates, binary-angle facings.
 //! - [`fixed`]  — a 16.16 fixed-point number for the few fractional needs.
 //! - [`rng`]    — the seeded LCG ported from the original `RandomClass`.
 //! - [`arena`]  — a generational arena addressed by [`arena::Handle`].
 //! - [`hash`]   — the hand-rolled FNV-1a per-tick state hasher.
 //! - [`path`]   — deterministic grid A* over a passability grid.
-//! - [`unit`]   — the movable [`unit::Unit`] entity and its movement stats.
+//! - [`combat`] — weapon/warhead profiles and the ported `Modify_Damage` (M4).
+//! - [`bullet`] — projectiles in flight (M4).
+//! - [`unit`]   — the movable [`unit::Unit`] entity, its movement + combat stats.
 //! - [`world`]  — [`World`], the command pipeline, and the fixed system order.
 #![deny(clippy::float_arithmetic)]
 
 pub mod arena;
+pub mod bullet;
+pub mod combat;
 pub mod coords;
 pub mod fixed;
 pub mod hash;
@@ -31,6 +35,8 @@ pub mod unit;
 pub mod world;
 
 pub use arena::{Arena, Handle};
+pub use bullet::Bullet;
+pub use combat::{modify_damage, Target, WarheadProfile, WeaponProfile, ARMOR_COUNT};
 pub use coords::{CellCoord, Facing, Lepton, WorldCoord, LEPTONS_PER_CELL};
 pub use path::Passability;
 pub use rng::RandomLcg;

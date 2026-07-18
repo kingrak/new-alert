@@ -120,14 +120,20 @@ fn heuristic(a: CellCoord, b: CellCoord) -> i32 {
 /// Find a shortest path from `start` to `goal` over `grid`.
 ///
 /// Returns the ordered list of cells to step through **after** `start`, up to
-/// and including `goal`. An empty vec means `start == goal`. `None` means the
-/// goal is off-grid, impassable, or unreachable.
+/// and including `goal`. An empty vec means `start == goal` **and** that cell is
+/// on-grid and passable. `None` means either endpoint is off-grid or impassable,
+/// or the goal is unreachable.
+///
+/// **Pinned-finding fix.** The endpoint validity check now runs *before* the
+/// `start == goal` short-circuit: an off-grid (or impassable) cell asked to
+/// "path to itself" returns `None`, not `Some(empty)`. Short-circuiting first
+/// let a degenerate off-grid start slip through as a spurious success.
 pub fn find_path(grid: &Passability, start: CellCoord, goal: CellCoord) -> Option<Vec<CellCoord>> {
-    if start == goal {
-        return Some(Vec::new());
-    }
     if !grid.is_passable(start) || !grid.is_passable(goal) {
         return None;
+    }
+    if start == goal {
+        return Some(Vec::new());
     }
 
     let n = (grid.width * grid.height) as usize;

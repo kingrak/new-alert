@@ -513,9 +513,15 @@ becomes a failing script committed with its fix.
 3. **M3 — Units**: spawn units, select, move with A*; sim/render split +
    command pipeline + state hash live from this milestone.
 4. **M4 — Combat**: weapons, warhead/armor matrix, damage, death, bullets.
-5. **M5 — Economy**: ore, harvester, refinery, power, build queue, placement.
-6. **M6 — Fog & AI**: shroud, basic skirmish AI (teamtype-driven like original).
-7. **M7 — Polish**: AUD audio, EVA, sidebar UI, palette effects.
+5. **M5 — Economy + minimal build UI**: ore, harvester, refinery, power, build
+   queue, placement — including a functional (not pretty) sidebar: build list,
+   queue clicks, placement grid. Production without UI is untestable as a game.
+6. **M6 — Fog & AI = FIRST PLAYABLE**: shroud, basic skirmish AI
+   (teamtype-driven like original), win/lose check. Exit criterion: a human
+   can play and win/lose a full skirmish — start with MCV/units, mine, build,
+   fight an AI that fights back — entirely in `ra-client window`.
+7. **M7 — Polish**: AUD audio, EVA, real sidebar art, radar, death anims /
+   explosions / splash damage, palette effects, campaign trigger logic.
 8. **M8 — LAN multiplayer**: `LanTransport` peer lockstep + snapshot resync
    (stage 2). Single-player releases happen well before this.
 9. **M9 — Server play**: relay/sequencer server, lobby, server-held replays

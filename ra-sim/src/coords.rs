@@ -119,6 +119,85 @@ pub fn isqrt(n: i64) -> i64 {
     x
 }
 
+/// Lepton distance between two world points, using the original's fast
+/// **"Dragon Strike"** octagonal metric — *not* Euclidean. Port of `Distance`
+/// (`redalert/coord.cpp:119`): `max(|dx|,|dy|) + min(|dx|,|dy|)/2`. This is the
+/// exact metric the engine uses for weapon-range and scatter-distance checks,
+/// so combat must use it (movement's straight-line stepping keeps [`isqrt`]).
+pub fn leptons_distance(a: WorldCoord, b: WorldCoord) -> i32 {
+    let dy = (a.y.0 - b.y.0).abs();
+    let dx = (a.x.0 - b.x.0).abs();
+    if dy > dx {
+        dy + ((dx as u32) / 2) as i32
+    } else {
+        dx + ((dy as u32) / 2) as i32
+    }
+}
+
+/// Move a world coordinate `distance` leptons along binary-angle `dir`. Port of
+/// `Coord_Move` / `Move_Point` (`redalert/coord.cpp:364`, `:432`) using the
+/// original's 256-entry cosine/sine tables and `calcx`/`calcy`
+/// (`common/misc.cpp`): `x += (cos*d)>>7`, `y += -((sin*d)>>7)` (screen-Y grows
+/// downward, hence the negated sine). Deterministic integer math; used for
+/// projectile-scatter displacement in combat.
+pub fn coord_move(start: WorldCoord, dir: Facing, distance: i32) -> WorldCoord {
+    let d = dir.0 as usize;
+    // calcx/calcy: (param * distance) >> 7, truncated to u16 then re-widened —
+    // faithful to `(unsigned short)(tmp >> 7)`. Distances here are tiny so the
+    // truncation is a no-op, but we mirror it exactly.
+    let cos = COS_TABLE[d] as i32; // signed char
+    let sin = SIN_TABLE[d] as i32;
+    let dx = ((((cos * distance) >> 7) as u16) as i16) as i32;
+    let dy = -(((((sin * distance) >> 7) as u16) as i16) as i32);
+    WorldCoord::new(start.x.0 + dx, start.y.0 + dy)
+}
+
+/// Cosine lookup, 256 binary-angle steps, values are signed `char` in ±0x7f.
+/// Verbatim from `Move_Point` (`redalert/coord.cpp`).
+static COS_TABLE: [i8; 256] = cos_sin_tables().0;
+/// Sine lookup, 256 binary-angle steps. Verbatim from `Move_Point`.
+static SIN_TABLE: [i8; 256] = cos_sin_tables().1;
+
+/// The original's cosine/sine byte tables. `SIN[i] == COS[(i+64) mod 256]`
+/// shifted per the source layout; we transcribe both directly to stay exact.
+const fn cos_sin_tables() -> ([i8; 256], [i8; 256]) {
+    // Transcribed byte-for-byte from `Move_Point`'s CosTable/SinTable
+    // (`redalert/coord.cpp`). `as i8` reinterprets the >0x7f bytes as negative,
+    // exactly as `(char)` does in the original.
+    const C: [u8; 256] = [
+        0x00, 0x03, 0x06, 0x09, 0x0c, 0x0f, 0x12, 0x15, 0x18, 0x1b, 0x1e, 0x21, 0x24, 0x27, 0x2a,
+        0x2d, 0x30, 0x33, 0x36, 0x39, 0x3b, 0x3e, 0x41, 0x43, 0x46, 0x49, 0x4b, 0x4e, 0x50, 0x52,
+        0x55, 0x57, 0x59, 0x5b, 0x5e, 0x60, 0x62, 0x64, 0x65, 0x67, 0x69, 0x6b, 0x6c, 0x6e, 0x6f,
+        0x71, 0x72, 0x74, 0x75, 0x76, 0x77, 0x78, 0x79, 0x7a, 0x7b, 0x7b, 0x7c, 0x7d, 0x7d, 0x7e,
+        0x7e, 0x7e, 0x7e, 0x7e, 0x7f, 0x7e, 0x7e, 0x7e, 0x7e, 0x7e, 0x7d, 0x7d, 0x7c, 0x7b, 0x7b,
+        0x7a, 0x79, 0x78, 0x77, 0x76, 0x75, 0x74, 0x72, 0x71, 0x70, 0x6e, 0x6c, 0x6b, 0x69, 0x67,
+        0x66, 0x64, 0x62, 0x60, 0x5e, 0x5b, 0x59, 0x57, 0x55, 0x52, 0x50, 0x4e, 0x4b, 0x49, 0x46,
+        0x43, 0x41, 0x3e, 0x3b, 0x39, 0x36, 0x33, 0x30, 0x2d, 0x2a, 0x27, 0x24, 0x21, 0x1e, 0x1b,
+        0x18, 0x15, 0x12, 0x0f, 0x0c, 0x09, 0x06, 0x03, 0x00, 0xfd, 0xfa, 0xf7, 0xf4, 0xf1, 0xee,
+        0xeb, 0xe8, 0xe5, 0xe2, 0xdf, 0xdc, 0xd9, 0xd6, 0xd3, 0xd0, 0xcd, 0xca, 0xc7, 0xc5, 0xc2,
+        0xbf, 0xbd, 0xba, 0xb7, 0xb5, 0xb2, 0xb0, 0xae, 0xab, 0xa9, 0xa7, 0xa5, 0xa2, 0xa0, 0x9e,
+        0x9c, 0x9a, 0x99, 0x97, 0x95, 0x94, 0x92, 0x91, 0x8f, 0x8e, 0x8c, 0x8b, 0x8a, 0x89, 0x88,
+        0x87, 0x86, 0x85, 0x85, 0x84, 0x83, 0x83, 0x82, 0x82, 0x82, 0x82, 0x82, 0x82, 0x82, 0x82,
+        0x82, 0x82, 0x82, 0x83, 0x83, 0x84, 0x85, 0x85, 0x86, 0x87, 0x88, 0x89, 0x8a, 0x8b, 0x8c,
+        0x8e, 0x8f, 0x90, 0x92, 0x94, 0x95, 0x97, 0x99, 0x9a, 0x9c, 0x9e, 0xa0, 0xa2, 0xa5, 0xa7,
+        0xa9, 0xab, 0xae, 0xb0, 0xb2, 0xb5, 0xb7, 0xba, 0xbd, 0xbf, 0xc2, 0xc5, 0xc7, 0xca, 0xcd,
+        0xd0, 0xd3, 0xd6, 0xd9, 0xdc, 0xdf, 0xe2, 0xe5, 0xe8, 0xeb, 0xee, 0xf1, 0xf4, 0xf7, 0xfa,
+        0xfd,
+    ];
+    // The original's SinTable equals CosTable advanced a quarter turn:
+    // SIN[i] == COS[(i + 64) & 255] (verified against the verbatim SinTable in
+    // `Move_Point`: SinTable[0]=0x7f=CosTable[64], etc.).
+    let mut cos = [0i8; 256];
+    let mut sin = [0i8; 256];
+    let mut i = 0;
+    while i < 256 {
+        cos[i] = C[i] as i8;
+        sin[i] = C[(i + 64) & 255] as i8;
+        i += 1;
+    }
+    (cos, sin)
+}
+
 /// A binary-angle facing: 0 = north, 64 = east, 128 = south, 192 = west,
 /// increasing clockwise. Wraparound is exact `u8` arithmetic.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Hash)]
@@ -276,6 +355,37 @@ mod tests {
         assert_eq!(isqrt(15), 3);
         assert_eq!(isqrt(16), 4);
         assert_eq!(isqrt(1_000_000), 1000);
+    }
+
+    #[test]
+    fn dragon_strike_distance() {
+        let o = WorldCoord::new(0, 0);
+        // Pure axis: distance == the axis delta.
+        assert_eq!(leptons_distance(o, WorldCoord::new(256, 0)), 256);
+        assert_eq!(leptons_distance(o, WorldCoord::new(0, 256)), 256);
+        // Octagonal metric: max + min/2. (300, 100) -> 300 + 50 = 350.
+        assert_eq!(leptons_distance(o, WorldCoord::new(300, 100)), 350);
+        assert_eq!(leptons_distance(o, WorldCoord::new(-100, 300)), 350);
+        assert_eq!(leptons_distance(o, o), 0);
+    }
+
+    #[test]
+    fn coord_move_cardinals() {
+        let o = WorldCoord::new(1000, 1000);
+        // North (screen-Y up): y decreases by ~dist, x ~unchanged.
+        let n = coord_move(o, Facing(0), 100);
+        assert!(n.y.0 < o.y.0 && (n.x.0 - o.x.0).abs() <= 1);
+        // East: x increases, y ~unchanged.
+        let e = coord_move(o, Facing(64), 100);
+        assert!(e.x.0 > o.x.0 && (e.y.0 - o.y.0).abs() <= 1);
+        // South: y increases.
+        let s = coord_move(o, Facing(128), 100);
+        assert!(s.y.0 > o.y.0);
+        // West: x decreases.
+        let w = coord_move(o, Facing(192), 100);
+        assert!(w.x.0 < o.x.0);
+        // Zero distance is a no-op.
+        assert_eq!(coord_move(o, Facing(37), 0), o);
     }
 }
 

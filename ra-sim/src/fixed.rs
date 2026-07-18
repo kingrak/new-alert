@@ -15,6 +15,12 @@ pub const ONE: i32 = 1 << FRAC_BITS;
 pub struct Fixed(pub i32);
 
 impl Fixed {
+    /// The largest representable value (`+32767.9999…`). Overflowing products
+    /// saturate here (see [`Fixed::mul`]).
+    pub const MAX: Fixed = Fixed(i32::MAX);
+    /// The smallest representable value (`-32768.0`).
+    pub const MIN: Fixed = Fixed(i32::MIN);
+
     /// The whole number `n` as a fixed-point value.
     pub fn from_int(n: i32) -> Fixed {
         Fixed(n << FRAC_BITS)
@@ -36,16 +42,27 @@ impl Fixed {
         self.0
     }
 
-    /// Product of two fixed-point values (64-bit intermediate, no overflow for
-    /// the magnitudes the sim uses).
+    /// Product of two fixed-point values.
+    ///
+    /// **Overflow contract (pinned finding fix).** The 16.16 layout's integer
+    /// part only spans ±32768, so a product whose magnitude exceeds that cannot
+    /// be represented. The computation is done in a 64-bit intermediate (so no
+    /// information is lost mid-multiply) and the result is then **saturated** to
+    /// the `Fixed` range rather than silently wrapping: an out-of-range positive
+    /// product clamps to [`Fixed::MAX`], a negative one to [`Fixed::MIN`]. This
+    /// is deterministic and monotonic (a bigger true product never yields a
+    /// smaller stored value), which a wrap would violate.
     #[allow(clippy::should_implement_trait)] // deliberate inherent method, not std::ops::Mul
     pub fn mul(self, other: Fixed) -> Fixed {
-        Fixed((((self.0 as i64) * (other.0 as i64)) >> FRAC_BITS) as i32)
+        let raw = ((self.0 as i64) * (other.0 as i64)) >> FRAC_BITS;
+        Fixed(raw.clamp(i32::MIN as i64, i32::MAX as i64) as i32)
     }
 
     /// Multiply a fixed fraction by an integer, returning a truncated integer.
+    /// Saturates to `i32` range on overflow (same contract as [`Fixed::mul`]).
     pub fn mul_int(self, n: i32) -> i32 {
-        (((self.0 as i64) * (n as i64)) >> FRAC_BITS) as i32
+        let raw = ((self.0 as i64) * (n as i64)) >> FRAC_BITS;
+        raw.clamp(i32::MIN as i64, i32::MAX as i64) as i32
     }
 }
 
@@ -81,32 +98,28 @@ mod tests {
         assert_eq!(quarter.mul_int(100), 25);
     }
 
-    /// **Structural finding, not a correctness claim.** `Fixed::mul` is a
-    /// bare `(a as i64 * b as i64 >> 16) as i32` with no overflow guard: a
-    /// 16.16 layout's integer part only spans ±32768, so multiplying two
-    /// `from_int`-built operands whose *product* exceeds that (easy to hit —
-    /// `36 * -911 = -32796` is already one unit past the negative edge)
-    /// silently wraps instead of panicking or saturating, and the mul's own
-    /// doc comment only promises correctness "for the magnitudes the sim
-    /// uses" without stating what that bound is. This test pins the current
-    /// wrap value so the behavior is at least *visible* and intentional
-    /// (caught immediately if it ever changes), not so anyone should rely on
-    /// -32796 wrapping to +32740 being "right". Reported to ra-coder as a
-    /// pre-existing gap: worth either a `checked`/`saturating` variant or a
-    /// documented caller-side bound, before any real system starts composing
-    /// `Fixed` products whose magnitude isn't obviously small — `Fixed` is
-    /// currently unused by any production system (only its own tests
-    /// exercise it), so nothing downstream is affected yet.
+    /// Pinned-finding fix (was `mul_silently_wraps_past_the_16_bit_integer_range`).
+    /// A 16.16 layout's integer part only spans ±32768, so a product whose
+    /// magnitude exceeds that cannot be represented. `Fixed::mul` used to cast
+    /// the 64-bit intermediate straight to `i32`, which **wrapped** (`36 * -911
+    /// = -32796` came back as `+32740`). The contract is now **saturation**:
+    /// an out-of-range negative product clamps to `Fixed::MIN` (integer part
+    /// `-32768`), a positive one to `Fixed::MAX` (`+32767`). Saturation is
+    /// monotonic — a larger-magnitude true product never produces a
+    /// smaller-magnitude stored value — which the old wrap violated.
     #[test]
-    fn mul_silently_wraps_past_the_16_bit_integer_range() {
+    fn mul_saturates_past_the_16_bit_integer_range() {
+        // Negative overflow saturates to the floor, not a wrapped positive.
         let a = Fixed::from_int(36);
-        let b = Fixed::from_int(-911);
-        // Mathematically 36 * -911 == -32796, one past Fixed's -32768 floor.
-        assert_eq!(
-            a.mul(b).to_int(),
-            32740,
-            "wrap value changed — see doc comment above"
-        );
+        let b = Fixed::from_int(-911); // 36 * -911 == -32796, past the -32768 floor
+        assert_eq!(a.mul(b).to_int(), -32768);
+        assert_eq!(a.mul(b), Fixed::MIN);
+        // Positive overflow saturates to the ceiling.
+        let c = Fixed::from_int(1000);
+        assert_eq!(c.mul(c), Fixed::MAX);
+        assert_eq!(c.mul(c).to_int(), 32767);
+        // mul_int shares the contract: 30000 * 100000 = 3e9 > i32::MAX.
+        assert_eq!(Fixed::from_int(30_000).mul_int(100_000), i32::MAX);
     }
 }
 

@@ -70,6 +70,25 @@ impl UnitSprite {
     pub fn frame_for(&self, facing: Facing) -> Option<&SpriteFrame> {
         self.frames.get(self.body_frame(facing))
     }
+
+    /// Whether this sprite carries a separate turret (≥ 64 frames: 32 body +
+    /// 32 turret, e.g. the 2TNK). Turretless vehicle SHPs have 32 frames.
+    pub fn has_turret_frames(&self) -> bool {
+        self.frames.len() >= 64
+    }
+
+    /// The turret frame index for a given turret facing. Port of the turret
+    /// case of `UnitClass::Draw_It` (`unit.cpp:2174`): `shapenum =
+    /// BodyShape[Dir_To_32(turret_facing)] + 32`, i.e. the body remap plus the
+    /// 32-frame turret block. Returns `None` if the sprite has no turret frames.
+    pub fn turret_frame_for(&self, turret_facing: Facing) -> Option<&SpriteFrame> {
+        if !self.has_turret_frames() {
+            return None;
+        }
+        let i = dir_to_32(turret_facing) as usize;
+        let shapenum = (32 - i) % 32 + 32;
+        self.frames.get(shapenum)
+    }
 }
 
 /// Blit an indexed sprite frame onto an RGBA image, its **centre** at
@@ -106,6 +125,49 @@ pub fn draw_sprite_centered(
             dst.pixels[di + 2] = b;
             dst.pixels[di + 3] = 255;
         }
+    }
+}
+
+/// Draw a filled rectangle in `[r, g, b]`, clipped to the image. Used for
+/// health bars and muzzle flashes.
+pub fn fill_rect(dst: &mut RgbaImage, x0: i32, y0: i32, x1: i32, y1: i32, rgb: [u8; 3]) {
+    let (xa, xb) = (x0.min(x1).max(0), x0.max(x1).min(dst.width as i32 - 1));
+    let (ya, yb) = (y0.min(y1).max(0), y0.max(y1).min(dst.height as i32 - 1));
+    for y in ya..=yb {
+        for x in xa..=xb {
+            let di = ((y as u32 * dst.width + x as u32) * 4) as usize;
+            dst.pixels[di] = rgb[0];
+            dst.pixels[di + 1] = rgb[1];
+            dst.pixels[di + 2] = rgb[2];
+            dst.pixels[di + 3] = 255;
+        }
+    }
+}
+
+/// Draw a unit health bar centred at `cx`, sitting `above` pixels over the unit
+/// centre. `frac` is health/maxhealth in the range 0..=1000 (integer permille,
+/// so no float enters presentation state needlessly). Classic RA colouring:
+/// green > 50%, yellow > 25%, red below. Width is `CELL` pixels.
+pub fn draw_health_bar(dst: &mut RgbaImage, cx: i32, cy_top: i32, width: i32, frac_permille: i32) {
+    let frac = frac_permille.clamp(0, 1000);
+    let w = width.max(4);
+    let x0 = cx - w / 2;
+    let x1 = x0 + w;
+    let y0 = cy_top;
+    let y1 = cy_top + 2;
+    // Dark backing.
+    fill_rect(dst, x0 - 1, y0 - 1, x1 + 1, y1 + 1, [0, 0, 0]);
+    // Filled portion.
+    let filled = x0 + (w * frac / 1000);
+    let color = if frac > 500 {
+        [0, 200, 0]
+    } else if frac > 250 {
+        [220, 200, 0]
+    } else {
+        [220, 0, 0]
+    };
+    if filled > x0 {
+        fill_rect(dst, x0, y0, filled, y1, color);
     }
 }
 
