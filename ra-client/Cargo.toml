@@ -16,8 +16,13 @@ ra-sim = { path = "../ra-sim" }
 macroquad = { version = "0.4", optional = true }
 
 [features]
-default = ["window"]
+default = ["window", "audio"]
 window = ["dep:macroquad"]
+# Audio playback (M7): decodes AUD sounds and plays them via macroquad's audio
+# device. Requires `window` (macroquad). Cleanly separable — the headless and
+# no-default-features builds compile with no audio code at all, and audio never
+# affects the sim (§4.2), so determinism tests run identically with it off.
+audio = ["window", "macroquad/audio"]
 
 [[bin]]
 name = "ra-client"

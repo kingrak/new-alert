@@ -54,6 +54,10 @@ fn key_strategy() -> impl Strategy<Value = Key> {
         Just(Key::Right),
         Just(Key::Up),
         Just(Key::Down),
+        // M7: F1 toggles the controls-hint overlay (`show_help`); fuzzing it
+        // in exercises `draw_help_overlay` at arbitrary points in a sequence
+        // alongside everything else, same as any other key.
+        Just(Key::Help),
     ]
 }
 
@@ -393,7 +397,11 @@ proptest! {
 // right pixel) before placement mode is ever reachable at all.
 // ---------------------------------------------------------------------
 
-/// Like [`key_strategy`] plus `Key::Deploy` (M5).
+/// Like [`key_strategy`] plus `Key::Deploy` (M5). Also carries `Key::Help`
+/// (M7) — this is the only monkey fixture with the build sidebar enabled at
+/// all (see the econ fixture swap below), so it's the only variant where F1
+/// toggling can co-occur with a fuzzed radar/cameo sidebar click in the same
+/// sequence.
 fn econ_key_strategy() -> impl Strategy<Value = Key> {
     prop_oneof![
         Just(Key::Left),
@@ -401,6 +409,7 @@ fn econ_key_strategy() -> impl Strategy<Value = Key> {
         Just(Key::Up),
         Just(Key::Down),
         Just(Key::Deploy),
+        Just(Key::Help),
     ]
 }
 
@@ -564,9 +573,23 @@ proptest! {
     /// placement-mode drives) against the econ synthetic fixture. No panic,
     /// every drained command well-formed and scoped to the controlled house,
     /// and no placement without a completed building.
+    ///
+    /// M7: the fixture now also has the radar minimap and per-row cameo art
+    /// enabled (`support::synthetic_core_with_econ_radar_cameo` rather than
+    /// the plain `synthetic_core_with_econ`) — this is the only monkey
+    /// fixture with the sidebar enabled, and `sidebar_click` only reaches the
+    /// radar-jump / taller-cameo-row code paths when the sidebar is on (see
+    /// that helper's doc comment), so it's the only place those paths can be
+    /// fuzzed at all. The existing invariants below (well-formed commands,
+    /// scoped to the controlled house, no placement without a ready
+    /// building) must keep holding with radar clicks and taller rows mixed
+    /// into the same sequences — a radar click never emits a `Command` at
+    /// all, so it is invisible to those checks by construction, and a taller
+    /// row only changes the sidebar's y-geometry, not which item a given hit
+    /// resolves to.
     #[test]
     fn synthetic_monkey_with_econ_never_panics(ops in econ_ops_strategy(200..800)) {
-        let (mut core, _mcv) = support::synthetic_core_with_econ(0xE58E_C0E1, 5000);
+        let (mut core, _mcv) = support::synthetic_core_with_econ_radar_cameo(0xE58E_C0E1, 5000);
         apply_ops_with_econ(&mut core, &ops);
     }
 }

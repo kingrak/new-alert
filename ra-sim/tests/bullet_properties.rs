@@ -8,7 +8,7 @@
 use proptest::prelude::*;
 
 use ra_sim::coords::{coord_move, isqrt, CellCoord, Facing, WorldCoord};
-use ra_sim::{Bullet, Target, WarheadProfile};
+use ra_sim::{Bullet, Handle, Target, WarheadProfile};
 
 /// A minimal bullet for flight-only testing: damage/warhead/target are
 /// irrelevant to `advance`, so they're fixed placeholders.
@@ -29,6 +29,7 @@ fn make_bullet(pos: WorldCoord, impact: WorldCoord, speed: i32, instant: bool) -
         min_damage: 1,
         max_damage: 1000,
         source_house: 0,
+        source_unit: Handle { index: 0, gen: 0 },
         instant,
         invisible: false,
     }

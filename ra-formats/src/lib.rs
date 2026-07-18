@@ -17,6 +17,7 @@
 //! - [`ini`]    — a small case-insensitive INI reader.
 //! - [`names`]  — a small built-in list of well-known RA filenames.
 
+pub mod aud;
 pub mod codec;
 pub mod cps;
 pub mod crc;

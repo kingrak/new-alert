@@ -18,6 +18,7 @@
 
 use proptest::prelude::*;
 
+use ra_formats::aud;
 use ra_formats::codec::{apply_xor_delta, lcw_decompress};
 use ra_formats::ini::Ini;
 use ra_formats::mix::MixArchive;
@@ -187,5 +188,115 @@ proptest! {
         let text = String::from_utf8_lossy(&data);
         let ini = Ini::parse(&text);
         let _ = ini.get_int("Basic", "NewINIFormat");
+    }
+
+    // -- ra_formats::aud (M7) -------------------------------------------------
+    //
+    // `aud::decode` must never panic on arbitrary bytes: a corrupt/truncated
+    // header, a chunk claiming more compressed bytes than remain in the
+    // buffer, or an unrecognised compression byte must all yield `Err`, never
+    // an out-of-bounds index or arithmetic overflow. It's fine (expected) for
+    // `decode` to return `Err(..)`; only a panic is a bug.
+
+    #[test]
+    fn aud_decode_never_panics(data in proptest::collection::vec(any::<u8>(), 0..4096)) {
+        let _ = aud::decode(&data);
+    }
+
+    #[test]
+    fn aud_decode_truncated_header_never_panics(data in proptest::collection::vec(any::<u8>(), 0..12)) {
+        // Every length shorter than the 12-byte fixed header, on its own.
+        prop_assert!(aud::decode(&data).is_err());
+    }
+
+    #[test]
+    fn aud_decode_with_deaf_magic_at_odd_offset_never_panics(
+        prefix in proptest::collection::vec(any::<u8>(), 0..64),
+        suffix in proptest::collection::vec(any::<u8>(), 0..64),
+    ) {
+        // Splice the 0xDEAF chunk magic in at an arbitrary (likely
+        // misaligned, relative to any real chunk boundary) offset, so the
+        // decoder's chunk-header parsing sees the magic without the rest of
+        // a well-formed chunk around it.
+        let mut data = prefix;
+        data.extend_from_slice(&0x0000_DEAFu32.to_le_bytes());
+        data.extend_from_slice(&suffix);
+        let _ = aud::decode(&data);
+    }
+
+    #[test]
+    fn aud_decode_huge_declared_chunk_size_never_panics(
+        rate in any::<u16>(),
+        flags in any::<u8>(),
+        compression in prop_oneof![Just(1u8), Just(99u8), any::<u8>()],
+        declared_comp_size in any::<u16>(),
+        declared_out_size in any::<u16>(),
+        trailing in proptest::collection::vec(any::<u8>(), 0..32),
+    ) {
+        // A structurally valid 12-byte header plus one syntactically valid
+        // chunk header (real 0xDEAF magic) whose declared `comp_size` /
+        // `out_size` hugely overstate how many bytes actually follow —
+        // exactly the "huge declared chunk size vs actual remaining bytes"
+        // case, for every compression byte (valid or not).
+        let mut data = Vec::new();
+        data.extend_from_slice(&rate.to_le_bytes());
+        data.extend_from_slice(&0u32.to_le_bytes()); // advisory compressed size
+        data.extend_from_slice(&0u32.to_le_bytes()); // advisory uncompressed size
+        data.push(flags);
+        data.push(compression);
+        data.extend_from_slice(&declared_comp_size.to_le_bytes());
+        data.extend_from_slice(&declared_out_size.to_le_bytes());
+        data.extend_from_slice(&0x0000_DEAFu32.to_le_bytes());
+        data.extend_from_slice(&trailing);
+        let _ = aud::decode(&data);
+    }
+
+    #[test]
+    fn aud_decode_unknown_compression_is_err_not_panic(
+        rate in any::<u16>(),
+        flags in any::<u8>(),
+        compression in (0u8..=255).prop_filter("not a supported codec", |c| *c != 1 && *c != 99),
+        payload in proptest::collection::vec(any::<u8>(), 0..64),
+    ) {
+        // Any compression byte other than 1/99 must be rejected with `Err`
+        // once a well-formed chunk is reached, never panic and never
+        // silently decode garbage.
+        let mut data = Vec::new();
+        data.extend_from_slice(&rate.to_le_bytes());
+        data.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        data.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        data.push(flags);
+        data.push(compression);
+        data.extend_from_slice(&(payload.len() as u16).to_le_bytes());
+        data.extend_from_slice(&(payload.len() as u16).to_le_bytes());
+        data.extend_from_slice(&0x0000_DEAFu32.to_le_bytes());
+        data.extend_from_slice(&payload);
+        prop_assert!(aud::decode(&data).is_err());
+    }
+
+    #[test]
+    fn aud_decode_well_formed_random_payload_never_panics(
+        rate in any::<u16>(),
+        flags in any::<u8>(),
+        compression in prop_oneof![Just(1u8), Just(99u8)],
+        payload in proptest::collection::vec(any::<u8>(), 0..256),
+        declared_out_size in any::<u16>(),
+    ) {
+        // Syntactically well-formed single-chunk AUD (real header, real
+        // 0xDEAF magic, comp_size matches the actual payload length) with
+        // random payload bytes and a random (possibly wildly wrong)
+        // declared `out_size` — exercises both real codec paths
+        // (`decode_ima_chunk` / `decode_ws_chunk`) with adversarial data.
+        let mut data = Vec::new();
+        data.extend_from_slice(&rate.to_le_bytes());
+        data.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        data.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        data.push(flags);
+        data.push(compression);
+        data.extend_from_slice(&(payload.len() as u16).to_le_bytes());
+        data.extend_from_slice(&declared_out_size.to_le_bytes());
+        data.extend_from_slice(&0x0000_DEAFu32.to_le_bytes());
+        data.extend_from_slice(&payload);
+        let _ = aud::decode(&data);
     }
 }

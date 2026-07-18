@@ -17,6 +17,7 @@ use ra_client::assets::{self, LoadedGame};
 use ra_client::compositor::{IndexedImage, Palette};
 use ra_client::input::{InputEvent, MouseButton};
 use ra_client::terrain::{self, TileSet};
+use ra_client::unit_render::{SpriteFrame, UnitSprite};
 use ra_data::scenario::{MapCell, Scenario, Theater, MAP_CELL_H, MAP_CELL_W};
 use ra_data::templates;
 use ra_formats::tmpl::{Template, ICON_WIDTH};
@@ -485,6 +486,53 @@ pub fn synthetic_core_with_econ(seed: u32, credits: i32) -> (AppCore, Handle) {
     let (world, mcv) = synthetic_world_with_econ(seed, credits);
     let mut core = AppCore::with_sim(raster.clone(), *palette, world, Vec::new(), Vec::new());
     core.enable_sidebar(1, econ_buildables());
+    (core, mcv)
+}
+
+// ---------------------------------------------------------------------
+// M7 radar/cameo fixture: the econ fixture above, plus the radar minimap
+// panel and a cameo icon for every sidebar row. Both `AppCore::enable_radar`
+// and `AppCore::set_cameo_art` are geometry-only unless the build sidebar is
+// also enabled -- `AppCore::handle`'s `MouseDown` match arm only calls
+// `sidebar_click` (which is what actually reads the radar rect / taller
+// cameo row height) when `sidebar_enabled` is true -- so this fixture is the
+// econ one (sidebar already on) with the two new panels layered on top,
+// rather than a bare `synthetic_core_with_units`/`_armed_units`, which have
+// no sidebar at all and so can never reach either code path through a click.
+// ---------------------------------------------------------------------
+
+/// A minimal, deterministic stand-in for a decoded `<NAME>ICON.SHP` cameo:
+/// one `64x48` frame (matches `appcore`'s private `CAMEO_W`/`CAMEO_H`, M7)
+/// filled with a single non-zero palette index — index 0 is
+/// `unit_render`'s transparent sentinel (see `draw_sprite_topleft`), so an
+/// all-zero fixture would silently paint nothing and defeat any
+/// pixel-presence assertion built on top of it.
+fn fake_cameo_sprite(index: u8) -> UnitSprite {
+    const CAMEO_W: u32 = 64;
+    const CAMEO_H: u32 = 48;
+    UnitSprite {
+        frames: vec![SpriteFrame {
+            width: CAMEO_W,
+            height: CAMEO_H,
+            pixels: vec![index.max(1); (CAMEO_W * CAMEO_H) as usize],
+        }],
+    }
+}
+
+/// [`synthetic_core_with_econ`] with the radar minimap enabled
+/// (`AppCore::enable_radar`) and a distinct [`fake_cameo_sprite`] installed
+/// for every entry in [`econ_buildables`] (`AppCore::set_cameo_art`), so
+/// `sidebar_row_h()` reports the taller `SIDEBAR_ROW_H_CAMEO` and
+/// `radar_rect()`/`radar_cell_at` are live. The M7 UI fixture for
+/// radar-click-to-jump, cameo row hit-testing, and the radar/cameo-aware
+/// econ monkey variant (`ui_monkey.rs`).
+pub fn synthetic_core_with_econ_radar_cameo(seed: u32, credits: i32) -> (AppCore, Handle) {
+    let (mut core, mcv) = synthetic_core_with_econ(seed, credits);
+    core.enable_radar();
+    let cameos = (0..econ_buildables().len())
+        .map(|i| Some(fake_cameo_sprite(i as u8 + 1)))
+        .collect();
+    core.set_cameo_art(cameos);
     (core, mcv)
 }
 

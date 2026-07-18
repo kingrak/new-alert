@@ -199,6 +199,8 @@ fn cmd_window(mut args: Vec<String>) -> Result<(), BoxErr> {
         .transpose()
         .map_err(|_| "--credits needs an integer")?
         .unwrap_or(8000);
+    // Audio off flag (M7): `--mute` boots with an empty sound bank.
+    let muted = has_flag(&mut args, "--mute");
     // M6 FIRST PLAYABLE: boot a skirmish (player + 1 AI, shroud, ore growth,
     // win/lose) on a multiplayer map. Fall back to the M5 econ view, then
     // terrain+units, then terrain-only, if archives can't be resolved.
@@ -277,7 +279,16 @@ fn cmd_window(mut args: Vec<String>) -> Result<(), BoxErr> {
             }
         }
     };
-    ra_client::shell::run_window(core, smoke);
+    // Decode the sound bank from the resolved assets dir (unless muted). Best
+    // effort: an unresolved dir or missing sounds just yields an empty bank.
+    let sounds = if muted {
+        Vec::new()
+    } else {
+        platform::resolve_assets_dir(assets_flag.as_deref())
+            .map(|dir| assets::load_sound_bank(&dir))
+            .unwrap_or_default()
+    };
+    ra_client::shell::run_window(core, smoke, sounds);
     Ok(())
 }
 
@@ -684,11 +695,23 @@ fn drive_battle(
     let after = after.unwrap_or_else(|| core.compose_camera());
     let mid = mid.unwrap_or_else(|| before.clone());
 
+    // M7: let the death explosion animate a few cosmetic frames and capture it
+    // mid-blast, then toggle the F1 controls overlay and capture that too.
+    for _ in 0..5 {
+        core.update(67);
+    }
+    let explosion_frame = core.compose_camera();
+    core.handle(InputEvent::KeyDown(Key::Help));
+    core.handle(InputEvent::KeyUp(Key::Help));
+    let f1_frame = core.compose_camera();
+
     if write_png {
         for (name, f) in [
             ("battle_before", &before),
             ("battle_mid", &mid),
             ("battle_after", &after),
+            ("battle_explosion", &explosion_frame),
+            ("battle_f1_overlay", &f1_frame),
         ] {
             let path = format!("{out_dir}/{name}.png");
             let bytes = png::encode_rgba(f.width, f.height, &f.pixels);

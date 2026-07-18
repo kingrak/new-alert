@@ -33,6 +33,7 @@ use ra_sim::{
 };
 
 use crate::appcore::AppCore;
+use crate::appcore::SoundEvent;
 use crate::compositor::Palette;
 use crate::terrain::{rasterize, TileSet};
 use crate::unit_render::UnitSprite;
@@ -403,7 +404,22 @@ pub fn load_battle_from_bytes(
     let target_max_hp = world.units.get(target).map(|u| u.max_health).unwrap_or(1);
     let weapon = weapon.ok_or("2TNK resolved without a weapon")?;
 
-    let core = AppCore::with_sim(raster, palette, world, sprites, remaps);
+    let mut core = AppCore::with_sim(raster, palette, world, sprites, remaps);
+    // M7 verification: render on the full game surface (so the cosmetic effect
+    // layer is composited) with the explosion + ore art installed. Empty
+    // buildables — this is a combat-only harness, house 0 is the controlled side.
+    core.enable_sidebar(0, Vec::new());
+    core.enable_radar();
+    let theater_mix = main.open_nested(scenario.theater.mix_name()).ok();
+    if let Some(t) = &theater_mix {
+        let suffix = scenario.theater.suffix();
+        core.set_ore_art(
+            load_overlay_tiles(t, "GOLD", 4, suffix),
+            load_overlay_tiles(t, "GEM", 4, suffix),
+        );
+    }
+    let explosion: Vec<UnitSprite> = load_shp_opt(&conquer, "FBALL1.SHP").into_iter().collect();
+    core.set_effect_art(explosion, Vec::new());
     Ok(BattleSetup {
         core,
         attacker,
@@ -571,6 +587,127 @@ fn load_unit_sprite(conquer: &MixArchive, name: &str) -> Result<UnitSprite, Box<
         .get(&shp)
         .and_then(|b| UnitSprite::from_shp_bytes(b).ok())
         .ok_or_else(|| format!("sprite {shp} missing/undecodable").into())
+}
+
+/// Decode the M7 sound set to in-memory WAV, keyed by logical [`SoundEvent`].
+/// Reads the archives from `dir`; every sound is best-effort (a missing or
+/// undecodable AUD is simply skipped, so audio never blocks a boot). Returns
+/// empty when the archives can't be opened. Pure data — no audio device is
+/// touched here, so this is safe to call in any build (the shell decides whether
+/// to play).
+pub fn load_sound_bank(dir: &Path) -> Vec<(SoundEvent, Vec<u8>)> {
+    let (Ok(main_bytes), Ok(redalert_bytes)) = (
+        std::fs::read(dir.join("main.mix")),
+        std::fs::read(dir.join("redalert.mix")),
+    ) else {
+        return Vec::new();
+    };
+    let (Ok(main), Ok(redalert)) = (
+        MixArchive::parse(&main_bytes),
+        MixArchive::parse(&redalert_bytes),
+    ) else {
+        return Vec::new();
+    };
+    let sounds = main.open_nested("sounds.mix").ok();
+    let speech = redalert.open_nested("speech.mix").ok();
+
+    // (event, source mix, AUD name). Weapon/UI SFX live in sounds.mix; EVA voice
+    // lines in speech.mix. Names verified present in the shipped archives; any
+    // that are absent (e.g. a mission-failed line) are skipped.
+    let spec: [(SoundEvent, Option<&MixArchive>, &str); 7] = [
+        (SoundEvent::Fire, sounds.as_ref(), "CANNON1.AUD"),
+        (SoundEvent::Explosion, sounds.as_ref(), "KABOOM1.AUD"),
+        (SoundEvent::Select, sounds.as_ref(), "RABEEP1.AUD"),
+        (
+            SoundEvent::ConstructionComplete,
+            speech.as_ref(),
+            "CONSCMP1.AUD",
+        ),
+        (SoundEvent::LowPower, speech.as_ref(), "NOPOWR1.AUD"),
+        (SoundEvent::Victory, speech.as_ref(), "MISNWON1.AUD"),
+        (SoundEvent::Defeat, speech.as_ref(), "MISNLST1.AUD"),
+    ];
+    let mut out = Vec::new();
+    for (ev, mix, name) in spec {
+        let Some(mix) = mix else { continue };
+        if let Some(bytes) = mix.get(name) {
+            if let Ok(clip) = ra_formats::aud::decode(bytes) {
+                out.push((ev, ra_formats::aud::to_wav(&clip)));
+            }
+        }
+    }
+    out
+}
+
+/// Load one SHP by full (extension-included) name from a mix, `None` if
+/// missing/undecodable — used for optional cosmetic art (M7).
+fn load_shp_opt(mix: &MixArchive, name: &str) -> Option<UnitSprite> {
+    mix.get(name)
+        .and_then(|b| UnitSprite::from_shp_bytes(b).ok())
+}
+
+/// Load overlay tiles `<BASE>01.<SUF>`..`<BASE>NN.<SUF>` from a theater mix (the
+/// ore/gem density tiles are SHP-format despite the theater extension). M7.
+fn load_overlay_tiles(
+    theater: &MixArchive,
+    base: &str,
+    count: usize,
+    suffix: &str,
+) -> Vec<UnitSprite> {
+    (1..=count)
+        .filter_map(|i| load_shp_opt(theater, &format!("{base}{i:02}.{suffix}")))
+        .collect()
+}
+
+/// Resolve the short name of a buildable (for cameo `<NAME>ICON.SHP` lookup).
+fn buildable_name(catalog: &Catalog, item: BuildItem) -> Option<String> {
+    match item {
+        BuildItem::Building(id) => catalog.building(id).map(|p| p.name.clone()),
+        BuildItem::Unit(id) => catalog.unit(id).map(|p| p.name.clone()),
+    }
+}
+
+/// Load the M7 cosmetic art set (ore/gem tiles, explosion + per-building buildup
+/// anims, sidebar cameos) and install it on `core`. Every piece is optional:
+/// missing art degrades to the flat-rectangle / no-anim / text-row fallbacks, so
+/// this never fails the load. `theater`/`hires` may be absent.
+#[allow(clippy::too_many_arguments)]
+fn install_cosmetic_art(
+    core: &mut AppCore,
+    catalog: &Catalog,
+    buildables: &[BuildItem],
+    conquer: &MixArchive,
+    theater: Option<&MixArchive>,
+    theater_suffix: &str,
+    hires: Option<&MixArchive>,
+) {
+    // Ore / gem overlay tiles (GOLD01..04 / GEM01..04).
+    if let Some(t) = theater {
+        core.set_ore_art(
+            load_overlay_tiles(t, "GOLD", 4, theater_suffix),
+            load_overlay_tiles(t, "GEM", 4, theater_suffix),
+        );
+    }
+    // Explosion (shared) + per-building construction buildup (<NAME>MAKE.SHP).
+    let explosion: Vec<UnitSprite> = load_shp_opt(conquer, "FBALL1.SHP").into_iter().collect();
+    let buildups: Vec<Option<UnitSprite>> = catalog
+        .buildings
+        .iter()
+        .map(|b| load_shp_opt(conquer, &format!("{}MAKE.SHP", b.name.to_ascii_uppercase())))
+        .collect();
+    core.set_effect_art(explosion, buildups);
+    // Sidebar cameos (<NAME>ICON.SHP from hires.mix), parallel to `buildables`.
+    if let Some(h) = hires {
+        let cameos: Vec<Option<UnitSprite>> = buildables
+            .iter()
+            .map(|&item| {
+                buildable_name(catalog, item)
+                    .and_then(|n| load_shp_opt(h, &format!("{}ICON.SHP", n.to_ascii_uppercase())))
+            })
+            .collect();
+        core.set_cameo_art(cameos);
+    }
+    core.enable_radar();
 }
 
 /// Build the starter catalog (CONST/POWR/PROC/WEAP + MCV/HARV/1TNK/2TNK/JEEP)
@@ -795,7 +932,20 @@ pub fn load_econ_from_bytes(
 
     let mut core = AppCore::with_sim(raster, palette, world, content.unit_sprites, remaps);
     core.set_building_sprites(content.building_sprites);
-    core.enable_sidebar(controlled, content.buildables);
+    core.enable_sidebar(controlled, content.buildables.clone());
+    // M7 cosmetic art (ore/gem tiles, explosion/buildup anims, cameos, radar) so
+    // the econ view shows real ore fields thinning as they are harvested.
+    let theater_mix = main.open_nested(scenario.theater.mix_name()).ok();
+    let hires = redalert.open_nested("hires.mix").ok();
+    install_cosmetic_art(
+        &mut core,
+        &content.catalog,
+        &content.buildables,
+        &conquer,
+        theater_mix.as_ref(),
+        scenario.theater.suffix(),
+        hires.as_ref(),
+    );
 
     Ok(EconGame {
         core,
@@ -931,7 +1081,20 @@ pub fn load_skirmish_from_bytes(
 
     let mut core = AppCore::with_sim(raster, palette, world, content.unit_sprites, remaps);
     core.set_building_sprites(content.building_sprites);
-    core.enable_sidebar(player_house, content.buildables);
+    core.enable_sidebar(player_house, content.buildables.clone());
+
+    // M7 cosmetic art: ore/gem tiles, explosion + buildup anims, cameos, radar.
+    let theater_mix = main.open_nested(scenario.theater.mix_name()).ok();
+    let hires = redalert.open_nested("hires.mix").ok();
+    install_cosmetic_art(
+        &mut core,
+        &content.catalog,
+        &content.buildables,
+        &conquer,
+        theater_mix.as_ref(),
+        scenario.theater.suffix(),
+        hires.as_ref(),
+    );
 
     Ok(SkirmishGame {
         core,

@@ -520,8 +520,18 @@ becomes a failing script committed with its fix.
    (teamtype-driven like original), win/lose check. Exit criterion: a human
    can play and win/lose a full skirmish — start with MCV/units, mine, build,
    fight an AI that fights back — entirely in `ra-client window`.
-7. **M7 — Polish**: AUD audio, EVA, real sidebar art, radar, death anims /
-   explosions / splash damage, palette effects, campaign trigger logic.
+7. **M7 — Polish**: splash/area damage, guard auto-retaliation, AUD audio + EVA,
+   real sidebar art (cameos) + radar minimap, ore/gem overlay art, client
+   animation layer (explosions / muzzle flash / building buildup), F1 onboarding
+   overlay. **Campaign trigger logic is explicitly *out* of M7** — it is sim
+   scenario-scripting (TriggerClass/TeamType action tables), a self-contained
+   body of work unrelated to the "look/sound/feel like 1996" polish this
+   milestone targets, so it moves to **M7.5 — Campaign scripting** (below).
+   Naval, aircraft, and infantry-specific animations are also deferred past M7.
+7.5. **M7.5 — Campaign scripting** (was folded into M7): TriggerClass /
+   TeamTypeClass action+event tables, scenario win/lose triggers, reinforcements,
+   so the single-player *missions* (not just skirmish) run. Prereq for a campaign
+   release; independent of the M8 net work.
 8. **M8 — LAN multiplayer**: `LanTransport` peer lockstep + snapshot resync
    (stage 2). Single-player releases happen well before this.
 9. **M9 — Server play**: relay/sequencer server, lobby, server-held replays

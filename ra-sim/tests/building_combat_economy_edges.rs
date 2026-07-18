@@ -573,19 +573,16 @@ fn sell_refund_is_exact_with_integer_truncation_default_and_custom_percent() {
 /// (a) selling a building UNRELATED to the in-flight production lane does not
 ///     disturb it — production continues to completion exactly as if nothing
 ///     happened.
-/// (b) selling the war factory itself mid-unit-production does not cancel or
-///     refund the lane; installments keep being paid (they are not
-///     re-validated against the factory's continued existence — only the
-///     *start* of production checks for a live factory, see
-///     `apply_start_production`) until `progress >= total_ticks`, at which
-///     point the unit is "done" but can never actually spawn (`find_factory_exit`
-///     requires an alive war factory) — so the lane is left permanently
-///     stuck at `done` with its credits already fully spent and irrecoverable
-///     (no refund, no `CancelProduction` auto-issued). This is a real,
-///     pinned soft-lock; flagged here for ra-coder, not fixed (see the test's
-///     final assertions and the report).
+/// (b) selling the war factory itself mid-unit-production **abandons the lane
+///     and refunds the credits already spent** (M7 fix — was a pinned soft-lock
+///     in M6). This is the faithful port of `BuildingClass::Detach_All` →
+///     `FactoryClass::Abandon` (`building.cpp:5138`, `factory.cpp:479`
+///     `Refund_Money(money - Balance)`): removing the last builder of a category
+///     abandons the shared production and returns the progress money. The lane
+///     clears (no permanently-stuck `done` build), no unit ever spawns, and the
+///     abandoned build is net-zero in credits.
 #[test]
-fn sell_while_producing_pins_unrelated_continues_and_factory_sale_soft_locks() {
+fn sell_while_producing_unrelated_continues_and_factory_sale_abandons_with_refund() {
     // (a) Unrelated building sold mid-unit-production: production unaffected.
     {
         let mut w = world(1000);
@@ -644,7 +641,7 @@ fn sell_while_producing_pins_unrelated_continues_and_factory_sale_soft_locks() {
         );
     }
 
-    // (b) Selling the war factory itself mid-production: soft-locks the lane.
+    // (b) Selling the war factory itself mid-production: abandons + refunds.
     {
         let mut w = world(1000);
         w.spawn_building(B_FACT, 1, CellCoord::new(10, 10)).unwrap();
@@ -661,23 +658,38 @@ fn sell_while_producing_pins_unrelated_continues_and_factory_sale_soft_locks() {
         for _ in 0..5 {
             w.tick(&[]);
         }
+        let credits_before_sale = w.house_credits(1);
         let spent_before_sale = w.house(1).unwrap().unit_prod.unwrap().spent;
         assert!(
             spent_before_sale > 0,
             "sanity: some credits should already be spent"
         );
+
         w.tick(&[Command::Sell {
             house: 1,
             building: weap,
         }]);
         assert!(!w.buildings.contains(weap));
 
+        // The lane is abandoned immediately: it clears (no stuck `done` build),
+        // and the spent portion is refunded (FactoryClass::Abandon).
+        assert!(
+            w.house(1).unwrap().unit_prod.is_none(),
+            "selling the last war factory mid-production should abandon the lane"
+        );
+        // Refund: the `spent_before_sale` credits paid so far are returned, and
+        // selling the WEAP refunds 60 * 50% = 30. So relative to the pre-sale
+        // balance we gain exactly (spent_before_sale + 30).
+        assert_eq!(
+            w.house_credits(1),
+            credits_before_sale + spent_before_sale + 30,
+            "abandon must refund the spent progress; the WEAP sale refunds 30"
+        );
+
         // Run far past when the unit would normally have completed. Must not
-        // panic, must never spawn a unit, and the lane must remain
-        // permanently "done" with its credits already fully spent (not
-        // refunded, not un-stuck).
+        // panic and must never spawn a unit (the lane is gone).
         for _ in 0..5000 {
-            w.tick(&[]); // must not panic despite the exit factory being gone
+            w.tick(&[]);
         }
         assert!(
             !w.units
@@ -685,26 +697,16 @@ fn sell_while_producing_pins_unrelated_continues_and_factory_sale_soft_locks() {
                 .any(|(_, u)| u.house == 1 && u.type_id == U_PROD_SPRITE),
             "no unit should ever spawn once its war factory was sold mid-production"
         );
-        let stuck = w
-            .house(1)
-            .unwrap()
-            .unit_prod
-            .expect("the lane should still be occupied, permanently stuck");
         assert!(
-            stuck.done,
-            "the lane should have reached 'done' (installments aren't re-validated mid-build)"
+            w.house(1).unwrap().unit_prod.is_none(),
+            "the abandoned lane stays clear"
         );
-        assert_eq!(
-            stuck.spent, stuck.cost,
-            "a 'done' lane should have had its full cost paid in installments"
-        );
-        // Credits: the unit's full cost (120) was spent (stuck, unrefunded)
-        // and the WEAP sale refunded 60 * 50% = 30. Again, `spawn_building`
-        // itself never charged credits for FACT/POWR/WEAP.
+        // Net credit position: production abandoned net-zero (full cost never
+        // completed; spent portion refunded), plus the WEAP sale refund of 30.
         assert_eq!(
             w.house_credits(1),
-            1000 - 120 + 30,
-            "120 spent (stuck, no refund) + 30 refunded from selling WEAP"
+            1000 + 30,
+            "abandoned build is net-zero; only the WEAP sale's 30 refund remains"
         );
     }
 }

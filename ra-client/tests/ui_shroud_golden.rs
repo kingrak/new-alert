@@ -287,20 +287,23 @@ fn real_skirmish_compose_game_map_sweep_with_shroud_no_panic() {
     // Pinned golden: fnv1a of each sweep position's frame, in order. Derived
     // once against the real assets (same "computed once, read back, pinned"
     // policy as every other golden hash in this repo -- see
-    // `ui_golden_frames.rs`'s doc comment). Only the player-start position
-    // (index 2) differs from the rest: `draw_shroud` paints against
-    // `player_house`'s own exploration only, so even the *AI's* base (index
-    // 3, `ai_start`) still reads as fully shrouded (solid black) to the
-    // player after just 20 ticks -- the same per-house isolation
-    // `shroud_suite.rs` pins at the sim level, now visible at the pixel
-    // level too. The origin and far-corner positions (0, 1, 4) are also
-    // unexplored, so all four legitimately hash identically to each other.
+    // `ui_golden_frames.rs`'s doc comment).
+    //
+    // **Re-pinned for M7.** `compose_game` gained the M7 game-surface layers:
+    // real ore/gem overlay art, the client animation layer, and the **radar
+    // minimap panel** (now installed by `load_skirmish`). The radar draws the
+    // current *camera view-box*, which differs per sweep position, so the frames
+    // no longer collapse to two classes. Positions 1 and 3 still hash identically
+    // (their clamped cameras coincide); position 2 (player start) additionally
+    // shows the explored terrain/ore under `draw_shroud`, which paints against
+    // `player_house`'s own exploration only -- the same per-house isolation
+    // `shroud_suite.rs` pins at the sim level, now visible at the pixel level.
     let golden: [u64; 5] = [
-        0x7cf7_4e73_3e38_8421,
-        0x7cf7_4e73_3e38_8421,
-        0x1a34_edca_76b3_cdd1,
-        0x7cf7_4e73_3e38_8421,
-        0x7cf7_4e73_3e38_8421,
+        0x31d5_f428_c2a5_bffb,
+        0x2a2b_c0f5_6079_e197,
+        0x64dd_0651_85b6_e68f,
+        0x2a2b_c0f5_6079_e197,
+        0x6860_7ad5_b332_ff2b,
     ];
     let got: Vec<u64> = frames.iter().map(|p| support::fnv1a(p)).collect();
     assert_eq!(

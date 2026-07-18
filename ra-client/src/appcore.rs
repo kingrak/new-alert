@@ -44,6 +44,35 @@ const ORE_GOLD_RGB: [u8; 3] = [196, 160, 40];
 /// Gem-ore render colour.
 const ORE_GEM_RGB: [u8; 3] = [70, 150, 210];
 
+/// Radar minimap panel side length, in sidebar pixels (a square).
+const RADAR_SIZE: i32 = 120;
+/// Hi-res sidebar cameo dimensions (`<NAME>ICON.SHP`, 64×48 in `hires.mix`).
+const CAMEO_W: i32 = 64;
+const CAMEO_H: i32 = 48;
+/// Taller sidebar row when cameo art is shown (cameo height + label strip).
+const SIDEBAR_ROW_H_CAMEO: i32 = CAMEO_H + 12;
+
+/// Approximate classic-RA per-house marker colours for the radar, indexed by
+/// house id (Greece gold, USSR red, …); grey for anything out of range.
+const HOUSE_DOT: [[u8; 3]; 8] = [
+    [216, 180, 40], // 0 Spain
+    [216, 180, 40], // 1 Greece — gold
+    [200, 40, 40],  // 2 USSR — red
+    [60, 120, 220], // 3 England — blue
+    [90, 200, 90],  // 4 Ukraine — green
+    [220, 120, 40], // 5 Germany — orange
+    [180, 80, 200], // 6 France — purple
+    [60, 200, 200], // 7 Turkey — teal
+];
+
+/// Radar/marker colour for a house.
+fn house_dot(house: u8) -> [u8; 3] {
+    HOUSE_DOT
+        .get(house as usize)
+        .copied()
+        .unwrap_or([160, 160, 160])
+}
+
 /// A single buildable entry the sidebar exposes (also the queryable surface
 /// tests drive the build UI through).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -102,6 +131,55 @@ const SELECT_RGB: [u8; 3] = [0, 255, 0];
 struct DragBox {
     start: (i32, i32),
     cur: (i32, i32),
+}
+
+/// Milliseconds each cosmetic-animation frame is shown (≈ the original's anim
+/// rate). Purely presentation; never touches the sim clock.
+const FX_FRAME_MS: u64 = 55;
+
+/// A client-side cosmetic animation instance (DESIGN.md §4.2: the cosmetic layer
+/// is derived from sim state and driven by a *virtual* clock, never feeding back
+/// into the sim). Spawned by diffing sim state across a tick (a vanished unit /
+/// building → explosion; a new building → construction buildup).
+#[derive(Clone, Copy, Debug)]
+struct Effect {
+    kind: EffectKind,
+    /// World position (leptons). Explosions anchor centred here; buildups anchor
+    /// their top-left here (matching how the building sprite is drawn).
+    anchor: WorldCoord,
+    /// The cosmetic-clock timestamp (ms) the effect began.
+    start_ms: u64,
+}
+
+/// Which animation an [`Effect`] plays.
+#[derive(Clone, Copy, Debug)]
+enum EffectKind {
+    /// A death/impact explosion (shared explosion SHP).
+    Explosion,
+    /// A structure's construction buildup, keyed by building type id.
+    Buildup(u32),
+}
+
+/// A logical sound cue the UI wants played (DESIGN.md §4.2: cosmetic, derived
+/// from sim state, never fed back into the sim). The shell maps each to an AUD
+/// file and plays it; a headless build ignores the queue entirely. Emitting a
+/// cue never draws sim RNG, so audio on/off leaves the sim hash chain identical.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SoundEvent {
+    /// A weapon was fired (a projectile spawned).
+    Fire,
+    /// A unit or building was destroyed.
+    Explosion,
+    /// The player placed/finished a structure.
+    ConstructionComplete,
+    /// The player's power went into deficit.
+    LowPower,
+    /// The player selected one or more of their own units.
+    Select,
+    /// The player won the skirmish.
+    Victory,
+    /// The player lost the skirmish.
+    Defeat,
 }
 
 /// The windowless client core: terrain raster + camera + the sim view.
@@ -168,6 +246,42 @@ pub struct AppCore {
     buildables: Vec<BuildItem>,
     /// Active placement mode: a completed building type id awaiting a map click.
     placing: Option<u32>,
+
+    // --- Onboarding / cosmetic (M7) ---
+    /// Whether the F1 controls-hint overlay is shown (toggled by `Key::Help`).
+    /// Purely presentation; the shell shows it briefly at boot then hides it.
+    show_help: bool,
+
+    // --- Cosmetic animation layer (M7) ---
+    /// The cosmetic animation clock (ms). Advances with `dt_ms` like `virtual_ms`
+    /// but drives only presentation — animation frame selection and lifetime.
+    /// It is *never* read by the sim, so anims on/off yields identical sim hashes.
+    anim_ms: u64,
+    /// Live cosmetic effects (explosions, buildups). Pruned as they expire.
+    effects: Vec<Effect>,
+    /// Death/impact explosion animation frames (e.g. FBALL1). Empty = no art.
+    explosion_sprite: Vec<UnitSprite>,
+    /// Construction buildup frames per building type id (`<NAME>MAKE.SHP`). A
+    /// `None` entry means that building has no buildup art (skip the anim).
+    buildup_sprites: Vec<Option<UnitSprite>>,
+    /// Ore (gold) overlay tiles GOLD01..04 — frame = density stage. Empty = the
+    /// flat-rectangle fallback is used.
+    ore_gold_sprites: Vec<UnitSprite>,
+    /// Gem overlay tiles GEM01..04 — frame = density stage.
+    ore_gem_sprites: Vec<UnitSprite>,
+    /// Sidebar cameo icons per buildable (parallel to `buildables`). Empty = the
+    /// text-only sidebar rows are used.
+    cameo_sprites: Vec<Option<UnitSprite>>,
+    /// Whether the radar minimap panel is drawn in the sidebar (M7).
+    radar_enabled: bool,
+
+    // --- Audio cue queue (M7, cosmetic) ---
+    /// Logical sound cues awaiting playback, drained by the shell each frame.
+    sounds: Vec<SoundEvent>,
+    /// Previous game-over state (to fire the win/lose cue on transition).
+    prev_game_over: GameOver,
+    /// Previous player low-power state (to fire the low-power cue on transition).
+    prev_low_power: bool,
 }
 
 impl AppCore {
@@ -222,7 +336,55 @@ impl AppCore {
             building_sprites: Vec::new(),
             buildables: Vec::new(),
             placing: None,
+            show_help: false,
+            anim_ms: 0,
+            effects: Vec::new(),
+            explosion_sprite: Vec::new(),
+            buildup_sprites: Vec::new(),
+            ore_gold_sprites: Vec::new(),
+            ore_gem_sprites: Vec::new(),
+            cameo_sprites: Vec::new(),
+            radar_enabled: false,
+            sounds: Vec::new(),
+            prev_game_over: GameOver::Ongoing,
+            prev_low_power: false,
         }
+    }
+
+    /// Drain queued logical sound cues (for the shell's audio device). A headless
+    /// build simply never calls this. Emitting/draining cues is pure presentation
+    /// and never touches the sim, so audio on/off yields identical sim hashes.
+    pub fn drain_sounds(&mut self) -> Vec<SoundEvent> {
+        std::mem::take(&mut self.sounds)
+    }
+
+    /// Install the cosmetic animation art: a shared explosion SHP (`FBALL1`) and
+    /// per-building-type buildup SHPs (`<NAME>MAKE.SHP`, indexed by building type
+    /// id). Optional — with none installed, deaths/placements simply play no anim.
+    pub fn set_effect_art(
+        &mut self,
+        explosion: Vec<UnitSprite>,
+        buildups: Vec<Option<UnitSprite>>,
+    ) {
+        self.explosion_sprite = explosion;
+        self.buildup_sprites = buildups;
+    }
+
+    /// Install ore/gem overlay tile art (GOLD01..04 / GEM01..04). Frame index is
+    /// the density stage (`bails - 1`). Optional — falls back to flat rectangles.
+    pub fn set_ore_art(&mut self, gold: Vec<UnitSprite>, gem: Vec<UnitSprite>) {
+        self.ore_gold_sprites = gold;
+        self.ore_gem_sprites = gem;
+    }
+
+    /// Install sidebar cameo icons, parallel to the `buildables` list. Optional.
+    pub fn set_cameo_art(&mut self, cameos: Vec<Option<UnitSprite>>) {
+        self.cameo_sprites = cameos;
+    }
+
+    /// Turn the radar minimap panel on (drawn at the top of the sidebar strip).
+    pub fn enable_radar(&mut self) {
+        self.radar_enabled = true;
     }
 
     /// Install building idle sprites, indexed by building type id.
@@ -237,6 +399,18 @@ impl AppCore {
         self.sidebar_enabled = true;
         self.player_house = Some(player_house);
         self.buildables = buildables;
+    }
+
+    /// Whether the F1 controls-hint overlay is currently visible. Exposed for
+    /// tests and the shell.
+    pub fn help_visible(&self) -> bool {
+        self.show_help
+    }
+
+    /// Set the controls-hint overlay visibility (the shell shows it briefly at
+    /// boot, then hides it; F1 toggles it thereafter).
+    pub fn set_help_visible(&mut self, on: bool) {
+        self.show_help = on;
     }
 
     /// The controlled house, if one is set.
@@ -420,6 +594,8 @@ impl AppCore {
         match ev {
             InputEvent::KeyDown(Key::Deploy) => self.deploy_selected(),
             InputEvent::KeyUp(Key::Deploy) => {}
+            InputEvent::KeyDown(Key::Help) => self.show_help = !self.show_help,
+            InputEvent::KeyUp(Key::Help) => {}
             InputEvent::KeyDown(k) => self.set_key(k, true),
             InputEvent::KeyUp(k) => self.set_key(k, false),
             InputEvent::MouseMoved { x, y } => {
@@ -476,6 +652,7 @@ impl AppCore {
             Key::Up => self.up = down,
             Key::Down => self.down = down,
             Key::Deploy => {} // handled at the event layer (edge-triggered)
+            Key::Help => {}   // handled at the event layer (edge-triggered)
         }
     }
 
@@ -489,6 +666,28 @@ impl AppCore {
             self.cam_y += dy * self.scroll_speed * dt;
             self.clamp_camera();
         }
+
+        // Cosmetic animation clock + expiry pruning (presentation only).
+        self.anim_ms = self.anim_ms.saturating_add(dt_ms as u64);
+        let now = self.anim_ms;
+        // Disjoint field borrows: prune `effects` while reading the sprite tables.
+        let expl_frames = self
+            .explosion_sprite
+            .first()
+            .map(|s| s.frames.len() as u64)
+            .unwrap_or(0);
+        let buildups = &self.buildup_sprites;
+        self.effects.retain(|e| {
+            let frames = match e.kind {
+                EffectKind::Explosion => expl_frames,
+                EffectKind::Buildup(id) => buildups
+                    .get(id as usize)
+                    .and_then(|o| o.as_ref())
+                    .map(|s| s.frames.len() as u64)
+                    .unwrap_or(0),
+            };
+            frames > 0 && now.saturating_sub(e.start_ms) < frames * FX_FRAME_MS
+        });
 
         // Fixed-timestep sim stepping on virtual time.
         self.virtual_ms = self.virtual_ms.saturating_add(dt_ms as u64);
@@ -504,17 +703,138 @@ impl AppCore {
             self.virtual_ms = (self.world.tick_count() as u64) * 1000 / TICKS_PER_SECOND;
         }
         self.tick_frac = (self.virtual_ms.saturating_mul(TICKS_PER_SECOND) % 1000) as u32;
+
+        // Transition-driven audio cues (win/lose, low power) — cosmetic.
+        let go = self.world.game_over();
+        if go != self.prev_game_over {
+            match go {
+                GameOver::Victory => self.push_sound(SoundEvent::Victory),
+                GameOver::Defeat => self.push_sound(SoundEvent::Defeat),
+                GameOver::Ongoing => {}
+            }
+            self.prev_game_over = go;
+        }
+        let low = self
+            .player_house
+            .and_then(|h| self.world.house(h))
+            .map(|hs| hs.low_power())
+            .unwrap_or(false);
+        if low && !self.prev_low_power {
+            self.push_sound(SoundEvent::LowPower);
+        }
+        self.prev_low_power = low;
     }
 
     /// Snapshot positions for interpolation, then apply one tick's commands and
-    /// run the sim's systems.
+    /// run the sim's systems. Afterwards, diff sim state to spawn cosmetic
+    /// effects (explosions on death, buildups on placement) — read-only over the
+    /// world, so this never perturbs the sim or its RNG.
     fn step_tick(&mut self) {
         self.prev_coords.clear();
+        let mut prev_units: Vec<(Handle, WorldCoord)> = Vec::new();
         for (h, u) in self.world.units.iter() {
             self.prev_coords.insert(h.index, u.coord);
+            prev_units.push((h, u.coord));
         }
+        // Pre-tick building snapshot: handle + centre coord + top-left cell.
+        let prev_buildings: Vec<(Handle, WorldCoord, WorldCoord)> = self
+            .world
+            .buildings
+            .iter()
+            .map(|(h, b)| (h, b.center_cell().center(), b.cell.center()))
+            .collect();
+        let prev_bullets: Vec<Handle> = self.world.bullets.iter().map(|(h, _)| h).collect();
+
         let cmds = std::mem::take(&mut self.pending);
         self.world.tick(&cmds);
+
+        // New projectiles → a fire cue (covers visible cannon shots; hitscan
+        // weapons are represented by the muzzle flash instead).
+        let fired = self
+            .world
+            .bullets
+            .iter()
+            .any(|(h, _)| !prev_bullets.contains(&h));
+        if fired {
+            self.push_sound(SoundEvent::Fire);
+        }
+
+        // Deaths → explosions (visual + audio).
+        let mut any_death = false;
+        for (h, coord) in prev_units {
+            if !self.world.units.contains(h) {
+                self.spawn_effect(EffectKind::Explosion, coord);
+                any_death = true;
+            }
+        }
+        for (h, center, _tl) in &prev_buildings {
+            if !self.world.buildings.contains(*h) {
+                self.spawn_effect(EffectKind::Explosion, *center);
+                any_death = true;
+            }
+        }
+        if any_death {
+            self.push_sound(SoundEvent::Explosion);
+        }
+
+        // New buildings → construction buildup (anchored at the building
+        // top-left); a new *player* building also plays the EVA cue.
+        let player = self.player_house;
+        let fresh: Vec<(u32, WorldCoord, u8)> = self
+            .world
+            .buildings
+            .iter()
+            .filter(|(h, _)| !prev_buildings.iter().any(|(ph, _, _)| ph == h))
+            .map(|(_, b)| (b.type_id, b.cell.center(), b.house))
+            .collect();
+        let mut player_built = false;
+        for (type_id, anchor, house) in fresh {
+            self.spawn_effect(EffectKind::Buildup(type_id), anchor);
+            if Some(house) == player {
+                player_built = true;
+            }
+        }
+        if player_built {
+            self.push_sound(SoundEvent::ConstructionComplete);
+        }
+    }
+
+    /// Queue a cosmetic sound cue (deduped against the current frame's queue so a
+    /// burst of same-type events plays once).
+    fn push_sound(&mut self, ev: SoundEvent) {
+        if !self.sounds.contains(&ev) {
+            self.sounds.push(ev);
+        }
+    }
+
+    /// Queue a cosmetic effect if it has art to play (else no-op — an explosion
+    /// with no SHP installed, or a buildup for a building with no MAKE art).
+    fn spawn_effect(&mut self, kind: EffectKind, anchor: WorldCoord) {
+        if self.effect_frame_count(kind) == 0 {
+            return;
+        }
+        self.effects.push(Effect {
+            kind,
+            anchor,
+            start_ms: self.anim_ms,
+        });
+    }
+
+    /// Number of animation frames the given effect kind has (0 = no art).
+    fn effect_frame_count(&self, kind: EffectKind) -> u32 {
+        match kind {
+            EffectKind::Explosion => self
+                .explosion_sprite
+                .first()
+                .map(|s| s.frames.len() as u32)
+                .unwrap_or(0),
+            EffectKind::Buildup(id) => self
+                .buildup_sprites
+                .get(id as usize)
+                .and_then(|o| o.as_ref())
+                .map(|s| s.frames.len() as u32)
+                .unwrap_or(0),
+        }
     }
 
     /// Unit-ish scroll direction from held keys plus pointer edge scrolling.
@@ -620,6 +940,7 @@ impl AppCore {
                 &mut frame, d.start.0, d.start.1, d.cur.0, d.cur.1, SELECT_RGB,
             );
         }
+        self.draw_help_overlay(&mut frame);
         frame
     }
 
@@ -646,6 +967,8 @@ impl AppCore {
         // Units draw over terrain/buildings; anything spilling into the sidebar
         // strip is overpainted by `draw_sidebar` below.
         self.draw_units(&mut frame, cam);
+        // Cosmetic animation layer (explosions, buildups) over the entities.
+        self.draw_effects(&mut frame, cam);
         // Shroud: paint unexplored cells black, hiding whatever sits under them.
         self.draw_shroud(&mut frame, cam);
         self.draw_placement_preview(&mut frame, cam, tw);
@@ -656,7 +979,46 @@ impl AppCore {
         }
         self.draw_sidebar(&mut frame);
         self.draw_game_over(&mut frame);
+        self.draw_help_overlay(&mut frame);
         frame
+    }
+
+    /// Draw the F1 controls-hint overlay: a dim panel of one-line hints over the
+    /// tactical area. Shown for the first few seconds of play and whenever F1 is
+    /// toggled on. Text uses the built-in bitmap font (uppercase + basic
+    /// punctuation only), so hints stay within the supported glyph set.
+    fn draw_help_overlay(&self, frame: &mut RgbaImage) {
+        if !self.help_visible() {
+            return;
+        }
+        const HINTS: [&str; 7] = [
+            "CONTROLS  -  F1 TO HIDE",
+            "ARROWS / SCREEN EDGE: SCROLL MAP",
+            "LEFT-DRAG: SELECT   LEFT-CLICK: PICK",
+            "RIGHT-CLICK: MOVE / ATTACK",
+            "D: DEPLOY MCV INTO A BASE",
+            "SIDEBAR: CLICK TO BUILD / PLACE / SELL",
+            "GOAL: DESTROY THE ENEMY BASE",
+        ];
+        let pad = 6;
+        let line_h = font::GLYPH_H + 3;
+        let panel_w = (HINTS.iter().map(|s| font::text_width(s)).max().unwrap_or(0)) + pad * 2;
+        let panel_h = line_h * HINTS.len() as i32 + pad * 2;
+        let x0 = 8;
+        let y0 = 8;
+        // Dim backing panel (clipped inside fill_rect).
+        fill_rect(frame, x0, y0, x0 + panel_w, y0 + panel_h, [10, 12, 20]);
+        draw_rect_outline(frame, x0, y0, x0 + panel_w, y0 + panel_h, [70, 90, 130]);
+        let mut ty = y0 + pad;
+        for (i, line) in HINTS.iter().enumerate() {
+            let col = if i == 0 {
+                [240, 220, 120]
+            } else {
+                [210, 215, 225]
+            };
+            font::draw_text(frame, x0 + pad, ty, line, col);
+            ty += line_h;
+        }
     }
 
     /// Paint a solid-black overlay over cells the player house has not explored
@@ -847,6 +1209,7 @@ impl AppCore {
             }
             if let Some((_, handle)) = best {
                 self.selected.push(handle);
+                self.push_sound(SoundEvent::Select);
             }
             return;
         }
@@ -862,6 +1225,9 @@ impl AppCore {
             if px >= xa && px <= xb && py >= ya && py <= yb {
                 self.selected.push(h);
             }
+        }
+        if !self.selected.is_empty() {
+            self.push_sound(SoundEvent::Select);
         }
     }
 
@@ -1094,8 +1460,35 @@ impl AppCore {
     }
 
     /// Y offset (px) where the buildable rows begin (below the readout header).
+    /// Header height (credits + power lines) before the radar / rows.
+    fn sidebar_header_h(&self) -> i32 {
+        2 + (font::GLYPH_H + 2) + font::GLYPH_H + 4
+    }
+
+    /// The radar panel rectangle `(x0, y0, size)` in viewport pixels, if enabled.
+    fn radar_rect(&self) -> Option<(i32, i32, i32)> {
+        if !self.radar_enabled {
+            return None;
+        }
+        let x0 = self.tactical_width() as i32 + 2;
+        let y0 = self.sidebar_header_h();
+        Some((x0, y0, RADAR_SIZE))
+    }
+
+    /// Per-row height — taller when cameo art is drawn.
+    fn sidebar_row_h(&self) -> i32 {
+        if self.cameo_sprites.iter().any(|c| c.is_some()) {
+            SIDEBAR_ROW_H_CAMEO
+        } else {
+            SIDEBAR_ROW_H
+        }
+    }
+
     fn sidebar_rows_top(&self) -> i32 {
-        font::GLYPH_H * 3 + 12
+        match self.radar_rect() {
+            Some((_, y0, size)) => y0 + size + 4,
+            None => font::GLYPH_H * 3 + 12,
+        }
     }
 
     /// The buildable index for a sidebar viewport point, if it lands on a row.
@@ -1107,7 +1500,7 @@ impl AppCore {
         if y < top {
             return None;
         }
-        let idx = ((y - top) / SIDEBAR_ROW_H) as usize;
+        let idx = ((y - top) / self.sidebar_row_h()) as usize;
         let items = self.sidebar_items();
         if idx < items.len() {
             Some(idx)
@@ -1116,9 +1509,37 @@ impl AppCore {
         }
     }
 
-    /// Handle a left-click inside the sidebar strip: ready buildings enter
-    /// placement mode, buildable rows start production.
+    /// Whether a viewport point lands on the radar panel; returns the map cell it
+    /// corresponds to (for click-to-jump).
+    fn radar_cell_at(&self, x: i32, y: i32) -> Option<CellCoord> {
+        let (rx, ry, size) = self.radar_rect()?;
+        if x < rx || x >= rx + size || y < ry || y >= ry + size {
+            return None;
+        }
+        let (mw, mh) = (self.map_cells_w().max(1), self.map_cells_h().max(1));
+        let cx = ((x - rx) as i64 * mw as i64 / size as i64) as i32;
+        let cy = ((y - ry) as i64 * mh as i64 / size as i64) as i32;
+        Some(CellCoord::new(cx, cy))
+    }
+
+    /// Map width/height in cells (from the terrain raster).
+    fn map_cells_w(&self) -> i32 {
+        self.raster.width as i32 / CELL_PIXELS
+    }
+    fn map_cells_h(&self) -> i32 {
+        self.raster.height as i32 / CELL_PIXELS
+    }
+
+    /// Handle a left-click inside the sidebar strip: the radar jumps the camera,
+    /// ready buildings enter placement mode, buildable rows start production.
     fn sidebar_click(&mut self, x: i32, y: i32) {
+        // Radar click-to-jump works even after the game is over (navigation only).
+        if let Some(cell) = self.radar_cell_at(x, y) {
+            let px = (cell.x * CELL_PIXELS - self.tactical_width() as i32 / 2) as f32;
+            let py = (cell.y * CELL_PIXELS - self.viewport_h as i32 / 2) as f32;
+            self.set_camera(px, py);
+            return;
+        }
         if !self.accepting_orders() {
             return;
         }
@@ -1154,10 +1575,39 @@ impl AppCore {
                 if cell.bails == 0 {
                     continue;
                 }
-                let rgb = if cell.gem { ORE_GEM_RGB } else { ORE_GOLD_RGB };
                 let px = (cx * CELL_PIXELS) as i64 - cam.x;
                 let py = (cy * CELL_PIXELS) as i64 - cam.y;
-                // Denser ore = larger patch (2..CELL_PIXELS-ish).
+
+                // Real overlay art when installed: pick a tile variant from the
+                // cell coordinates (cosmetic-only variety — the sim tracks only
+                // density+kind, the original stored the GOLD01..04 variant in the
+                // overlay byte) and the density stage (`bails - 1`) as the frame.
+                let tiles = if cell.gem {
+                    &self.ore_gem_sprites
+                } else {
+                    &self.ore_gold_sprites
+                };
+                if !tiles.is_empty() {
+                    let variant = (cx.wrapping_mul(7) ^ cy.wrapping_mul(13))
+                        .rem_euclid(tiles.len() as i32) as usize;
+                    let sprite = &tiles[variant];
+                    let nframes = sprite.frames.len().max(1);
+                    let stage = ((cell.bails as usize).saturating_sub(1)).min(nframes - 1);
+                    if let Some(sframe) = sprite.frames.get(stage) {
+                        draw_sprite_topleft(
+                            frame,
+                            px as i32,
+                            py as i32,
+                            sframe,
+                            &identity_remap(),
+                            &self.palette,
+                        );
+                        continue;
+                    }
+                }
+
+                // Fallback: flat rectangle whose size grows with density.
+                let rgb = if cell.gem { ORE_GEM_RGB } else { ORE_GOLD_RGB };
                 let inset = (CELL_PIXELS - 4 - (cell.bails as i32).min(CELL_PIXELS - 6)).max(2) / 2;
                 fill_rect(
                     frame,
@@ -1167,6 +1617,37 @@ impl AppCore {
                     py as i32 + CELL_PIXELS - inset,
                     rgb,
                 );
+            }
+        }
+    }
+
+    /// Draw the live cosmetic effects at their current animation frame. Explosions
+    /// are centre-anchored; buildups are top-left-anchored (like the building).
+    /// House-neutral art, so the identity remap is used.
+    fn draw_effects(&self, frame: &mut RgbaImage, cam: Rect) {
+        let remap = identity_remap();
+        for e in &self.effects {
+            let elapsed = self.anim_ms.saturating_sub(e.start_ms);
+            let fi = (elapsed / FX_FRAME_MS) as usize;
+            let (sprite, centered) = match e.kind {
+                EffectKind::Explosion => (self.explosion_sprite.first(), true),
+                EffectKind::Buildup(id) => (
+                    self.buildup_sprites
+                        .get(id as usize)
+                        .and_then(|o| o.as_ref()),
+                    false,
+                ),
+            };
+            let Some(sprite) = sprite else { continue };
+            let Some(sframe) = sprite.frames.get(fi) else {
+                continue;
+            };
+            let px = (leptons_to_pixel(e.anchor.x.0) as i64 - cam.x) as i32;
+            let py = (leptons_to_pixel(e.anchor.y.0) as i64 - cam.y) as i32;
+            if centered {
+                draw_sprite_centered(frame, px, py, sframe, &remap, &self.palette);
+            } else {
+                draw_sprite_topleft(frame, px, py, sframe, &remap, &self.palette);
             }
         }
     }
@@ -1264,8 +1745,12 @@ impl AppCore {
             pcol,
         );
 
+        // Radar minimap panel (top of the strip, under the header).
+        self.draw_radar(frame);
+
         // Buildable rows.
         let items = self.sidebar_items();
+        let row_h = self.sidebar_row_h();
         let mut ry = self.sidebar_rows_top();
         for item in &items {
             let row_bg = if item.ready {
@@ -1275,45 +1760,183 @@ impl AppCore {
             } else {
                 [30, 30, 34]
             };
-            fill_rect(frame, x0 + 2, ry, w - 3, ry + SIDEBAR_ROW_H - 2, row_bg);
+            fill_rect(frame, x0 + 2, ry, w - 3, ry + row_h - 2, row_bg);
             let name_col = if item.buildable || item.progress.is_some() || item.ready {
                 [230, 230, 230]
             } else {
                 [110, 110, 120]
             };
-            font::draw_text(frame, tx, ry + 2, &item.name, name_col);
+
+            // Cameo art (centred) when installed; else the item's short name.
+            let cameo = self.cameo_for(item.item);
+            let label_y = if let Some(sprite) = cameo {
+                if let Some(f) = sprite.frames.first() {
+                    let cx = x0 + (SIDEBAR_W as i32 - CAMEO_W) / 2;
+                    draw_sprite_topleft(frame, cx, ry + 2, f, &identity_remap(), &self.palette);
+                    // Dim non-buildable cameos.
+                    if !(item.buildable || item.progress.is_some() || item.ready) {
+                        fill_rect_alpha(
+                            frame,
+                            cx,
+                            ry + 2,
+                            cx + CAMEO_W,
+                            ry + 2 + CAMEO_H,
+                            [10, 10, 14],
+                            140,
+                        );
+                    }
+                }
+                ry + CAMEO_H + 2
+            } else {
+                font::draw_text(frame, tx, ry + 2, &item.name, name_col);
+                ry + 2 + font::GLYPH_H + 1
+            };
+
+            // Cost line.
             font::draw_text(
                 frame,
                 tx,
-                ry + 2 + font::GLYPH_H + 1,
+                label_y,
                 &format!("${}", item.cost),
                 [180, 180, 140],
             );
-            // Progress bar / ready tag on the right of the row.
+            // Progress bar / ready tag.
             if item.ready {
-                font::draw_text(frame, tx + 40, ry + 2, "READY", [120, 240, 120]);
+                font::draw_text(frame, tx + 40, label_y, "READY", [120, 240, 120]);
             } else if let Some(pm) = item.progress {
                 let bx0 = x0 + 44;
                 let bx1 = w - 4;
-                fill_rect(frame, bx0, ry + 3, bx1, ry + 9, [20, 20, 24]);
+                fill_rect(frame, bx0, label_y + 1, bx1, label_y + 7, [20, 20, 24]);
                 let fill = bx0 + (bx1 - bx0) * pm / 1000;
-                fill_rect(frame, bx0, ry + 3, fill, ry + 9, [80, 160, 240]);
-                font::draw_text(
-                    frame,
-                    bx0,
-                    ry + 11,
-                    &format!("{}%", pm / 10),
-                    [200, 200, 210],
-                );
+                fill_rect(frame, bx0, label_y + 1, fill, label_y + 7, [80, 160, 240]);
             }
-            ry += SIDEBAR_ROW_H;
+            ry += row_h;
         }
+    }
+
+    /// Look up the cameo sprite for a buildable (parallel to `buildables`).
+    fn cameo_for(&self, item: BuildItem) -> Option<&UnitSprite> {
+        let idx = self.buildables.iter().position(|&b| b == item)?;
+        self.cameo_sprites.get(idx).and_then(|o| o.as_ref())
+    }
+
+    /// Draw the radar minimap: explored terrain (dim), ore tint, house-coloured
+    /// building/unit markers, and the current camera view box. Reads sim state
+    /// only. No-op if the radar is disabled.
+    fn draw_radar(&self, frame: &mut RgbaImage) {
+        let Some((rx, ry, size)) = self.radar_rect() else {
+            return;
+        };
+        let (mw, mh) = (self.map_cells_w().max(1), self.map_cells_h().max(1));
+        // Panel backing + frame.
+        fill_rect(frame, rx - 1, ry - 1, rx + size, ry + size, [8, 8, 12]);
+
+        let house = self.player_house.unwrap_or(0);
+        let shroud = &self.world.shroud;
+        // Terrain / shroud / ore, one radar pixel per scaled cell.
+        for py in 0..size {
+            let cy = (py as i64 * mh as i64 / size as i64) as i32;
+            for px in 0..size {
+                let cx = (px as i64 * mw as i64 / size as i64) as i32;
+                let c = CellCoord::new(cx, cy);
+                let explored = shroud.is_explored(house, c);
+                let rgb = if !explored {
+                    [0, 0, 0]
+                } else {
+                    let ore = self.world.ore.at(c);
+                    if ore.bails > 0 {
+                        if ore.gem {
+                            [60, 110, 160]
+                        } else {
+                            [150, 125, 40]
+                        }
+                    } else {
+                        [40, 52, 40]
+                    }
+                };
+                put_pixel(frame, rx + px, ry + py, rgb);
+            }
+        }
+        // Building footprints (house colour) — only where explored.
+        for (_h, b) in self.world.buildings.iter() {
+            let col = house_dot(b.house);
+            for fc in b.footprint() {
+                if !shroud.is_explored(house, fc) {
+                    continue;
+                }
+                let px = rx + (fc.x as i64 * size as i64 / mw as i64) as i32;
+                let py = ry + (fc.y as i64 * size as i64 / mh as i64) as i32;
+                put_pixel(frame, px, py, col);
+            }
+        }
+        // Unit dots (house colour) — only where explored.
+        for (_h, u) in self.world.units.iter() {
+            let c = u.cell();
+            if !shroud.is_explored(house, c) {
+                continue;
+            }
+            let px = rx + (c.x as i64 * size as i64 / mw as i64) as i32;
+            let py = ry + (c.y as i64 * size as i64 / mh as i64) as i32;
+            put_pixel(frame, px, py, house_dot(u.house));
+        }
+        // Camera view box.
+        let cam = self.camera_rect();
+        let vx0 = rx + (cam.x * size as i64 / (mw as i64 * CELL_PIXELS as i64)) as i32;
+        let vy0 = ry + (cam.y * size as i64 / (mh as i64 * CELL_PIXELS as i64)) as i32;
+        let vx1 = rx
+            + ((cam.x + cam.width as i64) * size as i64 / (mw as i64 * CELL_PIXELS as i64)) as i32;
+        let vy1 = ry
+            + ((cam.y + cam.height as i64) * size as i64 / (mh as i64 * CELL_PIXELS as i64)) as i32;
+        draw_rect_outline(
+            frame,
+            vx0,
+            vy0,
+            vx1.min(rx + size),
+            vy1.min(ry + size),
+            [230, 230, 230],
+        );
     }
 
     /// Drain queued sim commands emitted since the last call (for the transport
     /// / tests). Terrain-only cores never emit any.
     pub fn drain_commands(&mut self) -> Vec<Command> {
         std::mem::take(&mut self.emitted)
+    }
+}
+
+/// Set a single clipped opaque pixel.
+fn put_pixel(dst: &mut RgbaImage, x: i32, y: i32, rgb: [u8; 3]) {
+    if x < 0 || y < 0 || x as u32 >= dst.width || y as u32 >= dst.height {
+        return;
+    }
+    let di = ((y as u32 * dst.width + x as u32) * 4) as usize;
+    dst.pixels[di] = rgb[0];
+    dst.pixels[di + 1] = rgb[1];
+    dst.pixels[di + 2] = rgb[2];
+    dst.pixels[di + 3] = 255;
+}
+
+/// Alpha-blend a solid colour over a clipped rectangle (`alpha` 0..=255).
+fn fill_rect_alpha(
+    dst: &mut RgbaImage,
+    x0: i32,
+    y0: i32,
+    x1: i32,
+    y1: i32,
+    rgb: [u8; 3],
+    alpha: u8,
+) {
+    let (xa, xb) = (x0.min(x1).max(0), x1.max(x0).min(dst.width as i32 - 1));
+    let (ya, yb) = (y0.min(y1).max(0), y1.max(y0).min(dst.height as i32 - 1));
+    let a = alpha as u32;
+    for y in ya..=yb {
+        for x in xa..=xb {
+            let di = ((y as u32 * dst.width + x as u32) * 4) as usize;
+            for (k, &c) in rgb.iter().enumerate() {
+                let bg = dst.pixels[di + k] as u32;
+                dst.pixels[di + k] = ((c as u32 * a + bg * (255 - a)) / 255) as u8;
+            }
+        }
     }
 }
 

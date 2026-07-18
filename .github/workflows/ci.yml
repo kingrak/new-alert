@@ -28,6 +28,13 @@ jobs:
       - run: cargo test --workspace
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo fmt --check
+      # feature-config matrix (Linux only to keep the matrix cheap):
+      # headless (no window/audio) and window-without-audio must stay green
+      - if: runner.os == 'Linux'
+        run: |
+          cargo clippy -p ra-client --no-default-features --all-targets -- -D warnings
+          cargo test -p ra-client --no-default-features
+          cargo clippy -p ra-client --no-default-features --features window --all-targets -- -D warnings
 
   # DESIGN.md §4.8 layer 5: boot the real macroquad shell under a virtual
   # display to catch adapter-level breakage (e.g. a windowing/GL init crash)

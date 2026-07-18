@@ -302,24 +302,15 @@ fn spawn_building_reveals_full_footprint_when_sight_covers_it() {
     }
 }
 
-/// **Finding, not a fix.** `World::spawn_building` (`world.rs`, "Reveal the
-/// shroud around the new structure (building.cpp:1140)") reveals a single
-/// octagonal disc centered on the building's `center_cell()`, using the
-/// building's `sight`. That is correct for every building the real catalog
-/// currently models (see `real_catalog_buildings_footprint_fully_covered_by_sight`
-/// below — verified against the real `rules.ini` shipped with this repo's
-/// assets: every one of the 10 modelled building types' `Sight=` covers its
-/// full footprint today). But the reveal is structurally a *center-out disc*,
-/// not a footprint walk — so a large-footprint / small-sight combination can
-/// leave footprint corners dark. `ra-data/src/buildings.rs`'s own footprint
-/// table doc comments a `BSIZE_55` (5x5) shape from the original engine that
-/// this milestone doesn't model yet; this test builds a synthetic 5x5/sight-1
-/// building to demonstrate the gap concretely, so it is caught the moment
-/// such content is added. This is a *theoretical* gap today (no live catalog
-/// building triggers it), reported to ra-coder as a design note on
-/// `spawn_building`'s reveal, not a bug fix.
+/// **M7 fix (was a characterization of the gap).** `World::spawn_building` now
+/// reveals the shroud from **every footprint cell** of a new structure, not a
+/// single centre-out disc (`Sight_From` runs over the occupied cells,
+/// `map.cpp:576`). So even a pathological large-footprint / tiny-sight building
+/// has its whole footprint revealed on placement — the corner-darkness gap this
+/// test used to pin is closed. Kept as a regression guard that the footprint
+/// walk stays in place.
 #[test]
-fn spawn_building_center_disc_can_leave_large_footprint_corners_dark_when_sight_is_undersized() {
+fn spawn_building_reveal_walks_full_footprint_even_with_undersized_sight() {
     let mut world = World::new(Passability::all_passable(), 1);
     world.enable_shroud();
     let mut catalog = Catalog::new();
@@ -330,35 +321,27 @@ fn spawn_building_center_disc_can_leave_large_footprint_corners_dark_when_sight_
     let handle = world
         .spawn_building(0, 1, top_left)
         .expect("spawn should succeed");
-    let b = world.buildings.get(handle).unwrap();
-    let center = b.center_cell();
+    let center = world.buildings.get(handle).unwrap().center_cell();
     assert_eq!(center, CellCoord::new(52, 52));
 
-    // The center cell itself is explored (sight >= 1 covers the center).
-    assert!(world.shroud.is_explored(1, center));
-
-    // But the footprint's far corners (offset (2,2) etc. from the center)
-    // are NOT — demonstrating the gap. If this assertion ever starts
-    // failing because `spawn_building` was changed to walk the full
-    // footprint, that's the fix landing; update/remove this test then.
-    let corners = [
+    // Every footprint cell — including all four far corners — is now explored,
+    // regardless of how undersized the building's own sight is.
+    let footprint: Vec<CellCoord> = world.buildings.get(handle).unwrap().footprint().collect();
+    for c in footprint {
+        assert!(
+            world.shroud.is_explored(1, c),
+            "footprint cell {c:?} must be revealed by the footprint-walk reveal"
+        );
+    }
+    // Spot-check the extreme corners explicitly.
+    for c in [
         CellCoord::new(50, 50),
         CellCoord::new(54, 50),
         CellCoord::new(50, 54),
         CellCoord::new(54, 54),
-    ];
-    let mut any_dark = false;
-    for c in corners {
-        if !world.shroud.is_explored(1, c) {
-            any_dark = true;
-        }
+    ] {
+        assert!(world.shroud.is_explored(1, c), "corner {c:?} left dark");
     }
-    assert!(
-        any_dark,
-        "expected at least one footprint corner to be left unrevealed by the undersized-sight \
-         center-disc reveal (if this now fails, spawn_building's reveal was fixed to cover the \
-         full footprint -- update this characterization test)"
-    );
 }
 
 /// Real-catalog check (skip-clean without assets, but this repo's `assets/`

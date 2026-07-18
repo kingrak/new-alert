@@ -427,13 +427,20 @@ impl World {
             }
             hs.adjust_building_count(building_id, 1);
         }
-        // Reveal the shroud around the new structure (building.cpp:1140).
-        let center = self
+        // Reveal the shroud around the new structure. The original reveals sight
+        // from the building's whole footprint, not a single centre cell
+        // (`Sight_From` runs over the occupied cells, `map.cpp:576`); revealing
+        // from each footprint cell closes the disc gap that a single-centre
+        // reveal leaves around a multi-cell building's corners.
+        let sight = proto.sight.min(10);
+        let foot: Vec<CellCoord> = self
             .buildings
             .get(handle)
-            .map(|b| b.center_cell())
-            .unwrap_or(cell);
-        self.shroud.reveal(house, center, proto.sight.min(10));
+            .map(|b| b.footprint().collect())
+            .unwrap_or_else(|| vec![cell]);
+        for c in foot {
+            self.shroud.reveal(house, c, sight);
+        }
         Some(handle)
     }
 
@@ -1033,6 +1040,8 @@ fn remove_building(world: &mut World, handle: Handle) {
     let house = b.house;
     let power = b.power;
     let type_id = b.type_id;
+    let was_construction_yard = b.is_construction_yard;
+    let was_war_factory = b.is_war_factory;
     let cells: Vec<CellCoord> = b.footprint().collect();
     for c in cells {
         world.passable.set_occupied(c, false);
@@ -1046,6 +1055,54 @@ fn remove_building(world: &mut World, handle: Handle) {
         hs.adjust_building_count(type_id, -1);
     }
     world.buildings.remove(handle);
+
+    // Abandon orphaned production: removing the last building able to host a
+    // production lane abandons its in-flight object and refunds the credits
+    // already spent (`BuildingClass::Detach_All` → `FactoryClass::Abandon`,
+    // `building.cpp:5138`, `factory.cpp:479` `Refund_Money(money - Balance)`).
+    // This runs on *both* Sell and combat destruction, exactly as Detach_All
+    // does, and fixes the M6 sell-while-producing soft-lock (a stuck-done unit
+    // lane with no factory left to exit from).
+    if was_construction_yard && !house_has_construction_yard(world, house) {
+        abandon_production_lane(world, house, ProdKind::Building);
+    }
+    if was_war_factory && !house_has_war_factory(world, house) {
+        abandon_production_lane(world, house, ProdKind::Unit);
+    }
+}
+
+/// Whether `house` still owns a live construction yard.
+fn house_has_construction_yard(world: &World, house: u8) -> bool {
+    world
+        .buildings
+        .iter()
+        .any(|(_, b)| b.house == house && b.is_construction_yard && b.is_alive())
+}
+
+/// Whether `house` still owns a live war factory.
+fn house_has_war_factory(world: &World, house: u8) -> bool {
+    world
+        .buildings
+        .iter()
+        .any(|(_, b)| b.house == house && b.is_war_factory && b.is_alive())
+}
+
+/// Abandon a house's in-flight production lane, refunding the portion of the
+/// cost already paid (`FactoryClass::Abandon`, `factory.cpp:479`). The `spent`
+/// field is exactly "money already paid" (the original's `money - Balance`), so
+/// refunding it makes the abandoned build net-zero in credits. No-op if the lane
+/// is empty. A completed-but-unplaced building (`ready_building`) is left intact
+/// — placement does not require the construction yard in our model.
+fn abandon_production_lane(world: &mut World, house: u8, kind: ProdKind) {
+    let refund = if let Some(hs) = world.houses.get_mut(house as usize) {
+        match kind {
+            ProdKind::Building => hs.building_prod.take().map(|p| p.spent).unwrap_or(0),
+            ProdKind::Unit => hs.unit_prod.take().map(|p| p.spent).unwrap_or(0),
+        }
+    } else {
+        0
+    };
+    refund_credits(world, house, refund);
 }
 
 /// Whether building `building_id`'s footprint at top-left `cell` is a legal
@@ -1341,10 +1398,166 @@ fn fire(
         min_damage: weapon.min_damage,
         max_damage: weapon.max_damage,
         source_house,
+        source_unit: shooter,
         instant: weapon.instant,
         invisible: weapon.invisible,
     };
     world.bullets.insert(bullet);
+}
+
+/// Leptons within which a warhead's detonation damages nearby objects — the
+/// original's fixed blast radius `range = ICON_LEPTON_W + (ICON_LEPTON_W >> 1)`
+/// (`combat.cpp:177` = 256 + 128 = 384 = 1.5 cells). "Damage never spills
+/// further than one cell away" (`combat.cpp:186`): the object scan only visits
+/// the impact cell and its 8 neighbours, then this radius filters by true
+/// distance.
+const EXPLOSION_RANGE: i32 = 384;
+
+/// Port of `Explosion_Damage` (`combat.cpp:162-243`): apply a warhead's blast at
+/// `impact` to every unit and building within [`EXPLOSION_RANGE`] leptons whose
+/// cell lies in the impact cell's 3×3 neighbourhood, with the distance falloff
+/// handled by [`modify_damage`] (which `Take_Damage` calls, `object.cpp:1661`).
+///
+/// Faithful details: the firing unit is excluded from its own blast
+/// (`object != source`, `combat.cpp:203`); a building occupying the impact cell
+/// takes a **direct hit** at distance 0 (`combat.cpp:230`); each object is
+/// damaged at most once (our arena handles are unique, so no explicit
+/// `IsToDamage` dedup is needed). Allies are **not** spared — splash is
+/// full friendly-fire, exactly as the original (only `source` is immune).
+///
+/// This path draws **no** sim RNG (the original's only RNG here is bridge
+/// destruction, `combat.cpp:270`, which we do not model), so the combat RNG draw
+/// sequence — and every determinism golden that depends on it — is unchanged.
+///
+/// Wall/overlay/tiberium erosion (`combat.cpp:249-261`) is deferred (see the M7
+/// report): warheads here damage only units and buildings.
+#[allow(clippy::too_many_arguments)]
+fn explosion_damage(
+    world: &mut World,
+    impact: WorldCoord,
+    damage: i32,
+    warhead: &crate::combat::WarheadProfile,
+    min_damage: i32,
+    max_damage: i32,
+    source: Handle,
+    dead_units: &mut Vec<Handle>,
+    dead_buildings: &mut Vec<Handle>,
+) {
+    if damage == 0 {
+        return;
+    }
+    let impact_cell = impact.cell();
+    // The attacker's house, if it is still alive — retaliation only fires against
+    // a live enemy source (never an ally caught in friendly-fire splash).
+    let source_house = world
+        .units
+        .get(source)
+        .filter(|u| u.is_alive())
+        .map(|u| u.house);
+
+    // --- Units in the 3×3 neighbourhood ---
+    for h in world.units.handles() {
+        if h == source {
+            continue;
+        }
+        let (coord, armor) = match world.units.get(h) {
+            Some(u) if u.is_alive() => (u.coord, u.armor),
+            _ => continue,
+        };
+        let uc = coord.cell();
+        if (uc.x - impact_cell.x).abs() > 1 || (uc.y - impact_cell.y).abs() > 1 {
+            continue;
+        }
+        let distance = leptons_distance(impact, coord);
+        if distance >= EXPLOSION_RANGE {
+            continue;
+        }
+        let dmg = modify_damage(damage, warhead, armor, distance, min_damage, max_damage);
+        if dmg <= 0 {
+            continue;
+        }
+        if let Some(u) = world.units.get_mut(h) {
+            u.health = u.health.saturating_sub(dmg as u16);
+            if u.health == 0 {
+                if !dead_units.contains(&h) {
+                    dead_units.push(h);
+                }
+            } else if source_house.is_some_and(|sh| sh != u.house) {
+                // Auto-retaliation (guard-mission return fire, item 2):
+                // `FootClass::Take_Damage` assigns the attacker as TarCom when
+                // the unit survives, is allowed to retaliate, and is idle.
+                assign_retaliation(u, source);
+            }
+        }
+    }
+
+    // --- Buildings covering the 3×3 neighbourhood ---
+    for h in world.buildings.handles() {
+        let (covers_impact, near, center, armor) = match world.buildings.get(h) {
+            Some(b) if b.is_alive() => {
+                let mut near = false;
+                'scan: for dy in -1..=1 {
+                    for dx in -1..=1 {
+                        if b.covers(CellCoord::new(impact_cell.x + dx, impact_cell.y + dy)) {
+                            near = true;
+                            break 'scan;
+                        }
+                    }
+                }
+                (
+                    b.covers(impact_cell),
+                    near,
+                    b.center_cell().center(),
+                    b.armor,
+                )
+            }
+            _ => continue,
+        };
+        if !near {
+            continue;
+        }
+        // A building occupying the impact cell takes a direct hit (combat.cpp:230).
+        let distance = if covers_impact {
+            0
+        } else {
+            leptons_distance(impact, center)
+        };
+        if distance >= EXPLOSION_RANGE {
+            continue;
+        }
+        let dmg = modify_damage(damage, warhead, armor, distance, min_damage, max_damage);
+        if dmg <= 0 {
+            continue;
+        }
+        if let Some(b) = world.buildings.get_mut(h) {
+            b.health = b.health.saturating_sub(dmg as u16);
+            if b.health == 0 && !dead_buildings.contains(&h) {
+                dead_buildings.push(h);
+            }
+        }
+    }
+}
+
+/// Assign the attacker as a damaged unit's target if it is idle and armed — the
+/// guard-mission return-fire path (`FootClass::Take_Damage` →
+/// `Is_Allowed_To_Retaliate` → `Assign_Target(source)`, `foot.cpp:1176-1189`).
+///
+/// Simplifications vs. the original, all documented deviations:
+/// - We retaliate only when the unit has **no current target and no move path**
+///   (truly idle/guarding), so an explicit player Move/Attack order is never
+///   hijacked — the original also snaps out of sticky modes but keeps an
+///   existing TarCom/NavCom. This directly fixes the playtest complaint ("units
+///   stand and die") without overriding orders.
+/// - `Is_Allowed_To_Retaliate` gates human houses behind `Rule.IsSmartDefense`
+///   (`techno.cpp:5641`); we enable retaliation for **all** houses (the
+///   skirmish-friendly default), so the player's guarding units fight back.
+/// - The warhead-can-harm-source and threat-comparison gates are omitted;
+///   we require only that the unit is armed and the source is a live enemy.
+fn assign_retaliation(unit: &mut Unit, source: Handle) {
+    if unit.weapon.is_none() || unit.target.is_some() || !unit.path.is_empty() {
+        return;
+    }
+    unit.target = Some(Target::Unit(source));
 }
 
 /// Bullet system: advance every projectile; on detonation apply damage to its
@@ -1366,57 +1579,24 @@ fn run_bullets(world: &mut World) {
         if !detonated {
             continue;
         }
-        // Detonate: pull the bullet out and apply its damage. Buildings take
-        // damage through the same `modify_damage` path as units (buildings share
-        // the object damage math, `object.cpp:1661`; `Armor=` selects the column).
+        // Detonate: pull the bullet out and apply its warhead as an area blast at
+        // the impact point (`Explosion_Damage`, combat.cpp:162). This unifies all
+        // three target kinds — an accurate unit/building hit lands the primary
+        // object at distance 0 (identical to the old single-target math) while
+        // also catching neighbours; a force-fire `Cell` now does real ground-blast
+        // damage instead of detonating harmlessly.
         if let Some(b) = world.bullets.remove(handle) {
-            match b.target {
-                Target::Unit(t) => {
-                    if let Some(tu) = world.units.get(t) {
-                        if tu.is_alive() {
-                            let distance = leptons_distance(b.impact, tu.coord);
-                            let dmg = modify_damage(
-                                b.damage,
-                                &b.warhead,
-                                tu.armor,
-                                distance,
-                                b.min_damage,
-                                b.max_damage,
-                            );
-                            if let Some(tu) = world.units.get_mut(t) {
-                                tu.health = tu.health.saturating_sub(dmg.max(0) as u16);
-                                if tu.health == 0 && !dead_units.contains(&t) {
-                                    dead_units.push(t);
-                                }
-                            }
-                        }
-                    }
-                }
-                Target::Building(t) => {
-                    if let Some(tb) = world.buildings.get(t) {
-                        if tb.is_alive() {
-                            let distance = leptons_distance(b.impact, tb.center_cell().center());
-                            let dmg = modify_damage(
-                                b.damage,
-                                &b.warhead,
-                                tb.armor,
-                                distance,
-                                b.min_damage,
-                                b.max_damage,
-                            );
-                            if let Some(tb) = world.buildings.get_mut(t) {
-                                tb.health = tb.health.saturating_sub(dmg.max(0) as u16);
-                                if tb.health == 0 && !dead_buildings.contains(&t) {
-                                    dead_buildings.push(t);
-                                }
-                            }
-                        }
-                    }
-                }
-                // Force-fire at an empty cell detonates harmlessly. Area/splash
-                // damage to bystanders is a documented M7 TODO.
-                Target::Cell(_) => {}
-            }
+            explosion_damage(
+                world,
+                b.impact,
+                b.damage,
+                &b.warhead,
+                b.min_damage,
+                b.max_damage,
+                b.source_unit,
+                &mut dead_units,
+                &mut dead_buildings,
+            );
         }
     }
     // Remove the dead (their handles go stale; attackers drop the target next
@@ -1987,6 +2167,104 @@ mod tests {
             (900..1100).contains(&ticks),
             "unexpected time-to-kill: {ticks} ticks"
         );
+    }
+
+    #[test]
+    fn splash_damage_hits_a_bystander_near_a_force_fire_impact() {
+        // Force-fire the 90mm (AP, base 30, spread 3) at empty ground cell
+        // (20,20); a heavy-armor bystander sits one cell away at (21,20).
+        // Hand-check: impact centre is (20,20).center() = (20*256+128, ...).
+        // The bystander centre is one cell (256 leptons) east, so
+        // leptons_distance(impact, bystander) = 256.
+        // modify_damage(30, AP, armor=3 (100%), 256, 1, 1000):
+        //   30*100% = 30; spread 3 -> 256 / (3*5=15) = 17 -> clamp 16 -> 30/16 = 1.
+        // So the bystander loses exactly 1 hp per shot from splash alone.
+        let mut w = world();
+        let atk = spawn_tank(&mut w, 1, CellCoord::new(10, 20), 400);
+        let bystander = w.spawn_unit(0, 2, CellCoord::new(21, 20), Facing(0), 600, stats());
+        w.set_unit_combat(bystander, 3, None, false); // unarmed heavy
+
+        let before = w.units.get(bystander).unwrap().health;
+        w.tick(&[Command::Attack {
+            unit: atk,
+            target: Target::Cell(CellCoord::new(20, 20)),
+            house: 1,
+        }]);
+        // Let the bullet fly to the ground and detonate.
+        let mut fired = false;
+        for _ in 0..200 {
+            w.tick(&[]);
+            let now = w.units.get(bystander).unwrap().health;
+            if now < before {
+                assert_eq!(before - now, 1, "one 90mm splash hit at 1 cell = 1 hp");
+                fired = true;
+                break;
+            }
+        }
+        assert!(fired, "force-fire at ground never splashed the bystander");
+    }
+
+    #[test]
+    fn idle_unit_retaliates_against_its_attacker() {
+        // An idle, armed guard tank (house 2) that gets shot by house 1 turns and
+        // targets the attacker (guard-mission return fire, foot.cpp:1189).
+        let mut w = world();
+        let attacker = spawn_tank(&mut w, 1, CellCoord::new(10, 10), 400);
+        let guard = spawn_tank(&mut w, 2, CellCoord::new(11, 10), 400);
+        // Guard starts idle: no target, no path.
+        assert!(!w.units.get(guard).unwrap().has_target());
+
+        w.tick(&[Command::Attack {
+            unit: attacker,
+            target: Target::Unit(guard),
+            house: 1,
+        }]);
+        // Within a few shots the guard should have taken a hit and retaliated.
+        let mut retaliated = false;
+        for _ in 0..300 {
+            w.tick(&[]);
+            if let Some(g) = w.units.get(guard) {
+                if g.target == Some(Target::Unit(attacker)) {
+                    retaliated = true;
+                    break;
+                }
+            } else {
+                break; // guard died before we observed retaliation
+            }
+        }
+        assert!(retaliated, "idle guard never returned fire on its attacker");
+    }
+
+    #[test]
+    fn retaliation_never_overrides_an_explicit_order() {
+        // A unit under a live move order that gets shot must NOT drop its order to
+        // retaliate (we only wake truly idle units).
+        let mut w = world();
+        let attacker = spawn_tank(&mut w, 1, CellCoord::new(10, 10), 400);
+        let mover = spawn_tank(&mut w, 2, CellCoord::new(11, 10), 400);
+        w.tick(&[
+            Command::Attack {
+                unit: attacker,
+                target: Target::Unit(mover),
+                house: 1,
+            },
+            Command::Move {
+                unit: mover,
+                dest: CellCoord::new(30, 30),
+                house: 2,
+            },
+        ]);
+        // While the mover still has a path, its target stays None (no hijack).
+        for _ in 0..40 {
+            w.tick(&[]);
+            let Some(m) = w.units.get(mover) else { break };
+            if !m.path.is_empty() {
+                assert_eq!(
+                    m.target, None,
+                    "a moving unit must not be hijacked to retaliate"
+                );
+            }
+        }
     }
 
     #[test]

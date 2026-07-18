@@ -15,6 +15,8 @@ pub enum Key {
     Down,
     /// Deploy the selected MCV into a construction yard (M5).
     Deploy,
+    /// Toggle the on-screen controls hint overlay (M7, F1).
+    Help,
 }
 
 /// A pointer button. Left drives selection; right issues move orders.

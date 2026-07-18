@@ -6,6 +6,7 @@
 //! [`crate::combat::modify_damage`] to the target. Death anims and craters are a
 //! deliberate M7 seam (see [`crate::world`]).
 
+use crate::arena::Handle;
 use crate::combat::{Target, WarheadProfile};
 use crate::coords::{Facing, WorldCoord};
 use crate::hash::Fnv1a;
@@ -36,6 +37,12 @@ pub struct Bullet {
     pub max_damage: i32,
     /// House that fired the shot (for future friendly-fire / scoring rules).
     pub source_house: u8,
+    /// The unit that fired the shot. Used to (a) exclude the shooter from its
+    /// own blast (`object != source`, `combat.cpp:203`) and (b) name the
+    /// retaliation target for units the blast wakes up (`FootClass::Take_Damage`
+    /// → `Assign_Target(source)`, `foot.cpp:1189`). The handle may be stale by
+    /// detonation (the shooter died mid-flight); consumers check liveness.
+    pub source_unit: Handle,
     /// Hitscan flag: detonate on the first bullet step, no visible flight
     /// (`MaxSpeed == MPH_LIGHT_SPEED && IsInvisible`, `bullet.cpp:787`).
     pub instant: bool,
@@ -98,6 +105,8 @@ impl Bullet {
         h.write_i32(self.min_damage);
         h.write_i32(self.max_damage);
         h.write_u8(self.source_house);
+        h.write_u32(self.source_unit.index);
+        h.write_u32(self.source_unit.gen);
         h.write_u8(self.instant as u8);
         h.write_u8(self.invisible as u8);
     }
