@@ -10,16 +10,22 @@
 //! - [`crypto`] — the Westwood public-key scheme + Blowfish (header decryption).
 //! - [`pal`]    — 6-bit VGA palettes expanded to 8-bit RGB.
 //! - [`shp`]    — SHP unit shapes (Format80 / LCW and Format40 / XOR-delta).
+//! - [`tmpl`]   — theater template (icon/tileset) files (`.tem`/`.sno`/`.int`).
 //! - [`codec`]  — the shared LCW and XOR-delta byte codecs.
+//! - [`pack`]   — base64 + chunked-LCW "pack" decoding (`[MapPack]` blocks).
+//! - [`ini`]    — a small case-insensitive INI reader.
 //! - [`names`]  — a small built-in list of well-known RA filenames.
 
 pub mod codec;
 pub mod crc;
 pub mod crypto;
+pub mod ini;
 pub mod mix;
 pub mod names;
+pub mod pack;
 pub mod pal;
 pub mod shp;
+pub mod tmpl;
 
 /// Error type shared by the format parsers.
 ///

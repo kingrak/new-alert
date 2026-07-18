@@ -19,8 +19,11 @@
 use proptest::prelude::*;
 
 use ra_formats::codec::{apply_xor_delta, lcw_decompress};
+use ra_formats::ini::Ini;
 use ra_formats::mix::MixArchive;
+use ra_formats::pack::{decode_base64, decompress_pack};
 use ra_formats::shp::Shp;
+use ra_formats::tmpl::Template;
 
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(512))]
@@ -110,5 +113,79 @@ proptest! {
     ) {
         let mut dst = vec![0u8; dst_len];
         apply_xor_delta(&mut dst, &delta);
+    }
+
+    #[test]
+    fn tmpl_parse_never_panics(data in proptest::collection::vec(any::<u8>(), 0..4096)) {
+        // Header fields are bounded u16/u32 reads; `icon()` is only exercised
+        // here through the safe getters (count/width/height), never with an
+        // attacker-chosen index, since that's covered by the bounded test
+        // below. `Template::parse` itself must never panic or allocate
+        // beyond the input length (it copies `data` verbatim into `raw`).
+        if let Ok(t) = Template::parse(&data) {
+            let _ = t.width();
+            let _ = t.height();
+            let _ = t.count();
+            let _ = t.color_map();
+        }
+    }
+
+    #[test]
+    fn tmpl_icon_lookup_never_panics(
+        data in proptest::collection::vec(any::<u8>(), 0..4096),
+        idx in 0usize..300,
+    ) {
+        // `icon()` indexes into `raw` via checked `get()` calls, so any index
+        // (in- or out-of-range) must return `Option`, never panic.
+        if let Ok(t) = Template::parse(&data) {
+            let _ = t.icon(idx);
+        }
+    }
+
+    #[test]
+    fn base64_decode_never_panics(data in proptest::collection::vec(any::<u8>(), 0..4096)) {
+        let out = decode_base64(&data);
+        // Every 6 input bits contributes at most... in the worst case (all
+        // alphabet bytes) output is bounded by input length.
+        prop_assert!(out.len() <= data.len());
+    }
+
+    #[test]
+    fn decompress_pack_never_panics(data in proptest::collection::vec(any::<u8>(), 0..8192)) {
+        let _ = decompress_pack(&data);
+    }
+
+    #[test]
+    fn base64_then_pack_never_panics(data in proptest::collection::vec(any::<u8>(), 0..8192)) {
+        // The exact pipeline `ra_data::scenario` runs over a scenario's
+        // `[MapPack]`/`[OverlayPack]` text: base64-decode then chunked-LCW
+        // decompress. Must never panic regardless of what garbage the
+        // "base64" text actually contains.
+        let packed = decode_base64(&data);
+        let _ = decompress_pack(&packed);
+    }
+
+    #[test]
+    fn ini_parse_never_panics(text in ".{0,4096}") {
+        // Arbitrary (possibly non-ASCII, control-character-laden) text must
+        // parse into *some* `Ini` without panicking; every lookup used below
+        // is itself bounds-checked.
+        let ini = Ini::parse(&text);
+        let _ = ini.has_section("Map");
+        let _ = ini.get("Map", "Theater");
+        let _ = ini.get_int("Map", "X");
+        let _ = ini.section_entries("MapPack");
+        let _ = ini.concat_block("MapPack");
+    }
+
+    #[test]
+    fn ini_parse_never_panics_on_raw_bytes(data in proptest::collection::vec(any::<u8>(), 0..4096)) {
+        // Same property, but starting from arbitrary bytes lossily converted
+        // to UTF-8 (the actual path `ra_client::assets` uses for MIX-sourced
+        // INI text via `String::from_utf8_lossy`), so invalid UTF-8 sequences
+        // and replacement characters are exercised too.
+        let text = String::from_utf8_lossy(&data);
+        let ini = Ini::parse(&text);
+        let _ = ini.get_int("Basic", "NewINIFormat");
     }
 }

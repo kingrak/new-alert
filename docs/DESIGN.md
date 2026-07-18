@@ -458,7 +458,54 @@ rule already removes the main risk (FP behavior differences). Two additions:
 packaging per OS (zip + .app bundle + tarball) is an M7 concern, but the build
 matrix exists now so portability rot is caught per-commit, not at release.
 
-### 4.8 Milestones
+### 4.8 Automated UI testing — no human clicking
+
+Requirement: every feature and every corner of the map must be exercisable by
+automated tests. This is an architecture constraint on `ra-client`, not a
+test-suite afterthought:
+
+**The AppCore seam.** All client behavior lives in a windowless `AppCore`:
+
+```rust
+struct AppCore { /* ui state, camera, selection, sim handle, ... */ }
+impl AppCore {
+    fn handle(&mut self, ev: InputEvent);        // our own event enum, not macroquad's
+    fn update(&mut self, dt_ms: u32);            // virtual time — no wall clock
+    fn compose(&self, viewport: Rect) -> Frame;  // pure CPU RGBA compositing
+    fn drain_commands(&mut self) -> Vec<Command>;
+}
+```
+
+The macroquad `main` is a ~100-line adapter: translate real input to
+`InputEvent`, call `update` with real dt, upload `compose` output as a texture.
+Nothing else lives in the shell — if a behavior can't be reached through
+`handle`/`update`, it's a review-blocking defect because it's untestable.
+
+**Test layers built on the seam** (owned by ra-tester):
+
+1. **Scripted end-to-end drives**: input scripts as data (`select unit at cell,
+   right-click cell, expect move command / camera at X`), run headless with
+   virtual time. Every user-facing feature gets a script; new feature PRs ship
+   with one.
+2. **Map sweeps**: drive the camera programmatically over the *entire* map —
+   every scroll extreme, all four corners, every zoom/viewport size — asserting
+   compose() succeeds everywhere (no panic, no missing tile, frame hash stable
+   across two passes). Run over real scenario maps from the assets.
+3. **Monkey tests**: property-tested random `InputEvent` sequences (thousands
+   of events, seeded/reproducible) — the client must never panic or leak an
+   invalid command regardless of input order. Proptest shrinking gives minimal
+   repro scripts for free.
+4. **Golden frames**: `compose()` output hashes pinned for known
+   scenario+viewport combos (regression pins, tolerance-free since rendering
+   is integer compositing; skip when assets absent, like the format goldens).
+5. **Windowed smoke test**: one CI job (Linux + xvfb) boots the real macroquad
+   shell for a few seconds to catch adapter-level breakage. Everything else
+   runs windowless on all three OS targets.
+
+Input scripts and monkey seeds double as bug repro currency: any UI bug report
+becomes a failing script committed with its fix.
+
+### 4.9 Milestones
 
 1. **M1 — Formats**: `ra-formats` parses MIX (incl. encrypted headers), PAL,
    SHP, TMP; CLI dump tool; golden-file tests against known assets.

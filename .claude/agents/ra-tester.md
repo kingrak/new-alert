@@ -36,12 +36,27 @@ tests. Ground truth for correct game behavior is the original source at
    - Serialize/deserialize `World` round-trip equality.
    - Run the sim in two threads / different iteration counts per batch →
      identical hashes (catches accidental order dependence).
-4. **UI tests** — the client's logic layer (input→command mapping, selection,
-   camera math, sidebar state machines) must be structured for headless testing;
-   test it with synthetic input events, no window. Rendering itself: smoke-test
-   that a frame renders without panic where feasible; screenshot-comparison
-   tests only if explicitly tasked. If client code is untestable because logic
-   is welded to rendering, report that as a structural finding for ra-coder.
+4. **UI tests** — fully automated, no human interaction, per DESIGN.md §4.8.
+   The client exposes a windowless `AppCore` (`handle(InputEvent)` /
+   `update(dt_ms)` virtual time / `compose(viewport)` pure compositing /
+   `drain_commands()`); ALL UI testing drives that seam. You own five layers:
+   - **Scripted end-to-end drives**: input scripts as data covering every
+     user-facing feature (select, order, scroll, sidebar, hotkeys...);
+     assert on emitted commands, UI state, and composed frames.
+   - **Map sweeps**: programmatically scroll/jump the camera across the ENTIRE
+     map of real scenarios — all four corners, every edge extreme, every
+     viewport size in use — asserting compose() never panics, never drops a
+     tile, and is hash-stable across repeat passes.
+   - **Monkey tests**: seeded proptest-driven random InputEvent sequences
+     (thousands of events); no panic, no invalid command, ever. Commit
+     shrunken repro seeds as regressions.
+   - **Golden frames**: pinned compose() hashes for known scenario+viewport
+     combos (skip cleanly when assets absent).
+   - **Windowed smoke**: keep the CI xvfb boot-test of the real macroquad
+     shell working; everything else must run windowless.
+   If any client behavior is reachable only through the macroquad shell and
+   not through AppCore, that is a review-blocking structural defect — report
+   it to ra-coder; do not work around it by driving a real window.
 
 ## Rules
 

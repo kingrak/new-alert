@@ -6,3 +6,7 @@ license.workspace = true
 publish = false
 
 [dependencies]
+ra-formats = { path = "../ra-formats" }
+
+[dev-dependencies]
+proptest = "1.11.0"

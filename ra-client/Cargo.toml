@@ -4,5 +4,23 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 publish = false
+description = "Red Alert client: terrain compositing, camera, and the macroquad shell."
 
 [dependencies]
+ra-formats = { path = "../ra-formats" }
+ra-data = { path = "../ra-data" }
+# macroquad is the rendering/input layer (DESIGN.md §1, §4.5): pure-Rust, no
+# system deps beyond stock GL/X11. Optional so the headless `--dump` path — the
+# M2 acceptance gate — builds and runs with no windowing libraries present.
+macroquad = { version = "0.4", optional = true }
+
+[features]
+default = ["window"]
+window = ["dep:macroquad"]
+
+[[bin]]
+name = "ra-client"
+path = "src/bin/ra-client.rs"
+
+[dev-dependencies]
+proptest = "1.11.0"

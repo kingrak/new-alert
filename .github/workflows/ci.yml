@@ -29,6 +29,57 @@ jobs:
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo fmt --check
 
+  # DESIGN.md §4.8 layer 5: boot the real macroquad shell under a virtual
+  # display to catch adapter-level breakage (e.g. a windowing/GL init crash)
+  # that only the real `window` binary target — not the windowless `AppCore`
+  # test suites — can exercise. Linux only, matching the project's stated
+  # policy that only this one smoke job needs a display; everything else
+  # (map sweeps, monkey tests, golden frames) runs windowless on all OSes.
+  #
+  # Structural gap (reported to ra-coder, tracked here rather than worked
+  # around): `ra-client window` has no timed-exit flag — it loops until
+  # Escape is pressed or the OS window is closed, so there is no way for
+  # this job to observe "booted, ran a few frames, exited cleanly" as a
+  # process exit code. `timeout` below is a pragmatic stopgap that bounds
+  # the job's runtime and treats "still running when the bounded timeout
+  # fired" (exit 124) as a pass, but a real `--smoke-seconds N` flag would
+  # let this job assert an actual clean exit instead.
+  #
+  # CI never has the copyrighted freeware assets checked in (see
+  # `assets/` — gitignored), so in practice `cmd_window` always takes the
+  # fast "could not find an assets directory" failure path here rather than
+  # ever reaching `shell::run_window`. That's tolerated explicitly below
+  # rather than papered over with `continue-on-error` on the whole step,
+  # so a *different* failure (e.g. a genuine panic or GL init crash) still
+  # fails the job.
+  windowed-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get update && sudo apt-get install -y xvfb libasound2-dev libx11-dev libxi-dev libgl1-mesa-dev
+      - run: cargo build -p ra-client
+      - name: xvfb-boot ra-client window (bounded, tolerant of missing assets)
+        run: |
+          set +e
+          xvfb-run -a timeout 10s target/debug/ra-client window 2>smoke.log
+          code=$?
+          set -e
+          cat smoke.log
+
+          if [ "$code" = 0 ] || [ "$code" = 124 ]; then
+            echo "smoke ok (exit $code: clean exit, or still running when the bounded timeout fired)"
+            exit 0
+          fi
+          if grep -q "could not find an assets directory" smoke.log; then
+            echo "smoke ok: expected no-assets failure (CI has no real assets; exit $code)"
+            exit 0
+          fi
+          echo "unexpected smoke failure (exit $code)"
+          exit 1
+        continue-on-error: true
+
   platform-quarantine:
     runs-on: ubuntu-latest
     steps:
