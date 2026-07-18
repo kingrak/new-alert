@@ -13,12 +13,15 @@ use std::path::PathBuf;
 use std::sync::OnceLock;
 
 use ra_client::appcore::AppCore;
-use ra_client::assets;
+use ra_client::assets::{self, LoadedGame};
 use ra_client::compositor::{IndexedImage, Palette};
+use ra_client::input::{InputEvent, MouseButton};
 use ra_client::terrain::{self, TileSet};
 use ra_data::scenario::{MapCell, Scenario, Theater, MAP_CELL_H, MAP_CELL_W};
 use ra_data::templates;
-use ra_formats::tmpl::Template;
+use ra_formats::tmpl::{Template, ICON_WIDTH};
+use ra_sim::coords::{CellCoord, Facing};
+use ra_sim::{Command, Handle, MoveStats, World};
 
 /// Tiny dependency-free FNV-1a 64-bit hash — same algorithm used by the
 /// `ra-formats` and `ra-data` golden tests, reimplemented here rather than
@@ -182,4 +185,150 @@ pub fn synthetic_raster_and_palette() -> (IndexedImage, Palette) {
 
     let raster = terrain::rasterize(&scenario, &tiles);
     (raster, synthetic_palette())
+}
+
+/// Cell of the `n`th synthetic "jeep" spawned by [`synthetic_core_with_units`]
+/// / [`synthetic_world_with_units`], exposed so scripted-drive tests can
+/// address a specific unit's start position without hardcoding the layout
+/// twice.
+pub fn synthetic_unit_cell(n: i32) -> CellCoord {
+    CellCoord::new(10 + n * 2, 10)
+}
+
+/// Build a `World` over an all-passable synthetic grid with a small, fixed
+/// population: three house-1 "jeeps" in a row (stand-ins for the real
+/// scg01ea JEEPs — M3 has no real unit catalog loaded here, just `MoveStats`
+/// shaped like one) plus one house-2 unit off to the side, so
+/// selection/ownership tests have both a same-house group to select and a
+/// different-house unit that must never be swept in by mistake. Returns the
+/// world plus the three house-1 handles in spawn order.
+pub fn synthetic_world_with_units(seed: u32) -> (World, Vec<Handle>) {
+    let mut world = World::new(ra_sim::Passability::all_passable(), seed);
+    let jeep_stats = MoveStats {
+        max_speed: 25, // Speed=10 -> 10*256/100
+        rot: 10,
+    };
+    let mut jeeps = Vec::new();
+    for i in 0..3i32 {
+        let h = world.spawn_unit(0, 1, synthetic_unit_cell(i), Facing(0), 256, jeep_stats);
+        jeeps.push(h);
+    }
+    // A house-2 unit well away from the jeeps and from any destination the
+    // scripted-drive tests click on, so it's a reliable "must not move"
+    // witness for ownership-scoped orders.
+    world.spawn_unit(
+        1,
+        2,
+        CellCoord::new(60, 60),
+        Facing(0),
+        256,
+        MoveStats {
+            max_speed: 20,
+            rot: 8,
+        },
+    );
+    (world, jeeps)
+}
+
+/// [`synthetic_core`] plus the unit population from
+/// [`synthetic_world_with_units`], wrapped in an `AppCore`. No sprites are
+/// installed (unit bodies won't draw, but `compose`'s sprite lookup already
+/// tolerates a missing sprite by design — see `AppCore::draw_units` — so
+/// this still exercises every non-rendering unit code path: selection,
+/// ownership, command emission, movement, hashing).
+pub fn synthetic_core_with_units(seed: u32) -> (AppCore, Vec<Handle>) {
+    let (raster, palette) = synthetic_fixture();
+    let (world, jeeps) = synthetic_world_with_units(seed);
+    let core = AppCore::with_sim(raster.clone(), *palette, world, Vec::new(), Vec::new());
+    (core, jeeps)
+}
+
+/// Load the M2/M3 reference scenario (`scg01ea.ini`) as a fully playable
+/// [`LoadedGame`] (terrain + real spawned units) from the real assets, or
+/// print a skip notice and return `None`. Companion to [`load_real_core`]
+/// (terrain-only); this one drives `ra_client::assets::load_game_from_dir`,
+/// so it needs `redalert.mix` (rules.ini, PALETTE.CPS) in addition to
+/// `main.mix`.
+pub fn load_real_game() -> Option<LoadedGame> {
+    if !real_assets_available() {
+        eprintln!(
+            "SKIP: real assets not found under {} (set RA_ASSETS_DIR or copy \
+             main.mix/redalert.mix into assets/ to run this test)",
+            assets_dir().display()
+        );
+        return None;
+    }
+    Some(
+        assets::load_game_from_dir(&assets_dir(), "scg01ea.ini")
+            .expect("scg01ea.ini should load as a playable game from the real assets"),
+    )
+}
+
+/// Pixels per cell edge (same constant `AppCore`/`ra-client`'s binary use).
+const CELL_PIXELS: i32 = ICON_WIDTH as i32;
+
+/// Virtual-time step that advances `AppCore` by ≈ one 15 Hz sim tick
+/// (`1000 / TICKS_PER_SECOND`, rounded up so repeated calls don't fall
+/// slightly behind and occasionally skip a tick).
+pub const TICK_MS: u32 = 67;
+
+/// Drive a "box-select the units inside this viewport rectangle, right-click
+/// this destination cell, step some ticks" script through `core`'s real
+/// `handle`/`update` seam (DESIGN.md §4.8 layer 1) and return the per-`
+/// update()`-call `sim_hash()` chain (`warmup_ticks` idle steps first, then
+/// `settle_ticks` after the order is issued) plus whatever `Command`s the
+/// right-click emitted. Shared by the scripted end-to-end drive
+/// (`ui_scripted_drive.rs`) and the client-level determinism suite
+/// (`ui_determinism.rs`) so both exercise exactly the same input sequence —
+/// one as a behavior assertion, the other as a same-script-twice hash
+/// comparison.
+pub fn run_select_and_move_script(
+    core: &mut AppCore,
+    camera: (f32, f32),
+    viewport: (u32, u32),
+    select_corners: ((i32, i32), (i32, i32)),
+    dest_cell: CellCoord,
+    warmup_ticks: u32,
+    settle_ticks: u32,
+) -> (Vec<u64>, Vec<Command>) {
+    core.handle(InputEvent::Resize {
+        width: viewport.0,
+        height: viewport.1,
+    });
+    core.set_camera(camera.0, camera.1);
+
+    let mut hashes = Vec::new();
+    for _ in 0..warmup_ticks {
+        core.update(TICK_MS);
+        hashes.push(core.sim_hash());
+    }
+
+    let (s, e) = select_corners;
+    core.handle(InputEvent::MouseDown {
+        button: MouseButton::Left,
+        x: s.0,
+        y: s.1,
+    });
+    core.handle(InputEvent::MouseMoved { x: e.0, y: e.1 });
+    core.handle(InputEvent::MouseUp {
+        button: MouseButton::Left,
+        x: e.0,
+        y: e.1,
+    });
+
+    let r = core.camera_rect();
+    let dest_vx = (dest_cell.x * CELL_PIXELS) as i64 + CELL_PIXELS as i64 / 2 - r.x;
+    let dest_vy = (dest_cell.y * CELL_PIXELS) as i64 + CELL_PIXELS as i64 / 2 - r.y;
+    core.handle(InputEvent::MouseDown {
+        button: MouseButton::Right,
+        x: dest_vx as i32,
+        y: dest_vy as i32,
+    });
+    let emitted = core.drain_commands();
+
+    for _ in 0..settle_ticks {
+        core.update(TICK_MS);
+        hashes.push(core.sim_hash());
+    }
+    (hashes, emitted)
 }

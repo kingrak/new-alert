@@ -15,6 +15,15 @@ pub enum Key {
     Down,
 }
 
+/// A pointer button. Left drives selection; right issues move orders.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MouseButton {
+    /// Left button — box/click selection.
+    Left,
+    /// Right button — move order to the selection.
+    Right,
+}
+
 /// A single input event delivered to [`crate::AppCore::handle`].
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum InputEvent {
@@ -31,6 +40,24 @@ pub enum InputEvent {
     },
     /// The pointer left the window (stops edge scrolling).
     MouseLeft,
+    /// A pointer button was pressed at viewport pixel coordinates.
+    MouseDown {
+        /// Which button.
+        button: MouseButton,
+        /// X in viewport pixels.
+        x: i32,
+        /// Y in viewport pixels.
+        y: i32,
+    },
+    /// A pointer button was released at viewport pixel coordinates.
+    MouseUp {
+        /// Which button.
+        button: MouseButton,
+        /// X in viewport pixels.
+        x: i32,
+        /// Y in viewport pixels.
+        y: i32,
+    },
     /// The drawable viewport was resized to `width`×`height` pixels.
     Resize {
         /// New viewport width in pixels.

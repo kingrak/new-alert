@@ -10,6 +10,63 @@
 use ra_formats::ini::Ini;
 use ra_formats::pack::{decode_base64, decompress_pack};
 
+use crate::house::house_from_name;
+
+/// One entry from a scenario's `[UNITS]` section — a vehicle placement.
+///
+/// The line format is `house,type,strength,cell,facing,mission[,trigger]`
+/// (`UnitClass::Read_INI`, `redalert/unit.cpp`). `strength` is a 0..256
+/// fraction of the type's max strength; `cell` is a linear `y*128 + x` index;
+/// `facing` is an 8-bit binary angle.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnitPlacement {
+    /// Owning house index (see [`crate::house`]).
+    pub house: u8,
+    /// Unit type name, e.g. `"JEEP"` (looked up in `rules.ini`).
+    pub unit_type: String,
+    /// Health as a 0..=256 fraction of the type's max strength.
+    pub strength: u16,
+    /// Linear cell number (`y * 128 + x`).
+    pub cell: u32,
+    /// Initial body facing (binary angle, 0 = north).
+    pub facing: u8,
+    /// Initial mission/order name, e.g. `"Guard"`.
+    pub mission: String,
+}
+
+/// Parse a scenario's `[UNITS]` section into placements, in file order.
+/// Entries with an unknown house or too few fields are skipped (as the original
+/// does when `From_Name` yields `HOUSE_NONE`).
+pub fn parse_units(ini: &Ini) -> Vec<UnitPlacement> {
+    let Some(entries) = ini.section_entries("UNITS") else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for (_, value) in entries {
+        let f: Vec<&str> = value.split(',').map(|s| s.trim()).collect();
+        if f.len() < 6 {
+            continue;
+        }
+        let Some(house) = house_from_name(f[0]) else {
+            continue;
+        };
+        let strength: u16 = f[2].parse().unwrap_or(256).min(256);
+        let Ok(cell) = f[3].parse::<u32>() else {
+            continue;
+        };
+        let facing: u8 = (f[4].parse::<i64>().unwrap_or(0) & 0xFF) as u8;
+        out.push(UnitPlacement {
+            house,
+            unit_type: f[1].to_string(),
+            strength,
+            cell,
+            facing,
+            mission: f[5].to_string(),
+        });
+    }
+    out
+}
+
 /// Map width in cells (fixed in RA).
 pub const MAP_CELL_W: u32 = 128;
 /// Map height in cells (fixed in RA).
@@ -246,6 +303,34 @@ fn decode_overlaypack(ini: &Ini) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_units_section() {
+        // Real scg01ea layout: three Greek jeeps and a USSR harvester.
+        let ini = Ini::parse(
+            "[UNITS]\n\
+             0=Greece,JEEP,256,6463,128,Guard,None\n\
+             1=USSR,HARV,256,7752,224,Harvest,None\n\
+             2=Nobody,JEEP,256,10,0,Guard,None\n\
+             3=Greece,JEEP,64,6464,32,Guard\n",
+        );
+        let units = parse_units(&ini);
+        // The "Nobody" house is unknown -> skipped; four lines -> three units.
+        assert_eq!(units.len(), 3);
+        assert_eq!(units[0].house, 1); // Greece
+        assert_eq!(units[0].unit_type, "JEEP");
+        assert_eq!(units[0].cell, 6463);
+        assert_eq!(units[0].facing, 128);
+        assert_eq!(units[1].house, 2); // USSR
+        assert_eq!(units[1].unit_type, "HARV");
+        assert_eq!(units[2].strength, 64);
+    }
+
+    #[test]
+    fn no_units_section_is_empty() {
+        let ini = Ini::parse("[Basic]\nName=x\n");
+        assert!(parse_units(&ini).is_empty());
+    }
 
     #[test]
     fn theater_mapping() {

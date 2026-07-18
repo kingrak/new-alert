@@ -22,9 +22,10 @@ pub mod input;
 pub mod platform;
 pub mod png;
 pub mod terrain;
+pub mod unit_render;
 
 #[cfg(feature = "window")]
 pub mod shell;
 
 pub use appcore::{AppCore, Command, Frame};
-pub use input::{InputEvent, Key, Rect};
+pub use input::{InputEvent, Key, MouseButton, Rect};

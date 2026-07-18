@@ -6,3 +6,14 @@ license.workspace = true
 publish = false
 
 [dependencies]
+
+[dev-dependencies]
+proptest = "1.11.0"
+# Real-map A*/determinism tests need to build a Passability grid and spawn
+# real starting units from the actual scenario archives. These are
+# dev-dependencies only (test-only, not part of the production dependency
+# graph) so there is no cycle: ra-client depends on ra-sim, but ra-sim itself
+# never depends on ra-client, and neither ra-data nor ra-formats depends on
+# ra-sim.
+ra-data = { path = "../ra-data" }
+ra-formats = { path = "../ra-formats" }

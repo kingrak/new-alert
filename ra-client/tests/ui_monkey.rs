@@ -1,15 +1,29 @@
 //! Monkey UI tests (DESIGN.md §4.8 layer 3): seeded, proptest-driven random
 //! `InputEvent`/`update()` interleavings. `AppCore` must never panic and
-//! `drain_commands()` must never yield anything invalid — currently
-//! `Command` is uninhabited (no sim exists yet at M2), so the only possible
-//! valid drain is empty; this suite asserts that stays true after every
-//! single op, not just at the end of a run.
+//! `drain_commands()` must never yield anything invalid.
 //!
-//! Two variants: synthetic (always runs, rebuilds a fresh cheap synthetic
-//! core per case — proptest's normal shrinking-friendly pattern) and real
-//! `scg01ea` (skips cleanly when assets are absent; loads the scenario once
-//! and reuses it across cases via a `RefCell`, since re-parsing ~480MB of
-//! MIX archives thousands of times would dominate runtime for no extra
+//! **Terrain-only variants** (`synthetic_monkey_never_panics`,
+//! `real_scg01ea_monkey_never_panics`): no units exist in these fixtures, so
+//! `drain_commands()` must stay empty after every single op — that was the
+//! whole story at M2 when `Command` was uninhabited, and remains true now
+//! (M3) simply because there is nothing to select.
+//!
+//! **Units variants** (`synthetic_monkey_with_units_never_panics`,
+//! `real_scg01ea_monkey_with_units_never_panics`, new at M3): fixtures that
+//! *do* have live, ownable units, so `MouseDown`/`MouseUp` (added to the
+//! event strategy below — absent at M2, when there was nothing to click)
+//! actually exercise box/click selection and move-order issuing under fuzzed
+//! sequencing. The invariant these check is not "commands are always empty"
+//! but "every drained command is well-formed": it addresses a still-live
+//! unit, and its `house` field matches that unit's real owner — i.e.
+//! selection + ownership scoping never let a bogus or cross-house order
+//! through, regardless of how box-select/click/drag events are interleaved.
+//!
+//! Two asset variants of each: synthetic (always runs, rebuilds a fresh
+//! cheap core per case — proptest's normal shrinking-friendly pattern) and
+//! real `scg01ea` (skips cleanly when assets are absent; loads the scenario
+//! once and reuses it across cases via a `RefCell`, since re-parsing ~480MB
+//! of MIX archives thousands of times would dominate runtime for no extra
 //! coverage — the property under test is `AppCore`'s event handling, not the
 //! asset loader, which already has its own golden tests).
 
@@ -21,7 +35,8 @@ use proptest::prelude::*;
 use proptest::test_runner::{Config as ProptestRunnerConfig, TestRunner};
 
 use ra_client::appcore::AppCore;
-use ra_client::input::{InputEvent, Key};
+use ra_client::input::{InputEvent, Key, MouseButton};
+use ra_sim::Command;
 
 /// One fuzzed operation: either an `InputEvent` or a virtual-time tick.
 /// `AppCore::update` isn't itself part of `InputEvent`, so the monkey
@@ -42,6 +57,10 @@ fn key_strategy() -> impl Strategy<Value = Key> {
     ]
 }
 
+fn mouse_button_strategy() -> impl Strategy<Value = MouseButton> {
+    prop_oneof![Just(MouseButton::Left), Just(MouseButton::Right)]
+}
+
 fn event_strategy() -> impl Strategy<Value = InputEvent> {
     prop_oneof![
         3 => key_strategy().prop_map(InputEvent::KeyDown),
@@ -51,6 +70,16 @@ fn event_strategy() -> impl Strategy<Value = InputEvent> {
         4 => (-1000i32..=5000, -1000i32..=5000)
             .prop_map(|(x, y)| InputEvent::MouseMoved { x, y }),
         1 => Just(InputEvent::MouseLeft),
+        // MouseDown/MouseUp, both buttons, deliberately unpaired/arbitrarily
+        // ordered by the surrounding op sequence (a bare MouseUp with no
+        // prior MouseDown, two MouseDowns in a row, a button released other
+        // than the one pressed, ...) — selection/order issuing must survive
+        // every ordering, not just the well-formed drag sequences the
+        // scripted-drive suite uses.
+        3 => (mouse_button_strategy(), -200i32..=1200, -200i32..=1200)
+            .prop_map(|(button, x, y)| InputEvent::MouseDown { button, x, y }),
+        3 => (mouse_button_strategy(), -200i32..=1200, -200i32..=1200)
+            .prop_map(|(button, x, y)| InputEvent::MouseUp { button, x, y }),
         // Deliberately bounded small (see module docs on the Resize op):
         // this suite fuzzes event *sequencing*, not allocation size: an
         // unbounded Resize would make compose() cost dominate runtime
@@ -159,4 +188,86 @@ fn real_scg01ea_monkey_never_panics() {
         Ok(())
     });
     result.expect("real-asset monkey sequence should never panic or yield a command");
+}
+
+// ---------------------------------------------------------------------
+// Units variants (new at M3): fixtures with live, ownable units, so
+// MouseDown/MouseUp actually drive selection + move-order issuing. The
+// invariant is "every drained command is well-formed", not "always empty".
+// ---------------------------------------------------------------------
+
+/// Apply one op to `core` and check the M3 invariants: no panic (implicit),
+/// and every command drained after this op addresses a still-live unit whose
+/// `house` field matches that unit's real owner. `compose_camera()` is
+/// sampled the same way [`apply_op`] does.
+fn apply_op_with_units(core: &mut AppCore, op: MonkeyOp, index: usize) {
+    match op {
+        MonkeyOp::Event(ev) => core.handle(ev),
+        MonkeyOp::Update(dt) => core.update(dt),
+    }
+    for cmd in core.drain_commands() {
+        let (unit, house) = match cmd {
+            Command::Move { unit, house, .. } => (unit, house),
+            Command::Stop { unit, house } => (unit, house),
+        };
+        let owner = core.world().units.get(unit).unwrap_or_else(|| {
+            panic!("drained {cmd:?} addresses a handle that isn't live in the world")
+        });
+        assert_eq!(
+            house, owner.house,
+            "drained {cmd:?} has house {house}, but the unit it addresses is owned by house {}",
+            owner.house
+        );
+    }
+    if index.is_multiple_of(COMPOSE_EVERY) {
+        let frame = core.compose_camera();
+        let (vw, vh) = core.viewport_size();
+        assert_eq!(frame.width, vw);
+        assert_eq!(frame.height, vh);
+    }
+}
+
+fn apply_ops_with_units(core: &mut AppCore, ops: &[MonkeyOp]) {
+    core.handle(InputEvent::Resize {
+        width: 64,
+        height: 48,
+    });
+    for (i, &op) in ops.iter().enumerate() {
+        apply_op_with_units(core, op, i);
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(64))]
+
+    /// Synthetic units variant: a fresh `AppCore` with the 3-jeep-plus-one-
+    /// house-2-unit fixture (`support::synthetic_core_with_units`) per case,
+    /// fuzzed the same way as the terrain-only variant above but checked
+    /// against the well-formedness invariant instead of emptiness.
+    #[test]
+    fn synthetic_monkey_with_units_never_panics(ops in ops_strategy(200..800)) {
+        let (mut core, _jeeps) = support::synthetic_core_with_units(0x0FF1_CE42);
+        apply_ops_with_units(&mut core, &ops);
+    }
+}
+
+#[test]
+fn real_scg01ea_monkey_with_units_never_panics() {
+    let Some(game) = support::load_real_game() else {
+        return;
+    };
+    let core = RefCell::new(game.core);
+
+    let mut runner = TestRunner::new(ProptestRunnerConfig {
+        cases: 20,
+        ..ProptestRunnerConfig::default()
+    });
+    let strategy = ops_strategy(50..300);
+    let result = runner.run(&strategy, |ops| {
+        let mut core = core.borrow_mut();
+        apply_ops_with_units(&mut core, &ops);
+        Ok(())
+    });
+    result
+        .expect("real-asset units monkey sequence should never panic or yield a malformed command");
 }

@@ -6,6 +6,7 @@
 //!
 //! Modules:
 //! - [`mix`]    — MIX archives (plain + RA flagged/encrypted headers, nesting).
+//! - [`cps`]    — CPS full-screen images (LCW; `PALETTE.CPS` remap source).
 //! - [`crc`]    — the Westwood filename → entry-id hash.
 //! - [`crypto`] — the Westwood public-key scheme + Blowfish (header decryption).
 //! - [`pal`]    — 6-bit VGA palettes expanded to 8-bit RGB.
@@ -17,6 +18,7 @@
 //! - [`names`]  — a small built-in list of well-known RA filenames.
 
 pub mod codec;
+pub mod cps;
 pub mod crc;
 pub mod crypto;
 pub mod ini;

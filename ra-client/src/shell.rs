@@ -10,18 +10,21 @@
 use macroquad::prelude::*;
 
 use crate::appcore::AppCore;
-use crate::input::{InputEvent, Key};
+use crate::input::{InputEvent, Key, MouseButton};
 
-/// Run the windowed terrain viewer until the window is closed.
-pub fn run_window(core: AppCore) {
+/// Run the windowed viewer. If `smoke_seconds` is `Some(n)`, the window exits
+/// automatically after roughly `n` seconds of virtual frame time — a headless
+/// CI smoke path (Linux + xvfb) that boots the real shell without needing a
+/// human to close it (DESIGN.md §4.8 layer 5). `None` runs until closed.
+pub fn run_window(core: AppCore, smoke_seconds: Option<f32>) {
     let conf = Conf {
-        window_title: "new-alert — M2 terrain".to_string(),
+        window_title: "new-alert — M3 units".to_string(),
         window_width: 1024,
         window_height: 768,
         high_dpi: false,
         ..Default::default()
     };
-    macroquad::Window::from_config(conf, amain(core));
+    macroquad::Window::from_config(conf, amain(core, smoke_seconds));
 }
 
 const ARROWS: [(KeyCode, Key); 4] = [
@@ -31,9 +34,10 @@ const ARROWS: [(KeyCode, Key); 4] = [
     (KeyCode::Down, Key::Down),
 ];
 
-async fn amain(mut core: AppCore) {
+async fn amain(mut core: AppCore, smoke_seconds: Option<f32>) {
     let mut last_size = (0u32, 0u32);
     let mut last_mouse = (f32::NAN, f32::NAN);
+    let mut elapsed = 0.0f32;
 
     loop {
         // --- translate input -> InputEvent ---
@@ -64,12 +68,39 @@ async fn amain(mut core: AppCore) {
             });
         }
 
+        for (mqbtn, button) in [
+            (macroquad::input::MouseButton::Left, MouseButton::Left),
+            (macroquad::input::MouseButton::Right, MouseButton::Right),
+        ] {
+            if is_mouse_button_pressed(mqbtn) {
+                core.handle(InputEvent::MouseDown {
+                    button,
+                    x: mx as i32,
+                    y: my as i32,
+                });
+            }
+            if is_mouse_button_released(mqbtn) {
+                core.handle(InputEvent::MouseUp {
+                    button,
+                    x: mx as i32,
+                    y: my as i32,
+                });
+            }
+        }
+
         if is_key_pressed(KeyCode::Escape) {
             break;
         }
 
         // --- tick with real frame time (virtual-time API, real dt here) ---
-        let dt_ms = (get_frame_time() * 1000.0) as u32;
+        let dt = get_frame_time();
+        elapsed += dt;
+        if let Some(limit) = smoke_seconds {
+            if elapsed >= limit {
+                break;
+            }
+        }
+        let dt_ms = (dt * 1000.0) as u32;
         core.update(dt_ms);
 
         // --- compose and upload ---

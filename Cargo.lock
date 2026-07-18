@@ -380,6 +380,7 @@ dependencies = [
  "proptest",
  "ra-data",
  "ra-formats",
+ "ra-sim",
 ]
 
 [[package]]
@@ -404,6 +405,11 @@ version = "0.1.0"
 [[package]]
 name = "ra-sim"
 version = "0.1.0"
+dependencies = [
+ "proptest",
+ "ra-data",
+ "ra-formats",
+]
 
 [[package]]
 name = "rand"

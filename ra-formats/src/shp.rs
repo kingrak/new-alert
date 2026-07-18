@@ -22,6 +22,15 @@ const FMT_KEYFRAME: u8 = 0x80; // Format80 / LCW full frame
 const FMT_XOR_KEY: u8 = 0x40; // Format40 XOR vs referenced keyframe
 const FMT_XOR_PREV: u8 = 0x20; // Format40 XOR vs previous frame
 
+/// Upper bound on a single frame's pixel count (`width * height`), enforced at
+/// parse time. Real RA/TD shapes top out in the low tens of thousands of pixels
+/// (the largest buildings are a few hundred px per side); this 4M-pixel cap is
+/// far above any genuine asset while turning a corrupt/hostile header — where
+/// `width` and `height` are arbitrary `u16`s whose product can reach ~4.3
+/// billion — into a clean parse error instead of a multi-gigabyte allocation
+/// per decoded frame. Requested by ra-tester as a structural hardening.
+const MAX_FRAME_PIXELS: usize = 4 * 1024 * 1024;
+
 /// The parsed SHP file header.
 #[derive(Debug, Clone, Copy)]
 pub struct ShpHeader {
@@ -85,6 +94,14 @@ impl<'a> Shp<'a> {
         if width == 0 || height == 0 {
             return Err(FormatError::Invalid {
                 reason: "shp frame has zero dimension",
+            });
+        }
+
+        // Reject absurd dimensions up front so a decoded frame can never demand
+        // a runaway allocation (see MAX_FRAME_PIXELS).
+        if (width as usize) * (height as usize) > MAX_FRAME_PIXELS {
+            return Err(FormatError::Invalid {
+                reason: "shp frame dimensions exceed the maximum pixel cap",
             });
         }
 
@@ -308,6 +325,15 @@ mod tests {
         for (a, b) in all_a.iter().zip(all_b.iter()) {
             assert_eq!(a.pixels, b.pixels);
         }
+    }
+
+    #[test]
+    fn rejects_oversized_dimensions() {
+        // width = height = 0xFFFF -> ~4.29e9 pixels, well over the cap.
+        let mut bytes = build_two_frame_shp();
+        bytes[6..8].copy_from_slice(&0xFFFFu16.to_le_bytes());
+        bytes[8..10].copy_from_slice(&0xFFFFu16.to_le_bytes());
+        assert!(Shp::parse(&bytes).is_err());
     }
 
     #[test]

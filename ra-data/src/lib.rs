@@ -5,9 +5,15 @@
 //! source of stats).
 //!
 //! Modules:
-//! - [`templates`] — the terrain template catalog (id → filename + theaters).
-//! - [`scenario`]  — scenario INI: theater, map rectangle, and the decoded
-//!   `[MapPack]` / `[OverlayPack]` terrain cells.
+//! - [`templates`]    — the terrain template catalog (id → filename + theaters).
+//! - [`scenario`]     — scenario INI: theater, map rectangle, the decoded
+//!   `[MapPack]` / `[OverlayPack]` terrain cells, and `[UNITS]` placements.
+//! - [`rules`]        — unit stats (Speed/ROT/Strength) from `rules.ini` (§3.8).
+//! - [`house`]        — the eight countries and their colour-remap tables.
+//! - [`passability`]  — a coarse passable/impassable grid from terrain (§3.7).
 
+pub mod house;
+pub mod passability;
+pub mod rules;
 pub mod scenario;
 pub mod templates;

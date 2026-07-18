@@ -9,6 +9,7 @@ description = "Red Alert client: terrain compositing, camera, and the macroquad 
 [dependencies]
 ra-formats = { path = "../ra-formats" }
 ra-data = { path = "../ra-data" }
+ra-sim = { path = "../ra-sim" }
 # macroquad is the rendering/input layer (DESIGN.md §1, §4.5): pure-Rust, no
 # system deps beyond stock GL/X11. Optional so the headless `--dump` path — the
 # M2 acceptance gate — builds and runs with no windowing libraries present.
