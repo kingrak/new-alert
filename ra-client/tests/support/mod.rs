@@ -21,7 +21,10 @@ use ra_data::scenario::{MapCell, Scenario, Theater, MAP_CELL_H, MAP_CELL_W};
 use ra_data::templates;
 use ra_formats::tmpl::{Template, ICON_WIDTH};
 use ra_sim::coords::{CellCoord, Facing};
-use ra_sim::{Command, Handle, MoveStats, World};
+use ra_sim::{
+    BuildItem, Command, Handle, MoveStats, Target, WarheadProfile, WeaponProfile, World,
+    ARMOR_COUNT,
+};
 
 /// Tiny dependency-free FNV-1a 64-bit hash — same algorithm used by the
 /// `ra-formats` and `ra-data` golden tests, reimplemented here rather than
@@ -326,6 +329,248 @@ pub fn synthetic_core_with_armed_units(seed: u32) -> (AppCore, Vec<Handle>, Hand
     let (world, jeeps, target) = synthetic_world_with_armed_units(seed);
     let core = AppCore::with_sim(raster.clone(), *palette, world, Vec::new(), Vec::new());
     (core, jeeps, target)
+}
+
+// ---------------------------------------------------------------------
+// M5 economy fixture (no real assets needed): a tiny hand-built catalog
+// (mirrors the *shape* of `ra_client::assets::build_content`'s real
+// declaration order -- FACT/POWR/PROC/WEAP structures, MCV/HARV/TANK units
+// -- with made-up costs/footprints small enough that a scripted drive can
+// run a full deploy->build->place->harvest->produce loop in a modest tick
+// budget instead of the real rules.ini's much longer build times).
+// ---------------------------------------------------------------------
+
+/// Building type ids in the synthetic econ catalog.
+pub const ECON_B_FACT: u32 = 0;
+pub const ECON_B_POWR: u32 = 1;
+pub const ECON_B_PROC: u32 = 2;
+pub const ECON_B_WEAP: u32 = 3;
+/// Unit-proto ids in the synthetic econ catalog.
+pub const ECON_U_MCV: u32 = 0;
+pub const ECON_U_HARV: u32 = 1;
+pub const ECON_U_TANK: u32 = 2;
+
+/// The cell the starter MCV spawns at in [`synthetic_world_with_econ`] /
+/// [`synthetic_core_with_econ`] (house 1). Exposed so scripted-drive tests
+/// can compute screen positions without hardcoding the layout twice.
+pub fn econ_mcv_cell() -> CellCoord {
+    CellCoord::new(30, 30)
+}
+
+fn econ_catalog() -> ra_sim::Catalog {
+    use ra_sim::{BuildingProto, EconRules, UnitProto};
+    let bproto = |name: &str,
+                  w: u8,
+                  h: u8,
+                  power: i32,
+                  cost: i32,
+                  prereq: Vec<u32>,
+                  cy: bool,
+                  refin: bool,
+                  wf: bool| BuildingProto {
+        name: name.to_string(),
+        foot_w: w,
+        foot_h: h,
+        max_health: 400,
+        armor: 0,
+        power,
+        cost,
+        prereq,
+        is_refinery: refin,
+        is_construction_yard: cy,
+        is_war_factory: wf,
+        free_harvester_unit: if refin { Some(ECON_U_HARV) } else { None },
+        sprite_id: 0,
+    };
+    let uproto =
+        |name: &str, harv: bool, deploys: Option<u32>, cost: i32, prereq: Vec<u32>| UnitProto {
+            name: name.to_string(),
+            sprite_id: 0,
+            max_health: 300,
+            stats: MoveStats {
+                max_speed: 40,
+                rot: 10,
+            },
+            armor: 0,
+            weapon: None,
+            has_turret: false,
+            is_harvester: harv,
+            deploys_to: deploys,
+            cost,
+            prereq,
+        };
+    ra_sim::Catalog {
+        buildings: vec![
+            bproto("FACT", 3, 3, 0, 100, vec![], true, false, false),
+            bproto(
+                "POWR",
+                2,
+                2,
+                100,
+                30,
+                vec![ECON_B_FACT],
+                false,
+                false,
+                false,
+            ),
+            bproto("PROC", 3, 3, -30, 50, vec![ECON_B_POWR], false, true, false),
+            bproto("WEAP", 3, 3, -20, 60, vec![ECON_B_POWR], false, false, true),
+        ],
+        units: vec![
+            uproto("MCV", false, Some(ECON_B_FACT), 100, vec![]),
+            uproto("HARV", true, None, 60, vec![]),
+            uproto("TANK", false, None, 80, vec![ECON_B_WEAP]),
+        ],
+        econ: EconRules::default(),
+    }
+}
+
+/// Buildable items for the econ sidebar, in display order (structures then
+/// the vehicle) -- everything [`econ_catalog`] defines except the yard and
+/// the MCV (the yard comes from deploy, the MCV has no depot to reproduce
+/// itself from), matching the shape of the real client's sidebar list.
+pub fn econ_buildables() -> Vec<BuildItem> {
+    vec![
+        BuildItem::Building(ECON_B_POWR),
+        BuildItem::Building(ECON_B_PROC),
+        BuildItem::Building(ECON_B_WEAP),
+        BuildItem::Unit(ECON_U_TANK),
+    ]
+}
+
+/// A `World` wired for the M5 economy: the synthetic catalog, two houses (1
+/// = controlled/player, 2 = a witness enemy with no buildings — for
+/// ownership-gating tests), a small gold patch near the MCV, and a starter
+/// MCV for house 1 at [`econ_mcv_cell`]. Returns the world plus the MCV's
+/// handle.
+pub fn synthetic_world_with_econ(seed: u32, credits: i32) -> (World, Handle) {
+    let mut world = World::new(ra_sim::Passability::all_passable(), seed);
+    world.set_catalog(econ_catalog());
+    world.init_houses(3, credits);
+
+    // A small gold patch a few cells from the MCV, reachable once a
+    // refinery is up.
+    let mcv_cell = econ_mcv_cell();
+    let total = 128usize * 128;
+    let mut overlay = vec![0xFFu8; total];
+    for y in (mcv_cell.y + 6)..(mcv_cell.y + 10) {
+        for x in (mcv_cell.x + 6)..(mcv_cell.x + 10) {
+            overlay[(y * 128 + x) as usize] = ra_sim::ore::OVERLAY_GOLD_FIRST;
+        }
+    }
+    world.set_ore(ra_sim::OreField::from_overlay(128, 128, &overlay));
+
+    let mcv = world.spawn_unit(
+        ECON_U_MCV,
+        1,
+        mcv_cell,
+        Facing(0),
+        300,
+        MoveStats {
+            max_speed: 40,
+            rot: 10,
+        },
+    );
+    (world, mcv)
+}
+
+/// [`synthetic_world_with_econ`] wrapped in an `AppCore` with the build
+/// sidebar enabled for house 1 (the controlled house) and
+/// [`econ_buildables`] listed. Companion to [`synthetic_core_with_units`] /
+/// [`synthetic_core_with_armed_units`] for M5 build-UI coverage.
+pub fn synthetic_core_with_econ(seed: u32, credits: i32) -> (AppCore, Handle) {
+    let (raster, palette) = synthetic_fixture();
+    let (world, mcv) = synthetic_world_with_econ(seed, credits);
+    let mut core = AppCore::with_sim(raster.clone(), *palette, world, Vec::new(), Vec::new());
+    core.enable_sidebar(1, econ_buildables());
+    (core, mcv)
+}
+
+/// A one-shot-lethal, unlimited-range, always-aligned-once-fired weapon —
+/// deliberately unrealistic so [`synthetic_world_for_selection_regression`]
+/// converges in a handful of ticks instead of modeling a real firefight.
+fn instant_lethal_weapon() -> WeaponProfile {
+    WeaponProfile {
+        damage: 1000,
+        rof: 1,
+        range: 100_000,
+        proj_speed: 0,
+        proj_rot: 0,
+        invisible: true,
+        instant: true,
+        warhead: WarheadProfile {
+            spread: 1,
+            verses: [65536; ARMOR_COUNT],
+        },
+        warhead_ap: false,
+        arcing: false,
+        ballistic_scatter: 0,
+        homing_scatter: 0,
+        min_damage: 1,
+        max_damage: 2000,
+    }
+}
+
+/// A `World` built for the selection generational-handle regression test
+/// (`ui_scripted_drive.rs`). The defender kills the victim within the first
+/// tick or two of `update()` (see [`instant_lethal_weapon`]), which leaves no
+/// window to click-select the victim *after* any other UI action that would
+/// need ticking first (e.g. an MCV deploy-and-settle loop) — so the fixture
+/// pre-places FACT and POWR directly (bypassing the deploy/build UI
+/// entirely) rather than starting from an undeployed MCV. The scripted-drive
+/// test's own job is then just: select the victim at tick 0 (guaranteed
+/// alive), let time pass (the victim dies, unattended), then build+place
+/// PROC through the ordinary sidebar/placement path — PROC's free harvester
+/// is the fresh unit that should land in the victim's now-freed arena slot.
+/// Returns the world and the victim handle.
+pub fn synthetic_world_for_selection_regression(seed: u32) -> (World, Handle) {
+    let mut world = World::new(ra_sim::Passability::all_passable(), seed);
+    world.set_catalog(econ_catalog());
+    world.init_houses(3, 5000);
+
+    let mcv_cell = econ_mcv_cell();
+    let yard_cell = CellCoord::new(mcv_cell.x - 1, mcv_cell.y - 1);
+    world.spawn_building(ECON_B_FACT, 1, yard_cell).unwrap();
+    world
+        .spawn_building(ECON_B_POWR, 1, CellCoord::new(yard_cell.x + 3, yard_cell.y))
+        .unwrap();
+
+    let victim_cell = CellCoord::new(mcv_cell.x + 20, mcv_cell.y);
+    let victim = world.spawn_unit(
+        99,
+        1,
+        victim_cell,
+        Facing(0),
+        100,
+        MoveStats {
+            max_speed: 20,
+            rot: 8,
+        },
+    );
+
+    let defender_cell = CellCoord::new(victim_cell.x + 1, victim_cell.y);
+    let defender = world.spawn_unit(
+        98,
+        2,
+        defender_cell,
+        Facing(0),
+        400,
+        MoveStats {
+            max_speed: 0,
+            rot: 8,
+        },
+    );
+    world.set_unit_combat(defender, 0, Some(instant_lethal_weapon()), false);
+    if let Some(u) = world.units.get_mut(defender) {
+        u.target = Some(Target::Unit(victim));
+        // Already facing the victim, so the very first tick fires (no
+        // rotation-alignment delay to model).
+        u.facing =
+            Facing::toward(defender_cell.center(), victim_cell.center()).unwrap_or(Facing(0));
+        u.turret_facing = u.facing;
+    }
+
+    (world, victim)
 }
 
 /// Load the M2/M3 reference scenario (`scg01ea.ini`) as a fully playable

@@ -11,8 +11,11 @@ use std::collections::BTreeSet;
 use std::error::Error;
 use std::path::Path;
 
+use ra_data::buildings::building_stats;
 use ra_data::combat::{resolve_unit_combat, WeaponDef};
-use ra_data::house::{build_house_remaps, identity_remap, RemapTable, HOUSE_COUNT};
+use ra_data::house::{
+    build_house_remaps, house_from_name, identity_remap, RemapTable, HOUSE_COUNT,
+};
 use ra_data::passability;
 use ra_data::rules::unit_stats;
 use ra_data::scenario::{parse_units, Scenario};
@@ -24,7 +27,10 @@ use ra_formats::pal::Palette as PalFile;
 use ra_formats::tmpl::Template;
 
 use ra_sim::coords::{CellCoord, Facing};
-use ra_sim::{Handle, MoveStats, Passability, World};
+use ra_sim::{
+    BuildItem, BuildingProto, Catalog, EconRules, Handle, MoveStats, OreField, Passability,
+    UnitProto, World,
+};
 
 use crate::appcore::AppCore;
 use crate::compositor::Palette;
@@ -458,6 +464,375 @@ fn spawn_named(
         None => (None, 0),
     };
     Ok((handle, weapon, armor))
+}
+
+// ===========================================================================
+// M5 economy: build catalog, ore, houses, and a playable/verifiable game.
+// ===========================================================================
+
+/// The starter buildable content (catalog + decoded sprites + the sidebar list),
+/// lifted from rules.ini + the code-defined footprint table into the sim's
+/// plain `Catalog` (DESIGN.md §4.9 M5). Building type ids and unit-proto ids are
+/// the fixed indices assigned below; the sim references them, the client renders
+/// them.
+pub struct GameContent {
+    /// The sim's immutable build data.
+    pub catalog: Catalog,
+    /// Unit body sprites, indexed by unit `sprite_id` (== unit-proto id here).
+    pub unit_sprites: Vec<UnitSprite>,
+    /// Building idle sprites, indexed by building type id.
+    pub building_sprites: Vec<UnitSprite>,
+    /// Sidebar buildable list, in display order.
+    pub buildables: Vec<BuildItem>,
+}
+
+/// Read the economy constants from rules.ini `[General]`/`[AI]` (defaults are
+/// the RA stock values).
+fn econ_rules(rules: &Ini) -> EconRules {
+    let d = EconRules::default();
+    EconRules {
+        gold_value: rules
+            .get_int("General", "GoldValue")
+            .unwrap_or(d.gold_value as i64) as i32,
+        gem_value: rules
+            .get_int("General", "GemValue")
+            .unwrap_or(d.gem_value as i64) as i32,
+        bail_count: rules
+            .get_int("General", "BailCount")
+            .unwrap_or(d.bail_count as i64) as u16,
+        ore_dump_rate: rules
+            .get_int("General", "OreTruckRate")
+            .unwrap_or(d.ore_dump_rate as i64) as u16,
+        ..d
+    }
+}
+
+/// Fixed building type ids (order matters — the catalog is indexed by these).
+const B_FACT: u32 = 0;
+const B_POWR: u32 = 1;
+const B_PROC: u32 = 2;
+const B_WEAP: u32 = 3;
+/// Fixed unit-proto ids.
+const U_MCV: u32 = 0;
+const U_HARV: u32 = 1;
+const U_1TNK: u32 = 2;
+const U_2TNK: u32 = 3;
+const U_JEEP: u32 = 4;
+
+/// Map a prerequisite short-name to its building type id (only the starter set
+/// is modelled; unknown prereqs — e.g. `fix` for the MCV — are dropped, which is
+/// safe because those items are not in the sidebar).
+fn prereq_ids(names: &[String]) -> Vec<u32> {
+    names
+        .iter()
+        .filter_map(|n| match n.as_str() {
+            "fact" => Some(B_FACT),
+            "powr" => Some(B_POWR),
+            "proc" => Some(B_PROC),
+            "weap" => Some(B_WEAP),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Decode a unit SHP from `conquer.mix` by short name.
+fn load_unit_sprite(conquer: &MixArchive, name: &str) -> Result<UnitSprite, Box<dyn Error>> {
+    let shp = format!("{}.shp", name.to_ascii_lowercase());
+    conquer
+        .get(&shp)
+        .and_then(|b| UnitSprite::from_shp_bytes(b).ok())
+        .ok_or_else(|| format!("sprite {shp} missing/undecodable").into())
+}
+
+/// Build the starter catalog (CONST/POWR/PROC/WEAP + MCV/HARV/1TNK/2TNK/JEEP)
+/// from rules.ini and the building/unit SHPs in `conquer.mix`.
+pub fn build_content(rules: &Ini, conquer: &MixArchive) -> Result<GameContent, Box<dyn Error>> {
+    // --- Buildings (ids fixed by declaration order) ---
+    // (name, is_construction_yard, is_refinery, is_war_factory)
+    let bspecs = [
+        ("FACT", true, false, false),
+        ("POWR", false, false, false),
+        ("PROC", false, true, false),
+        ("WEAP", false, false, true),
+    ];
+    let mut buildings = Vec::new();
+    let mut building_sprites = Vec::new();
+    for (id, (name, is_cy, is_ref, is_wf)) in bspecs.iter().enumerate() {
+        let stats = building_stats(rules, name)
+            .ok_or_else(|| format!("no building stats/footprint for {name}"))?;
+        building_sprites.push(load_unit_sprite(conquer, name)?);
+        buildings.push(BuildingProto {
+            name: name.to_string(),
+            foot_w: stats.foot_w,
+            foot_h: stats.foot_h,
+            max_health: stats.strength,
+            armor: stats.armor,
+            power: stats.power,
+            cost: stats.cost,
+            prereq: prereq_ids(&stats.prereq),
+            is_refinery: *is_ref,
+            is_construction_yard: *is_cy,
+            is_war_factory: *is_wf,
+            free_harvester_unit: if *is_ref { Some(U_HARV) } else { None },
+            sprite_id: id as u32,
+        });
+    }
+
+    // --- Units (ids fixed by declaration order) ---
+    // (name, is_harvester, deploys_to)
+    let uspecs: [(&str, bool, Option<u32>); 5] = [
+        ("MCV", false, Some(B_FACT)),
+        ("HARV", true, None),
+        ("1TNK", false, None),
+        ("2TNK", false, None),
+        ("JEEP", false, None),
+    ];
+    let mut units = Vec::new();
+    let mut unit_sprites = Vec::new();
+    for (id, (name, is_harv, deploys_to)) in uspecs.iter().enumerate() {
+        let ustats = unit_stats(rules, name).ok_or_else(|| format!("no unit stats for {name}"))?;
+        let combat = resolve_unit_combat(rules, name);
+        unit_sprites.push(load_unit_sprite(conquer, name)?);
+        let cost = rules.get_int(name, "Cost").unwrap_or(0) as i32;
+        let prereq = rules
+            .get(name, "Prerequisite")
+            .map(|s| {
+                s.split(',')
+                    .map(|t| t.trim().to_ascii_lowercase())
+                    .filter(|t| !t.is_empty() && t != "none")
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        units.push(UnitProto {
+            name: name.to_string(),
+            sprite_id: id as u32,
+            max_health: ustats.strength.clamp(1, u16::MAX as i32) as u16,
+            stats: MoveStats {
+                max_speed: ustats.max_speed_leptons(),
+                rot: ustats.rot,
+            },
+            armor: combat.as_ref().map(|c| c.armor).unwrap_or(0),
+            weapon: combat
+                .as_ref()
+                .and_then(|c| c.weapon.as_ref().map(weapon_to_profile)),
+            has_turret: combat.as_ref().map(|c| c.has_turret).unwrap_or(false),
+            is_harvester: *is_harv,
+            deploys_to: *deploys_to,
+            cost,
+            prereq: prereq_ids(&prereq),
+        });
+    }
+
+    let catalog = Catalog {
+        buildings,
+        units,
+        econ: econ_rules(rules),
+    };
+    // Sidebar order: structures then vehicles (construction yard + MCV excluded —
+    // the yard comes from deploy, the MCV needs a service depot we don't model).
+    let buildables = vec![
+        BuildItem::Building(B_POWR),
+        BuildItem::Building(B_PROC),
+        BuildItem::Building(B_WEAP),
+        BuildItem::Unit(U_1TNK),
+        BuildItem::Unit(U_2TNK),
+        BuildItem::Unit(U_JEEP),
+        BuildItem::Unit(U_HARV),
+    ];
+    Ok(GameContent {
+        catalog,
+        unit_sprites,
+        building_sprites,
+        buildables,
+    })
+}
+
+/// A fully wired M5 economy game: an [`AppCore`] with the build sidebar enabled,
+/// a controlled house, an ore overlay, and a starter MCV to deploy.
+pub struct EconGame {
+    /// The ready-to-drive core (sidebar enabled, camera on the MCV).
+    pub core: AppCore,
+    /// The controlled ("player") house index.
+    pub controlled: u8,
+    /// The starter MCV's handle.
+    pub mcv: Handle,
+    /// The cell the MCV starts on (its construction yard centres here on deploy).
+    pub start_cell: CellCoord,
+    /// A nearby ore cell (for reporting / camera framing).
+    pub ore_cell: Option<CellCoord>,
+    /// The unit-proto id used for the MCV (== `U_MCV`).
+    pub mcv_unit_id: u32,
+}
+
+/// Load a fully playable M5 economy game from the archives under `dir`.
+pub fn load_econ_from_dir(
+    dir: &Path,
+    scenario_name: &str,
+    starting_credits: i32,
+) -> Result<EconGame, Box<dyn Error>> {
+    let main_bytes =
+        std::fs::read(dir.join("main.mix")).map_err(|e| format!("reading main.mix: {e}"))?;
+    let redalert_bytes = std::fs::read(dir.join("redalert.mix"))
+        .map_err(|e| format!("reading redalert.mix: {e}"))?;
+    load_econ_from_bytes(
+        &main_bytes,
+        &redalert_bytes,
+        scenario_name,
+        starting_credits,
+    )
+}
+
+/// Build the economy game from in-memory archives: terrain + palette + remaps,
+/// the starter catalog + sprites, ore from the scenario overlay, all eight
+/// houses, a controlled house (from `[Basic] Player=`, else Greece), and a
+/// starter MCV placed on open ground near an ore field.
+pub fn load_econ_from_bytes(
+    main_bytes: &[u8],
+    redalert_bytes: &[u8],
+    scenario_name: &str,
+    starting_credits: i32,
+) -> Result<EconGame, Box<dyn Error>> {
+    let main = MixArchive::parse(main_bytes)?;
+    let redalert = MixArchive::parse(redalert_bytes)?;
+
+    // Terrain raster + palette (reuse the terrain path).
+    let loaded = load_from_bytes(main_bytes, redalert_bytes, scenario_name)?;
+    let raster = rasterize(&loaded.scenario, &loaded.tiles);
+    let palette = loaded.palette;
+    let scenario = loaded.scenario;
+
+    // rules.ini + PALETTE.CPS remaps + the [Basic] player house.
+    let general = main.open_nested("general.mix")?;
+    let ini_bytes = general
+        .get(scenario_name)
+        .ok_or_else(|| format!("scenario '{scenario_name}' not found"))?;
+    let scen_ini = Ini::parse(&String::from_utf8_lossy(ini_bytes));
+
+    let local = redalert.open_nested("local.mix")?;
+    let rules = Ini::parse(&String::from_utf8_lossy(
+        local.get("rules.ini").ok_or("rules.ini not found")?,
+    ));
+    let remaps: Vec<RemapTable> = match local.get("palette.cps") {
+        Some(cps_bytes) => match Cps::parse(cps_bytes) {
+            Ok(cps) => build_house_remaps(&cps).to_vec(),
+            Err(_) => vec![identity_remap(); HOUSE_COUNT],
+        },
+        None => vec![identity_remap(); HOUSE_COUNT],
+    };
+    let controlled = scen_ini
+        .get("Basic", "Player")
+        .and_then(house_from_name)
+        .unwrap_or(1); // default Greece
+
+    // Catalog + sprites.
+    let conquer = main.open_nested("conquer.mix")?;
+    let content = build_content(&rules, &conquer)?;
+
+    // World: passability + houses + ore + catalog.
+    let passable = passability::build(&scenario);
+    let grid = Passability::new(128, 128, passable);
+    let mut world = World::new(grid, 0x1234_5678);
+    world.set_catalog(content.catalog.clone());
+    world.init_houses(HOUSE_COUNT, starting_credits);
+    world.set_ore(OreField::from_overlay(128, 128, &scenario.overlay));
+
+    // Pick a base start on open ground near ore, within the playable rect.
+    let near = CellCoord::new(
+        scenario.map_x as i32 + scenario.map_width as i32 / 2,
+        scenario.map_y as i32 + scenario.map_height as i32 / 2,
+    );
+    let (start_cell, ore_cell) = find_base_start(world.passability(), &world.ore, near);
+
+    // Spawn the starter MCV for the controlled house.
+    let mcv_proto = &content.catalog.units[U_MCV as usize];
+    let mcv = world.spawn_unit(
+        mcv_proto.sprite_id,
+        controlled,
+        start_cell,
+        Facing(0),
+        mcv_proto.max_health,
+        mcv_proto.stats,
+    );
+    world.set_unit_max_health(mcv, mcv_proto.max_health);
+    world.set_unit_combat(mcv, mcv_proto.armor, mcv_proto.weapon, mcv_proto.has_turret);
+
+    let mut core = AppCore::with_sim(raster, palette, world, content.unit_sprites, remaps);
+    core.set_building_sprites(content.building_sprites);
+    core.enable_sidebar(controlled, content.buildables);
+
+    Ok(EconGame {
+        core,
+        controlled,
+        mcv,
+        start_cell,
+        ore_cell,
+        mcv_unit_id: U_MCV,
+    })
+}
+
+/// Find a base start: a cell whose 5×5 neighbourhood is passable (room for the
+/// construction yard + expansion) and that is within ~10 cells of an ore field,
+/// searching outward from `near`. Falls back to any wide-open cell, then `near`.
+/// Returns `(start_cell, nearest_ore_cell)`.
+pub fn find_base_start(
+    passable: &Passability,
+    ore: &OreField,
+    near: CellCoord,
+) -> (CellCoord, Option<CellCoord>) {
+    let open5 = |c: CellCoord| -> bool {
+        for dy in -2..=2 {
+            for dx in -2..=2 {
+                if !passable.is_static_passable(CellCoord::new(c.x + dx, c.y + dy)) {
+                    return false;
+                }
+            }
+        }
+        true
+    };
+    let nearest_ore = |c: CellCoord| -> Option<(i32, CellCoord)> {
+        let mut best: Option<(i32, CellCoord)> = None;
+        for dy in -12..=12 {
+            for dx in -12..=12 {
+                let o = CellCoord::new(c.x + dx, c.y + dy);
+                if ore.has_ore(o) {
+                    let d = dx.abs().max(dy.abs());
+                    if best.map(|(bd, _)| d < bd).unwrap_or(true) {
+                        best = Some((d, o));
+                    }
+                }
+            }
+        }
+        best
+    };
+
+    // Spiral outward from `near` looking for an open cell close to ore.
+    for r in 0i32..60 {
+        for dy in -r..=r {
+            for dx in -r..=r {
+                if dx.abs() != r && dy.abs() != r {
+                    continue; // ring only
+                }
+                let c = CellCoord::new(near.x + dx, near.y + dy);
+                if open5(c) {
+                    if let Some((d, ocell)) = nearest_ore(c) {
+                        if d <= 10 {
+                            return (c, Some(ocell));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // Fallback: first open cell anywhere on the playable band.
+    for y in 2..126 {
+        for x in 2..126 {
+            let c = CellCoord::new(x, y);
+            if open5(c) {
+                return (c, nearest_ore(c).map(|(_, o)| o));
+            }
+        }
+    }
+    (near, None)
 }
 
 /// Lift a `ra-data` resolved [`WeaponDef`] (plain numbers) into the sim's

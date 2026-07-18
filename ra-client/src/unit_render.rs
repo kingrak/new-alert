@@ -128,6 +128,42 @@ pub fn draw_sprite_centered(
     }
 }
 
+/// Blit an indexed sprite frame with its **top-left** at (`x`, `y`) in
+/// destination pixels — the anchoring buildings use (their SHP art aligns to the
+/// footprint's upper-left cell). Index 0 is transparent; other indices are
+/// remapped then palette-expanded.
+pub fn draw_sprite_topleft(
+    dst: &mut RgbaImage,
+    x: i32,
+    y: i32,
+    frame: &SpriteFrame,
+    remap: &RemapTable,
+    palette: &Palette,
+) {
+    for sy in 0..frame.height as i32 {
+        let py = y + sy;
+        if py < 0 || py >= dst.height as i32 {
+            continue;
+        }
+        for sx in 0..frame.width as i32 {
+            let px = x + sx;
+            if px < 0 || px >= dst.width as i32 {
+                continue;
+            }
+            let idx = frame.pixels[(sy as u32 * frame.width + sx as u32) as usize];
+            if idx == 0 {
+                continue;
+            }
+            let [r, g, b] = palette[remap[idx as usize] as usize];
+            let di = ((py as u32 * dst.width + px as u32) * 4) as usize;
+            dst.pixels[di] = r;
+            dst.pixels[di + 1] = g;
+            dst.pixels[di + 2] = b;
+            dst.pixels[di + 3] = 255;
+        }
+    }
+}
+
 /// Draw a filled rectangle in `[r, g, b]`, clipped to the image. Used for
 /// health bars and muzzle flashes.
 pub fn fill_rect(dst: &mut RgbaImage, x0: i32, y0: i32, x1: i32, y1: i32, rgb: [u8; 3]) {

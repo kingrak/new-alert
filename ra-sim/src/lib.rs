@@ -24,21 +24,29 @@
 #![deny(clippy::float_arithmetic)]
 
 pub mod arena;
+pub mod building;
 pub mod bullet;
+pub mod catalog;
 pub mod combat;
 pub mod coords;
 pub mod fixed;
 pub mod hash;
+pub mod house;
+pub mod ore;
 pub mod path;
 pub mod rng;
 pub mod unit;
 pub mod world;
 
 pub use arena::{Arena, Handle};
+pub use building::Building;
 pub use bullet::Bullet;
+pub use catalog::{BuildingProto, Catalog, EconRules, UnitProto};
 pub use combat::{modify_damage, Target, WarheadProfile, WeaponProfile, ARMOR_COUNT};
 pub use coords::{CellCoord, Facing, Lepton, WorldCoord, LEPTONS_PER_CELL};
+pub use house::{BuildItem, House, ProdKind, Production};
+pub use ore::{OreCell, OreField};
 pub use path::Passability;
 pub use rng::RandomLcg;
-pub use unit::{MoveStats, Unit};
+pub use unit::{HarvStatus, HarvestState, MoveStats, Unit};
 pub use world::{apply, Command, World};

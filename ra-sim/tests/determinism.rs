@@ -625,24 +625,31 @@ fn real_scg01ea_hash_chain_prefix_golden() {
     // assets and copied from the printed output below (see the doc comment
     // above for the derivation policy).
     //
-    // **Updated for M4 (combat).** These values changed from the M3 pin because
-    // the world/unit state hash now folds in the new per-unit combat fields
-    // (armor, turret facing, rearm timer, weapon presence, target) and the
-    // bullets arena — a deliberate state extension, not a movement/pathing
-    // regression. The scenario's units carry only default (unarmed) combat state
-    // in this test, so the *behavior* is identical to M3; only the hashed field
-    // set grew. Re-pinned deterministically.
+    // **Updated for M4 (combat), re-pinned for M5 (economy).** These values
+    // changed because `World::state_hash` grew twice, each a deliberate state
+    // extension and not a movement/pathing regression:
+    //  - M4 folded in the per-unit combat fields (armor, turret facing, rearm
+    //    timer, weapon presence, target) and the bullets arena;
+    //  - M5 appends each unit's `is_harvester` byte and folds in the buildings
+    //    arena, the houses vector, and the ore field.
+    // In this test the scenario's units carry only default combat state, are not
+    // harvesters, and there are no buildings/houses/ore, so every M5 addition
+    // hashes its empty/default value — the *behavior* is byte-identical to M3.
+    // The companion audit `m4_repin_is_justified_movement_unaffected_by_combat_fields`
+    // proves this: its independent movement-only hash chain (`state_hash_m3_shaped`)
+    // is UNCHANGED across M4 and M5, so only the full-state hash *formula* grew.
+    // Re-pinned deterministically (values read back from the run once).
     let golden: [u64; 10] = [
-        0xbfd0_d9e9_b2fe_dbbb,
-        0x46c5_9344_0ccb_50ec,
-        0x848a_853e_0945_fae1,
-        0x900e_375a_db81_a762,
-        0x974e_1408_cc0d_3057,
-        0x57d9_69bb_658c_77c8,
-        0xda5d_5abd_5a52_36c8,
-        0x40f8_0d19_bb7b_086c,
-        0xba64_7334_00c2_96f4,
-        0xcdf9_4064_5935_97b0,
+        0xcbce_34ae_694c_1b1b,
+        0x8b61_f02b_76f2_2214,
+        0x70c3_f119_6b95_c141,
+        0x6de3_46e5_acaa_572a,
+        0x1e0f_3148_562b_7c17,
+        0xb335_8f45_5866_9d1c,
+        0x6635_14a6_9441_d8ca,
+        0xb3a6_f70c_edff_2790,
+        0x039f_0658_6157_7422,
+        0x59c2_824e_ed65_7fd4,
     ];
     assert_eq!(
         chain, golden,
@@ -1153,16 +1160,16 @@ mod repin_audit {
         assert_eq!(
             prod_chain,
             [
-                0xbfd0_d9e9_b2fe_dbbb,
-                0x46c5_9344_0ccb_50ec,
-                0x848a_853e_0945_fae1,
-                0x900e_375a_db81_a762,
-                0x974e_1408_cc0d_3057,
-                0x57d9_69bb_658c_77c8,
-                0xda5d_5abd_5a52_36c8,
-                0x40f8_0d19_bb7b_086c,
-                0xba64_7334_00c2_96f4,
-                0xcdf9_4064_5935_97b0,
+                0xcbce_34ae_694c_1b1b,
+                0x8b61_f02b_76f2_2214,
+                0x70c3_f119_6b95_c141,
+                0x6de3_46e5_acaa_572a,
+                0x1e0f_3148_562b_7c17,
+                0xb335_8f45_5866_9d1c,
+                0x6635_14a6_9441_d8ca,
+                0xb3a6_f70c_edff_2790,
+                0x039f_0658_6157_7422,
+                0x59c2_824e_ed65_7fd4,
             ],
             "this audit's script diverged from real_scg01ea_hash_chain_prefix_golden's script"
         );

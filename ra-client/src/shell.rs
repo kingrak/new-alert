@@ -88,6 +88,12 @@ async fn amain(mut core: AppCore, smoke_seconds: Option<f32>) {
             }
         }
 
+        // Deploy the selected MCV (M5): the 'D' key, edge-triggered.
+        if is_key_pressed(KeyCode::D) {
+            core.handle(InputEvent::KeyDown(Key::Deploy));
+            core.handle(InputEvent::KeyUp(Key::Deploy));
+        }
+
         if is_key_pressed(KeyCode::Escape) {
             break;
         }

@@ -13,6 +13,8 @@ pub enum Key {
     Up,
     /// Scroll the camera down.
     Down,
+    /// Deploy the selected MCV into a construction yard (M5).
+    Deploy,
 }
 
 /// A pointer button. Left drives selection; right issues move orders.

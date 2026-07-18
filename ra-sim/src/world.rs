@@ -8,13 +8,17 @@
 //! replays and multiplayer alike.
 
 use crate::arena::{Arena, Handle};
+use crate::building::Building;
 use crate::bullet::Bullet;
+use crate::catalog::Catalog;
 use crate::combat::{aligned_to_fire, modify_damage, Target};
 use crate::coords::{coord_move, isqrt, leptons_distance, CellCoord, Facing, WorldCoord};
 use crate::hash::Fnv1a;
+use crate::house::{BuildItem, House, ProdKind, Production};
+use crate::ore::OreField;
 use crate::path::{find_path, Passability};
 use crate::rng::RandomLcg;
-use crate::unit::{MoveStats, Unit};
+use crate::unit::{HarvStatus, MoveStats, Unit};
 
 /// A player order. Every command carries the **issuing house** explicitly
 /// (§4.6): ownership is validated by the sim, never inferred from a connection,
@@ -51,6 +55,50 @@ pub enum Command {
         /// House issuing the order (must own `unit`).
         house: u8,
     },
+    /// Deploy an MCV into a construction yard (`unit.cpp:1437`). The yard's 3×3
+    /// footprint is placed with its top-left at the MCV's cell minus (1,1) — the
+    /// original's `Adjacent_Cell(cell, FACING_NW)` origin — so it sits centred on
+    /// the MCV. Ignored unless the issuing house owns the MCV, the unit is an MCV
+    /// (`UnitProto::deploys_to`), and the footprint is a legal placement.
+    Deploy {
+        /// The MCV to deploy.
+        unit: Handle,
+        /// House issuing the order (must own `unit`).
+        house: u8,
+    },
+    /// Begin producing a building or unit at `house`'s factory. Validated
+    /// against prerequisites, the required factory (construction yard for
+    /// buildings, war factory for vehicles), funds, and the one-slot-per-kind
+    /// rule. Deducts nothing up front — cost is paid in installments as it
+    /// builds (`FactoryClass::AI`).
+    StartProduction {
+        /// House issuing the order.
+        house: u8,
+        /// What to build.
+        item: BuildItem,
+    },
+    /// Place a completed building at `cell` (its footprint top-left). Requires
+    /// the house's structure production to be finished and to match
+    /// `building`. Validated against the footprint (on-map, passable,
+    /// unoccupied) and the proximity-to-own-building rule
+    /// (`Passes_Proximity_Check`, `display.cpp:671`). A refinery spawns its free
+    /// harvester on placement (`building.cpp:2640`).
+    PlaceBuilding {
+        /// House issuing the order.
+        house: u8,
+        /// Building type id being placed (must match the ready structure).
+        building: u32,
+        /// Footprint top-left cell.
+        cell: CellCoord,
+    },
+    /// Cancel `house`'s in-progress production of the given kind, refunding the
+    /// credits spent so far (`FactoryClass::Abandon`, money refunded).
+    CancelProduction {
+        /// House issuing the order.
+        house: u8,
+        /// Which lane to cancel.
+        kind: ProdKind,
+    },
 }
 
 /// The complete simulation state. Fields are plain and serialisable; there are
@@ -59,9 +107,17 @@ pub enum Command {
 pub struct World {
     /// Live movable units, addressed by generational handle.
     pub units: Arena<Unit>,
+    /// Placed buildings — the second entity arena (§4.9 M5, §5 per-kind arenas).
+    pub buildings: Arena<Building>,
     /// Projectiles in flight (their own arena, per §5's per-kind arena plan).
     pub bullets: Arena<Bullet>,
-    /// Map passability grid (derived from terrain by `ra-data`).
+    /// Per-house economic state (credits, power, production), indexed by house.
+    pub houses: Vec<House>,
+    /// The map's harvestable ore overlay.
+    pub ore: OreField,
+    /// Immutable build data (footprints, costs, prerequisites, stats).
+    pub catalog: Catalog,
+    /// Map passability grid: static terrain + dynamic building occupancy.
     passable: Passability,
     /// The sim RNG, seeded and owned here.
     rng: RandomLcg,
@@ -70,15 +126,65 @@ pub struct World {
 }
 
 impl World {
-    /// Create a world over a passability grid, seeding the sim RNG.
+    /// Create a world over a passability grid, seeding the sim RNG. Houses, the
+    /// ore field, and the build catalog start empty — movement/combat-only
+    /// worlds (M3/M4 tests) never touch them; the loader populates them for M5.
     pub fn new(passable: Passability, seed: u32) -> World {
+        let (w, h) = (passable.width(), passable.height());
         World {
             units: Arena::new(),
+            buildings: Arena::new(),
             bullets: Arena::new(),
+            houses: Vec::new(),
+            ore: OreField::empty(w, h),
+            catalog: Catalog::new(),
             passable,
             rng: RandomLcg::new(seed),
             tick_count: 0,
         }
+    }
+
+    /// Install the build catalog (footprints, costs, prerequisites, protos).
+    pub fn set_catalog(&mut self, catalog: Catalog) {
+        self.catalog = catalog;
+    }
+
+    /// Install the ore overlay.
+    pub fn set_ore(&mut self, ore: OreField) {
+        self.ore = ore;
+    }
+
+    /// Create `n` houses, each starting with `credits`.
+    pub fn init_houses(&mut self, n: usize, credits: i32) {
+        self.houses = (0..n).map(|_| House::new(credits)).collect();
+    }
+
+    /// Read a house's credits (0 if the house index is out of range).
+    pub fn house_credits(&self, house: u8) -> i32 {
+        self.houses
+            .get(house as usize)
+            .map(|h| h.credits)
+            .unwrap_or(0)
+    }
+
+    /// Set a house's credits (no-op if out of range). For the loader / tests.
+    pub fn set_house_credits(&mut self, house: u8, credits: i32) {
+        if let Some(h) = self.houses.get_mut(house as usize) {
+            h.credits = credits;
+        }
+    }
+
+    /// Borrow a house, if it exists.
+    pub fn house(&self, house: u8) -> Option<&House> {
+        self.houses.get(house as usize)
+    }
+
+    /// Whether building type `building_id` may be placed at footprint top-left
+    /// `cell` for `house` (footprint on-map/passable/clear **and** the proximity
+    /// rule). Surfaced for the client's green/red placement preview and tests.
+    pub fn can_place_building(&self, house: u8, building_id: u32, cell: CellCoord) -> bool {
+        footprint_placeable(self, building_id, cell)
+            && passes_proximity(self, house, building_id, cell)
     }
 
     /// The current tick number.
@@ -132,6 +238,61 @@ impl World {
         }
     }
 
+    /// Mark a spawned unit as a harvester (drives the harvest FSM).
+    pub fn set_unit_harvester(&mut self, unit: Handle, is_harvester: bool) {
+        if let Some(u) = self.units.get_mut(unit) {
+            u.set_harvester(is_harvester);
+        }
+    }
+
+    /// Directly place building type `building_id` for `house` at footprint
+    /// top-left `cell`, stamping occupancy and updating the house's power totals
+    /// and building-type count. Used by the loader for scenario-provided
+    /// structures and internally by [`Command::Deploy`] / [`Command::PlaceBuilding`].
+    /// Does **not** validate the footprint (callers that need validation use the
+    /// commands). Returns the new building's handle, or `None` for a bad id.
+    pub fn spawn_building(
+        &mut self,
+        building_id: u32,
+        house: u8,
+        cell: CellCoord,
+    ) -> Option<Handle> {
+        let proto = self.catalog.building(building_id)?.clone();
+        let building = Building {
+            type_id: building_id,
+            house,
+            cell,
+            foot_w: proto.foot_w,
+            foot_h: proto.foot_h,
+            health: proto.max_health,
+            max_health: proto.max_health,
+            power: proto.power,
+            is_refinery: proto.is_refinery,
+            is_construction_yard: proto.is_construction_yard,
+            is_war_factory: proto.is_war_factory,
+        };
+        let handle = self.buildings.insert(building);
+        // Stamp occupancy.
+        let cells: Vec<CellCoord> = self
+            .buildings
+            .get(handle)
+            .map(|b| b.footprint().collect())
+            .unwrap_or_default();
+        for c in cells {
+            self.passable.set_occupied(c, true);
+        }
+        // Power + ownership bookkeeping.
+        if let Some(hs) = self.houses.get_mut(house as usize) {
+            if proto.power >= 0 {
+                hs.power_output += proto.power;
+            } else {
+                hs.power_drain += -proto.power;
+            }
+            hs.adjust_building_count(building_id, 1);
+        }
+        Some(handle)
+    }
+
     /// Advance one tick: apply `commands` (in order), run movement, then return
     /// the post-tick state hash. This is the function replays and the lockstep
     /// net layer drive; the returned hash is chained and compared.
@@ -157,6 +318,17 @@ impl World {
             h.write_u32(handle.gen);
             bullet.hash_into(&mut h);
         }
+        h.write_u32(self.buildings.len());
+        for (handle, building) in self.buildings.iter() {
+            h.write_u32(handle.index);
+            h.write_u32(handle.gen);
+            building.hash_into(&mut h);
+        }
+        h.write_u32(self.houses.len() as u32);
+        for house in &self.houses {
+            house.hash_into(&mut h);
+        }
+        self.ore.hash_into(&mut h);
         h.finish()
     }
 }
@@ -164,14 +336,19 @@ impl World {
 /// Apply one tick's worth of systems to `world`, in the canonical fixed order:
 ///
 /// 1. **commands** — apply player/AI orders (in the given canonical order),
-/// 2. **combat** — targeting, turret/body rotation, and firing (spawns bullets,
+/// 2. **production** — advance each house's factories, pay installments,
+///    complete buildings (→ ready-to-place) and units (→ spawn at the exit),
+/// 3. **harvesters** — the 5-state harvest FSM: scan/drive/mine/dock/unload,
+/// 4. **combat** — targeting, turret/body rotation, and firing (spawns bullets,
 ///    consumes the sim RNG on inaccurate shots — see [`run_combat`]),
-/// 3. **movement** — advance units along their paths,
-/// 4. **bullets** — advance projectiles, detonate, apply damage, remove the dead.
+/// 5. **movement** — advance units along their paths,
+/// 6. **bullets** — advance projectiles, detonate, apply damage, remove the dead.
 ///
 /// This fixed, explicit order is itself a determinism requirement (§4.2). This
 /// is the single mutation entry point for the sim (§4.4). `tick` must equal the
-/// world's current tick.
+/// world's current tick. Production and harvesting draw **no** sim RNG (the only
+/// RNG path stays combat scatter, M4); ore growth — the original's RNG-consuming
+/// economy step — is deferred to M6 (see [`crate::ore`]).
 pub fn apply(world: &mut World, tick: u32, commands: &[Command]) {
     debug_assert_eq!(
         tick, world.tick_count,
@@ -183,13 +360,19 @@ pub fn apply(world: &mut World, tick: u32, commands: &[Command]) {
         apply_command(world, cmd);
     }
 
-    // System 2: combat (targeting + rotation + firing).
+    // System 2: production (factories advance, credits paid, objects complete).
+    run_production(world);
+
+    // System 3: harvesters (the harvest FSM sets paths and books credits).
+    run_harvesters(world);
+
+    // System 4: combat (targeting + rotation + firing).
     run_combat(world);
 
-    // System 3: movement.
+    // System 5: movement.
     move_units(world);
 
-    // System 4: bullets (flight + detonation + damage + death).
+    // System 6: bullets (flight + detonation + damage + death).
     run_bullets(world);
 
     world.tick_count = world.tick_count.wrapping_add(1);
@@ -210,6 +393,11 @@ fn apply_command(world: &mut World, cmd: Command) {
                     u.path = path;
                     u.dest = Some(dest);
                     u.target = None; // a move order overrides an attack
+                                     // A manual move interrupts harvesting; the FSM resumes
+                                     // (state `Idle` → `Looking`) once the unit arrives.
+                    if u.is_harvester {
+                        u.harvest.status = HarvStatus::Idle;
+                    }
                 }
             }
         }
@@ -250,7 +438,278 @@ fn apply_command(world: &mut World, cmd: Command) {
                 u.path.clear();
             }
         }
+        Command::Deploy { unit, house } => apply_deploy(world, unit, house),
+        Command::StartProduction { house, item } => apply_start_production(world, house, item),
+        Command::PlaceBuilding {
+            house,
+            building,
+            cell,
+        } => apply_place_building(world, house, building, cell),
+        Command::CancelProduction { house, kind } => apply_cancel_production(world, house, kind),
     }
+}
+
+/// Deploy an MCV into its construction yard (`unit.cpp:1437`).
+fn apply_deploy(world: &mut World, unit: Handle, house: u8) {
+    // Ownership + is-MCV check.
+    let (unit_cell, u_house, type_id) = match world.units.get(unit) {
+        Some(u) => (u.cell(), u.house, u.type_id),
+        None => return,
+    };
+    // Resolve the deploy target from the unit's proto (matched by sprite id).
+    let building_id = world
+        .catalog
+        .units
+        .iter()
+        .find(|p| p.sprite_id == type_id && p.deploys_to.is_some())
+        .and_then(|p| p.deploys_to);
+    let (Some(building_id), true) = (building_id, u_house == house) else {
+        return;
+    };
+    // The yard's top-left sits one cell NW of the MCV's cell (centred on it).
+    let top_left = CellCoord::new(unit_cell.x - 1, unit_cell.y - 1);
+    // The MCV's own cells are currently unoccupied (units don't block), so the
+    // footprint check is a pure terrain/occupancy test.
+    if !footprint_placeable(world, building_id, top_left) {
+        return;
+    }
+    world.units.remove(unit);
+    let bhandle = world.spawn_building(building_id, house, top_left);
+    // A construction yard is the first building; refineries elsewhere spawn a
+    // harvester, but the CONST does not.
+    let _ = bhandle;
+}
+
+/// Begin producing an item, with prerequisite/factory/funds validation.
+fn apply_start_production(world: &mut World, house: u8, item: BuildItem) {
+    let Some(hs) = world.houses.get(house as usize) else {
+        return;
+    };
+
+    // Resolve cost + prerequisites + the required factory for this item.
+    let (cost, prereq, need_yard, need_factory, kind) = match item {
+        BuildItem::Building(id) => match world.catalog.building(id) {
+            Some(p) => (p.cost, p.prereq.clone(), true, false, ProdKind::Building),
+            None => return,
+        },
+        BuildItem::Unit(id) => match world.catalog.unit(id) {
+            Some(p) => (p.cost, p.prereq.clone(), false, true, ProdKind::Unit),
+            None => return,
+        },
+    };
+
+    // Slot must be free.
+    let slot_busy = match kind {
+        ProdKind::Building => hs.building_prod.is_some() || hs.ready_building.is_some(),
+        ProdKind::Unit => hs.unit_prod.is_some(),
+    };
+    if slot_busy {
+        return;
+    }
+
+    // Prerequisites: every required building type must be owned.
+    if !prereq.iter().all(|&id| hs.owns_building(id)) {
+        return;
+    }
+    // The producing factory must exist among the house's live buildings.
+    let has_yard = world
+        .buildings
+        .iter()
+        .any(|(_, b)| b.house == house && b.is_construction_yard);
+    let has_factory = world
+        .buildings
+        .iter()
+        .any(|(_, b)| b.house == house && b.is_war_factory);
+    if (need_yard && !has_yard) || (need_factory && !has_factory) {
+        return;
+    }
+    // Must be able to afford at least the first installment (any credits).
+    if world.house_credits(house) <= 0 {
+        return;
+    }
+
+    let total_ticks = world.catalog.time_to_build(cost);
+    let prod = Production {
+        item,
+        cost,
+        total_ticks,
+        progress: 0,
+        spent: 0,
+        power_accum: 0,
+        done: false,
+    };
+    if let Some(hs) = world.houses.get_mut(house as usize) {
+        match kind {
+            ProdKind::Building => hs.building_prod = Some(prod),
+            ProdKind::Unit => hs.unit_prod = Some(prod),
+        }
+    }
+}
+
+/// Place a completed building, with footprint + proximity validation.
+fn apply_place_building(world: &mut World, house: u8, building: u32, cell: CellCoord) {
+    // Must have this exact structure ready.
+    let ready = world
+        .houses
+        .get(house as usize)
+        .and_then(|h| h.ready_building);
+    if ready != Some(building) {
+        return;
+    }
+    if !footprint_placeable(world, building, cell) {
+        return;
+    }
+    if !passes_proximity(world, house, building, cell) {
+        return;
+    }
+    // Consume the ready slot and place.
+    if let Some(hs) = world.houses.get_mut(house as usize) {
+        hs.ready_building = None;
+    }
+    let Some(bhandle) = world.spawn_building(building, house, cell) else {
+        return;
+    };
+    // Refineries spawn a free harvester adjacent-south of their centre
+    // (`building.cpp:2640`, DIR_S).
+    let (is_refinery, free_unit, center) = world
+        .buildings
+        .get(bhandle)
+        .map(|b| (b.is_refinery, None::<u32>, b.center_cell()))
+        .unwrap_or((false, None, cell));
+    let _ = free_unit;
+    if is_refinery {
+        let free = world
+            .catalog
+            .building(building)
+            .and_then(|p| p.free_harvester_unit);
+        if let Some(unit_id) = free {
+            let dock = CellCoord::new(center.x, center.y + 1);
+            spawn_free_harvester(world, unit_id, house, dock, cell);
+        }
+    }
+}
+
+/// Cancel a house's production of the given kind, refunding what was spent.
+fn apply_cancel_production(world: &mut World, house: u8, kind: ProdKind) {
+    let Some(hs) = world.houses.get_mut(house as usize) else {
+        return;
+    };
+    let refund = match kind {
+        ProdKind::Building => {
+            let r = hs.building_prod.map(|p| p.spent).unwrap_or(0);
+            hs.building_prod = None;
+            // A completed-but-unplaced building is also cancellable (full refund
+            // of its cost is not tracked separately; ready buildings were fully
+            // paid, so cancelling one refunds its cost).
+            if let Some(id) = hs.ready_building.take() {
+                let cost = world.catalog.building(id).map(|p| p.cost).unwrap_or(0);
+                return refund_credits(world, house, cost);
+            }
+            r
+        }
+        ProdKind::Unit => {
+            let r = hs.unit_prod.map(|p| p.spent).unwrap_or(0);
+            hs.unit_prod = None;
+            r
+        }
+    };
+    refund_credits(world, house, refund);
+}
+
+fn refund_credits(world: &mut World, house: u8, amount: i32) {
+    if let Some(hs) = world.houses.get_mut(house as usize) {
+        hs.credits += amount;
+    }
+}
+
+/// Whether building `building_id`'s footprint at top-left `cell` is a legal
+/// placement: every footprint cell on-map, statically passable, and unoccupied.
+fn footprint_placeable(world: &World, building_id: u32, cell: CellCoord) -> bool {
+    let Some(proto) = world.catalog.building(building_id) else {
+        return false;
+    };
+    for dy in 0..proto.foot_h as i32 {
+        for dx in 0..proto.foot_w as i32 {
+            let c = CellCoord::new(cell.x + dx, cell.y + dy);
+            if !world.passable.is_static_passable(c) || world.passable.is_occupied(c) {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// Simplified `Passes_Proximity_Check` (`display.cpp:671`): the footprint must
+/// be adjacent (within one cell, 8-neighbourhood) to a cell owned by one of the
+/// house's live buildings. The first building a house places (its construction
+/// yard, via [`Command::Deploy`]) bypasses this — deploy does not call it — so a
+/// base can be founded on empty ground. Deviation: we omit the radar/shroud
+/// gating and the original's extra "one cell further" wall/bib allowances.
+fn passes_proximity(world: &World, house: u8, building_id: u32, cell: CellCoord) -> bool {
+    let Some(proto) = world.catalog.building(building_id) else {
+        return false;
+    };
+    // Any house building at all? (Should always be true post-deploy.) If the
+    // house owns nothing yet, allow placement (founding case).
+    let owns_any = world
+        .buildings
+        .iter()
+        .any(|(_, b)| b.house == house && b.is_alive());
+    if !owns_any {
+        return true;
+    }
+    // Expand the footprint by one cell and test overlap with owned footprints.
+    let (x0, y0) = (cell.x - 1, cell.y - 1);
+    let (x1, y1) = (cell.x + proto.foot_w as i32, cell.y + proto.foot_h as i32);
+    world.buildings.iter().any(|(_, b)| {
+        b.house == house
+            && b.is_alive()
+            && b.footprint()
+                .any(|fc| fc.x >= x0 && fc.x <= x1 && fc.y >= y0 && fc.y <= y1)
+    })
+}
+
+/// Spawn a refinery's free harvester at `dock` (falling back to a nearby free
+/// cell), fully set up to harvest (`building.cpp:2644`).
+fn spawn_free_harvester(
+    world: &mut World,
+    unit_id: u32,
+    house: u8,
+    dock: CellCoord,
+    refinery_cell: CellCoord,
+) {
+    let Some(proto) = world.catalog.unit(unit_id).cloned() else {
+        return;
+    };
+    // Find a free, passable spawn cell: prefer the dock, else scan outward.
+    let spawn_cell = if world.passable.is_passable(dock) {
+        dock
+    } else {
+        let mut found = dock;
+        'search: for r in 1..6 {
+            for dy in -r..=r {
+                for dx in -r..=r {
+                    let c = CellCoord::new(refinery_cell.x + dx, refinery_cell.y + dy);
+                    if world.passable.is_passable(c) {
+                        found = c;
+                        break 'search;
+                    }
+                }
+            }
+        }
+        found
+    };
+    let handle = world.spawn_unit(
+        proto.sprite_id,
+        house,
+        spawn_cell,
+        Facing(192), // DIR_W, as the original places it
+        proto.max_health,
+        proto.stats,
+    );
+    world.set_unit_max_health(handle, proto.max_health);
+    world.set_unit_combat(handle, proto.armor, proto.weapon, proto.has_turret);
+    world.set_unit_harvester(handle, proto.is_harvester);
 }
 
 /// Combat system: for each unit (in slot order) decrement its rearm timer,
@@ -467,6 +926,405 @@ fn run_bullets(world: &mut World) {
     for h in dead {
         world.units.remove(h);
     }
+}
+
+// ===========================================================================
+// Production system (§4.9 M5)
+// ===========================================================================
+
+/// Production system: advance each house's two factory lanes in house-index
+/// order (a fixed order — determinism, §4.2). Ported from `FactoryClass::AI`
+/// (`factory.cpp:194`): cost is paid in installments so the total spent equals
+/// the item cost exactly; a step that can't be afforded stalls.
+fn run_production(world: &mut World) {
+    for hi in 0..world.houses.len() {
+        advance_production(world, hi, ProdKind::Building);
+        advance_production(world, hi, ProdKind::Unit);
+    }
+}
+
+/// Advance one production lane of one house by one tick.
+fn advance_production(world: &mut World, house_idx: usize, kind: ProdKind) {
+    // Take the production out to sidestep the borrow checker.
+    let mut prod = match world.houses.get_mut(house_idx) {
+        Some(h) => match kind {
+            ProdKind::Building => h.building_prod.take(),
+            ProdKind::Unit => h.unit_prod.take(),
+        },
+        None => return,
+    };
+    let Some(p) = prod.as_mut() else {
+        return;
+    };
+    if p.done {
+        // Unit builds spawn on completion; retry the exit each tick until clear.
+        // Building builds move to `ready_building` immediately (handled below on
+        // the tick they finish), so a lingering done building lane shouldn't
+        // occur — but guard anyway.
+        finish_or_retry(world, house_idx, kind, prod);
+        return;
+    }
+
+    // --- Low-power throttle (documented deviation, see module notes) ---
+    // RA proper does not slow *production* under low power; it slows superweapon
+    // reload by `Inverse(Saturate(Power_Fraction(),1))` floored at 1/2
+    // (`building.cpp:4438-4441`). The task asks for low-power to slow
+    // production, so we apply that same ratio here: at full power one progress
+    // tick per game tick; at ≤50% power, one every two ticks.
+    let (mut pn, pd) = world.houses[house_idx].power_fraction();
+    if pd > 0 && pn * 2 < pd {
+        pn = (pd + 1) / 2; // floor the fraction at 1/2
+    }
+    p.power_accum += pn;
+    if p.power_accum < pd {
+        // Throttled: no progress this tick. Put the lane back unchanged.
+        store_production(world, house_idx, kind, prod);
+        return;
+    }
+    p.power_accum -= pd;
+
+    // --- Installment payment (faithful to factory.cpp:203-227) ---
+    let target_spent =
+        (p.cost as i64 * (p.progress + 1) as i64 / p.total_ticks.max(1) as i64) as i32;
+    let installment = (target_spent - p.spent).max(0);
+    if world.house_credits(house_idx as u8) < installment {
+        // Can't afford this step: stall (no progress), leave lane in place.
+        store_production(world, house_idx, kind, prod);
+        return;
+    }
+    if let Some(h) = world.houses.get_mut(house_idx) {
+        h.credits -= installment;
+    }
+    p.spent += installment;
+    p.progress += 1;
+
+    if p.progress >= p.total_ticks {
+        p.done = true;
+        finish_or_retry(world, house_idx, kind, prod);
+    } else {
+        store_production(world, house_idx, kind, prod);
+    }
+}
+
+/// Store a production back into its lane.
+fn store_production(world: &mut World, house_idx: usize, kind: ProdKind, prod: Option<Production>) {
+    if let Some(h) = world.houses.get_mut(house_idx) {
+        match kind {
+            ProdKind::Building => h.building_prod = prod,
+            ProdKind::Unit => h.unit_prod = prod,
+        }
+    }
+}
+
+/// Handle a completed production: a building becomes ready-to-place; a unit
+/// spawns at the war-factory exit (retrying next tick if the exit is blocked).
+fn finish_or_retry(world: &mut World, house_idx: usize, kind: ProdKind, prod: Option<Production>) {
+    let Some(p) = prod else { return };
+    match p.item {
+        BuildItem::Building(id) => {
+            if let Some(h) = world.houses.get_mut(house_idx) {
+                h.ready_building = Some(id);
+                h.building_prod = None;
+            }
+        }
+        BuildItem::Unit(id) => {
+            let house = house_idx as u8;
+            match find_factory_exit(world, house) {
+                Some(exit) => {
+                    spawn_produced_unit(world, id, house, exit);
+                    if let Some(h) = world.houses.get_mut(house_idx) {
+                        h.unit_prod = None;
+                    }
+                }
+                None => {
+                    // Exit blocked: keep the done production and retry next tick.
+                    store_production(world, house_idx, kind, Some(p));
+                }
+            }
+        }
+    }
+}
+
+/// A free passable cell adjacent to the house's war factory, for a completed
+/// vehicle to exit onto. Prefers the cell south of the factory centre, then
+/// scans the footprint's adjacency ring. Deviation: the original exits at
+/// building-specific coordinates via `Exit_Coord`/`Exit_Object`
+/// (`building.cpp:2106`); we use the nearest free adjacent cell instead.
+fn find_factory_exit(world: &World, house: u8) -> Option<CellCoord> {
+    let factory = world
+        .buildings
+        .iter()
+        .find(|(_, b)| b.house == house && b.is_war_factory && b.is_alive())
+        .map(|(_, b)| (b.cell, b.foot_w as i32, b.foot_h as i32, b.center_cell()))?;
+    let (tl, w, h, center) = factory;
+    // Preferred: straight south of centre.
+    let south = CellCoord::new(center.x, tl.y + h);
+    if world.passable.is_passable(south) {
+        return Some(south);
+    }
+    // Otherwise the whole 1-cell ring around the footprint.
+    for x in (tl.x - 1)..=(tl.x + w) {
+        for y in (tl.y - 1)..=(tl.y + h) {
+            let c = CellCoord::new(x, y);
+            let on_ring = x == tl.x - 1 || x == tl.x + w || y == tl.y - 1 || y == tl.y + h;
+            if on_ring && world.passable.is_passable(c) {
+                return Some(c);
+            }
+        }
+    }
+    None
+}
+
+/// Spawn a produced vehicle at `cell`, wiring its stats from the catalog proto.
+fn spawn_produced_unit(world: &mut World, unit_id: u32, house: u8, cell: CellCoord) {
+    let Some(proto) = world.catalog.unit(unit_id).cloned() else {
+        return;
+    };
+    let handle = world.spawn_unit(
+        proto.sprite_id,
+        house,
+        cell,
+        Facing(128), // face south, out of the factory
+        proto.max_health,
+        proto.stats,
+    );
+    world.set_unit_max_health(handle, proto.max_health);
+    world.set_unit_combat(handle, proto.armor, proto.weapon, proto.has_turret);
+    world.set_unit_harvester(handle, proto.is_harvester);
+}
+
+// ===========================================================================
+// Harvester system (§4.9 M5) — port of Mission_Harvest (unit.cpp:2898)
+// ===========================================================================
+
+/// Harvester system: run the 5-state FSM for every harvester, in slot order.
+fn run_harvesters(world: &mut World) {
+    for handle in world.units.handles() {
+        let is_harv = world
+            .units
+            .get(handle)
+            .map(|u| u.is_harvester)
+            .unwrap_or(false);
+        if is_harv {
+            process_harvester(world, handle);
+        }
+    }
+}
+
+/// One harvester's FSM tick. Simplifications from the original, each documented
+/// at its site: adjacency docking (no `RADIO_HELLO`/`MISSION_ENTER` protocol),
+/// single all-at-once unload (no staged `Harvester_Dump_List`), gold/gem bail
+/// accounting collapsed to the original's bail model (`Credit_Load`).
+fn process_harvester(world: &mut World, handle: Handle) {
+    let (cell, house, mut hs, has_path) = match world.units.get(handle) {
+        Some(u) => (u.cell(), u.house, u.harvest, !u.path.is_empty()),
+        None => return,
+    };
+    let cap = world.catalog.econ.bail_count;
+    let dump_rate = world.catalog.econ.ore_dump_rate;
+
+    // No refinery for this house -> guard/idle (unit.cpp:2922).
+    if !house_has_refinery(world, house) {
+        hs.status = HarvStatus::Idle;
+        write_harvest(world, handle, hs);
+        return;
+    }
+
+    use HarvStatus::*;
+    match hs.status {
+        Idle => {
+            // Resume once the unit is no longer executing a manual order.
+            if !has_path {
+                hs.status = if hs.cargo >= cap { FindHome } else { Looking };
+            }
+        }
+        Looking => {
+            if hs.cargo >= cap {
+                hs.status = FindHome;
+            } else if has_path {
+                // En route to an ore patch; wait for arrival.
+            } else if world.ore.has_ore(cell) {
+                hs.status = Harvesting;
+                hs.timer = dump_rate;
+            } else {
+                // Find the nearest reachable ore and drive to it.
+                match nearest_reachable_ore(world, cell, world.catalog.econ.long_scan_cells) {
+                    Some((dest, path)) => set_path(world, handle, dest, path),
+                    None => {
+                        hs.status = if hs.cargo > 0 { FindHome } else { Idle };
+                    }
+                }
+            }
+        }
+        Harvesting => {
+            if !world.ore.has_ore(cell) {
+                hs.status = if hs.cargo >= cap { FindHome } else { Looking };
+            } else if hs.timer > 0 {
+                hs.timer -= 1;
+            } else {
+                hs.timer = dump_rate;
+                let want = (cap - hs.cargo).min(1); // one bail per step (unit.cpp:2412)
+                let lifted = world.ore.harvest(cell, want);
+                hs.cargo += lifted.bails;
+                if lifted.gem {
+                    hs.gems += lifted.bails;
+                } else {
+                    hs.gold += lifted.bails;
+                }
+                if hs.cargo >= cap {
+                    hs.status = FindHome;
+                } else if !world.ore.has_ore(cell) {
+                    hs.status = Looking;
+                }
+            }
+        }
+        FindHome => match nearest_refinery(world, house, cell) {
+            Some((refinery, dock, path)) => {
+                hs.home = Some(refinery);
+                set_path(world, handle, dock, path);
+                hs.status = HeadingHome;
+            }
+            None => hs.status = Idle,
+        },
+        HeadingHome => {
+            if has_path {
+                // Driving to the dock; wait.
+            } else {
+                // Arrived: are we adjacent to (or on the dock of) our refinery?
+                let docked = hs
+                    .home
+                    .and_then(|h| world.buildings.get(h))
+                    .map(|b| b.adjacent(cell) || b.covers(cell))
+                    .unwrap_or(false);
+                if docked {
+                    hs.status = Unloading;
+                    hs.timer = dump_rate;
+                } else {
+                    // Lost the dock (blocked/destroyed) — re-home.
+                    hs.status = FindHome;
+                }
+            }
+        }
+        Unloading => {
+            if hs.timer > 0 {
+                hs.timer -= 1;
+            } else {
+                let econ = world.catalog.econ;
+                let credits = hs.gold as i32 * econ.gold_value + hs.gems as i32 * econ.gem_value;
+                if let Some(hh) = world.houses.get_mut(house as usize) {
+                    hh.credits += credits;
+                }
+                hs.cargo = 0;
+                hs.gold = 0;
+                hs.gems = 0;
+                hs.home = None;
+                hs.status = Looking;
+            }
+        }
+    }
+
+    write_harvest(world, handle, hs);
+}
+
+/// Persist a harvester's FSM state onto its unit.
+fn write_harvest(world: &mut World, handle: Handle, hs: crate::unit::HarvestState) {
+    if let Some(u) = world.units.get_mut(handle) {
+        u.harvest = hs;
+    }
+}
+
+/// Assign a movement path + destination to a unit (used by the harvest FSM).
+fn set_path(world: &mut World, handle: Handle, dest: CellCoord, path: Vec<CellCoord>) {
+    if let Some(u) = world.units.get_mut(handle) {
+        u.path = path;
+        u.dest = Some(dest);
+        u.target = None;
+    }
+}
+
+/// Whether `house` owns at least one live refinery.
+fn house_has_refinery(world: &World, house: u8) -> bool {
+    world
+        .buildings
+        .iter()
+        .any(|(_, b)| b.house == house && b.is_refinery && b.is_alive())
+}
+
+/// Find the nearest reachable ore cell within `max_cells` of `from`, returning
+/// it and the path to it. Candidates are considered nearest-first (octagonal
+/// `leptons_distance`, the sim's own metric); the first with a valid A* path
+/// wins. Attempts are capped so a fully walled-off cluster doesn't run A* over
+/// every ore cell in range.
+fn nearest_reachable_ore(
+    world: &World,
+    from: CellCoord,
+    max_cells: i32,
+) -> Option<(CellCoord, Vec<CellCoord>)> {
+    let mut candidates: Vec<(i32, CellCoord)> = Vec::new();
+    for dy in -max_cells..=max_cells {
+        for dx in -max_cells..=max_cells {
+            let c = CellCoord::new(from.x + dx, from.y + dy);
+            if world.ore.has_ore(c) && world.passable.is_passable(c) {
+                let d = leptons_distance(from.center(), c.center());
+                candidates.push((d, c));
+            }
+        }
+    }
+    candidates.sort_by(|a, b| a.0.cmp(&b.0).then(cell_key(a.1).cmp(&cell_key(b.1))));
+    for (_, c) in candidates.into_iter().take(16) {
+        if let Some(path) = find_path(&world.passable, from, c) {
+            return Some((c, path));
+        }
+    }
+    None
+}
+
+/// Find the nearest owned refinery, a free dock cell adjacent to it, and the
+/// path there. Prefers the cell south of the refinery centre (matching the free
+/// harvester's spawn placement, DIR_S), else any free adjacent cell.
+fn nearest_refinery(
+    world: &World,
+    house: u8,
+    from: CellCoord,
+) -> Option<(Handle, CellCoord, Vec<CellCoord>)> {
+    let mut refineries: Vec<(i32, Handle)> = world
+        .buildings
+        .iter()
+        .filter(|(_, b)| b.house == house && b.is_refinery && b.is_alive())
+        .map(|(h, b)| (leptons_distance(from.center(), b.center_cell().center()), h))
+        .collect();
+    refineries.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.index.cmp(&b.1.index)));
+    for (_, rhandle) in refineries {
+        let Some(b) = world.buildings.get(rhandle) else {
+            continue;
+        };
+        // Candidate docks: the whole 1-cell ring, south-centre first.
+        let mut docks: Vec<CellCoord> = Vec::new();
+        let center = b.center_cell();
+        docks.push(CellCoord::new(center.x, b.cell.y + b.foot_h as i32));
+        for x in (b.cell.x - 1)..=(b.cell.x + b.foot_w as i32) {
+            for y in (b.cell.y - 1)..=(b.cell.y + b.foot_h as i32) {
+                let c = CellCoord::new(x, y);
+                if b.adjacent(c) {
+                    docks.push(c);
+                }
+            }
+        }
+        for dock in docks {
+            if !world.passable.is_passable(dock) {
+                continue;
+            }
+            if let Some(path) = find_path(&world.passable, from, dock) {
+                return Some((rhandle, dock, path));
+            }
+        }
+    }
+    None
+}
+
+/// A stable linear key for a cell (deterministic tie-break).
+fn cell_key(c: CellCoord) -> i64 {
+    (c.y as i64) * 100000 + c.x as i64
 }
 
 /// Advance every moving unit along its path by up to its per-tick speed,
@@ -841,5 +1699,1035 @@ mod tests {
         let empty = w.state_hash();
         w.spawn_unit(0, 1, CellCoord::new(3, 3), Facing(0), 256, stats());
         assert_ne!(empty, w.state_hash());
+    }
+}
+
+/// M5 economy smoke tests — asset-free coverage that the new systems (deploy,
+/// production, placement, harvesting, power) actually run and stay deterministic.
+/// Full-fidelity coverage against real rules.ini is ra-tester's domain; these
+/// are the minimal "does it run + is it deterministic" checks the coder ships.
+#[cfg(test)]
+mod m5_tests {
+    use super::*;
+    use crate::catalog::{BuildingProto, Catalog, EconRules, UnitProto};
+    use crate::coords::{Facing, MAP_CELL_H, MAP_CELL_W};
+    use crate::house::{BuildItem, ProdKind};
+    use crate::ore::{OreField, OVERLAY_GOLD_FIRST};
+    use crate::unit::{HarvStatus, MoveStats};
+
+    // Building ids / unit-proto ids used by the test catalog.
+    const B_FACT: u32 = 0;
+    const B_POWR: u32 = 1;
+    const B_PROC: u32 = 2;
+    const B_WEAP: u32 = 3;
+    const B_PAD: u32 = 4; // 1x1 filler, for occupancy-blocking tests only
+    const U_HARV: u32 = 1;
+    const U_TANK: u32 = 2;
+
+    fn stats() -> MoveStats {
+        MoveStats {
+            max_speed: 40,
+            rot: 10,
+        }
+    }
+
+    /// A tiny catalog: FACT (construction yard), POWR (100 output), PROC
+    /// (refinery, −30 drain, spawns a free harvester) + MCV/HARV units. Costs are
+    /// small so build loops finish quickly.
+    fn catalog() -> Catalog {
+        let bproto = |name: &str,
+                      w: u8,
+                      h: u8,
+                      power: i32,
+                      cost: i32,
+                      prereq: Vec<u32>,
+                      cy: bool,
+                      refin: bool,
+                      wf: bool| BuildingProto {
+            name: name.to_string(),
+            foot_w: w,
+            foot_h: h,
+            max_health: 500,
+            armor: 0,
+            power,
+            cost,
+            prereq,
+            is_refinery: refin,
+            is_construction_yard: cy,
+            is_war_factory: wf,
+            free_harvester_unit: if refin { Some(U_HARV) } else { None },
+            sprite_id: 0,
+        };
+        let uproto =
+            |name: &str, harv: bool, deploys: Option<u32>, cost: i32, prereq: Vec<u32>| UnitProto {
+                name: name.to_string(),
+                sprite_id: if harv { 1 } else { 0 },
+                max_health: 400,
+                stats: stats(),
+                armor: 0,
+                weapon: None,
+                has_turret: false,
+                is_harvester: harv,
+                deploys_to: deploys,
+                cost,
+                prereq,
+            };
+        Catalog {
+            buildings: vec![
+                bproto("FACT", 3, 3, 0, 100, vec![], true, false, false),
+                bproto("POWR", 2, 2, 100, 30, vec![B_FACT], false, false, false),
+                bproto("PROC", 3, 3, -30, 50, vec![B_POWR], false, true, false),
+                bproto("WEAP", 3, 3, -20, 60, vec![B_POWR], false, false, true),
+                bproto("PAD", 1, 1, 0, 10, vec![], false, false, false),
+            ],
+            units: vec![
+                uproto("MCV", false, Some(B_FACT), 100, vec![]),
+                uproto("HARV", true, None, 140, vec![]),
+                uproto("TANK", false, None, 80, vec![B_WEAP]),
+            ],
+            econ: EconRules::default(),
+        }
+    }
+
+    fn econ_world(credits: i32) -> World {
+        let mut w = World::new(Passability::all_passable(), 0x51ee_d123);
+        w.set_catalog(catalog());
+        w.init_houses(3, credits);
+        w
+    }
+
+    #[test]
+    fn deploy_mcv_creates_construction_yard_and_occupies_cells() {
+        let mut w = econ_world(1000);
+        let mcv = w.spawn_unit(0, 1, CellCoord::new(20, 20), Facing(0), 400, stats());
+        assert!(w.passability().is_passable(CellCoord::new(20, 20)));
+        w.tick(&[Command::Deploy {
+            unit: mcv,
+            house: 1,
+        }]);
+        // The unit is gone; a 3x3 construction yard now stands centred on it.
+        assert!(!w.units.contains(mcv));
+        assert_eq!(w.buildings.len(), 1);
+        let (_, b) = w.buildings.iter().next().unwrap();
+        assert!(b.is_construction_yard);
+        assert_eq!(b.cell, CellCoord::new(19, 19)); // top-left = mcv - (1,1)
+                                                    // Footprint cells are now occupied (impassable to movers).
+        assert!(!w.passability().is_passable(CellCoord::new(20, 20)));
+        assert!(!w.passability().is_passable(CellCoord::new(21, 21)));
+        assert!(w.passability().is_passable(CellCoord::new(23, 23))); // outside
+                                                                      // The house owns one construction yard.
+        assert!(w.house(1).unwrap().owns_building(B_FACT));
+    }
+
+    #[test]
+    fn wrong_house_cannot_deploy() {
+        let mut w = econ_world(1000);
+        let mcv = w.spawn_unit(0, 1, CellCoord::new(20, 20), Facing(0), 400, stats());
+        w.tick(&[Command::Deploy {
+            unit: mcv,
+            house: 2,
+        }]); // not the owner
+        assert!(w.units.contains(mcv));
+        assert_eq!(w.buildings.len(), 0);
+    }
+
+    #[test]
+    fn build_and_place_power_plant_updates_power_and_prereqs() {
+        let mut w = econ_world(1000);
+        let mcv = w.spawn_unit(0, 1, CellCoord::new(20, 20), Facing(0), 400, stats());
+        w.tick(&[Command::Deploy {
+            unit: mcv,
+            house: 1,
+        }]);
+
+        // Prereq gate: PROC needs POWR, so it must be rejected up front.
+        w.tick(&[Command::StartProduction {
+            house: 1,
+            item: BuildItem::Building(B_PROC),
+        }]);
+        assert!(w.house(1).unwrap().building_prod.is_none());
+
+        // POWR is buildable (prereq FACT owned). Start it and run to completion.
+        w.tick(&[Command::StartProduction {
+            house: 1,
+            item: BuildItem::Building(B_POWR),
+        }]);
+        assert!(w.house(1).unwrap().building_prod.is_some());
+        let mut ready = false;
+        for _ in 0..500 {
+            w.tick(&[]);
+            if w.house(1).unwrap().ready_building == Some(B_POWR) {
+                ready = true;
+                break;
+            }
+        }
+        assert!(ready, "POWR never completed");
+        // Cost 30 was paid in installments.
+        assert_eq!(w.house_credits(1), 1000 - 30);
+
+        // Place it adjacent to the yard (proximity ok) and confirm power output.
+        w.tick(&[Command::PlaceBuilding {
+            house: 1,
+            building: B_POWR,
+            cell: CellCoord::new(22, 19),
+        }]);
+        assert!(w.house(1).unwrap().ready_building.is_none());
+        assert_eq!(w.house(1).unwrap().power_output, 100);
+        assert!(w.house(1).unwrap().owns_building(B_POWR));
+    }
+
+    #[test]
+    fn refinery_spawns_free_harvester_that_mines_and_banks_credits() {
+        let mut w = econ_world(0); // start broke — all credits must come from ore
+                                   // A patch of gold ore.
+        let total = 128 * 128;
+        let mut ov = vec![0xFFu8; total];
+        for y in 24..28 {
+            for x in 24..28 {
+                ov[y * 128 + x] = OVERLAY_GOLD_FIRST;
+            }
+        }
+        w.set_ore(OreField::from_overlay(128, 128, &ov));
+        // Place a refinery directly (skips production); it spawns nothing on its
+        // own, so also drop in a harvester next to it.
+        let refinery = w.spawn_building(B_PROC, 1, CellCoord::new(18, 18)).unwrap();
+        assert!(w.buildings.get(refinery).unwrap().is_refinery);
+        let harv = w.spawn_unit(1, 1, CellCoord::new(21, 22), Facing(0), 400, stats());
+        w.set_unit_harvester(harv, true);
+
+        // Run: the harvester should scan ore, mine, dock, unload, and bank credits.
+        let mut banked = false;
+        for _ in 0..4000 {
+            w.tick(&[]);
+            if w.house_credits(1) > 0 {
+                banked = true;
+                break;
+            }
+        }
+        assert!(banked, "harvester never banked any credits");
+        // Credits are whole gold bails × GoldValue.
+        assert_eq!(w.house_credits(1) % w.catalog.econ.gold_value, 0);
+    }
+
+    #[test]
+    fn economy_script_is_deterministic() {
+        let script = |w: &mut World| -> Vec<u64> {
+            let mcv = w.spawn_unit(0, 1, CellCoord::new(30, 30), Facing(0), 400, stats());
+            let mut hs = vec![w.tick(&[Command::Deploy {
+                unit: mcv,
+                house: 1,
+            }])];
+            hs.push(w.tick(&[Command::StartProduction {
+                house: 1,
+                item: BuildItem::Building(B_POWR),
+            }]));
+            for _ in 0..200 {
+                // Place POWR as soon as it is ready (deterministic tick).
+                if w.house(1).unwrap().ready_building == Some(B_POWR) {
+                    hs.push(w.tick(&[Command::PlaceBuilding {
+                        house: 1,
+                        building: B_POWR,
+                        cell: CellCoord::new(33, 29),
+                    }]));
+                } else {
+                    hs.push(w.tick(&[]));
+                }
+            }
+            hs
+        };
+        let mut a = econ_world(1000);
+        let mut b = econ_world(1000);
+        assert_eq!(script(&mut a), script(&mut b));
+        assert_eq!(a.state_hash(), b.state_hash());
+    }
+
+    #[test]
+    fn low_power_throttles_production_but_still_completes() {
+        // A house whose only building is a refinery (drain 30, no power source):
+        // Power_Fraction < 1, so production runs at the floored 1/2 rate but still
+        // finishes. Compare its build time against a full-power house.
+        let build_ticks = |low_power: bool| -> i32 {
+            let mut w = econ_world(1000);
+            // Give both a construction yard so POWR is buildable.
+            w.spawn_building(B_FACT, 1, CellCoord::new(40, 40)).unwrap();
+            if low_power {
+                // A refinery with no power plant => output 0 < drain 30.
+                w.spawn_building(B_PROC, 1, CellCoord::new(50, 50)).unwrap();
+                assert!(w.house(1).unwrap().low_power());
+            }
+            w.tick(&[Command::StartProduction {
+                house: 1,
+                item: BuildItem::Building(B_POWR),
+            }]);
+            let mut ticks = 1;
+            for _ in 0..2000 {
+                if w.house(1).unwrap().ready_building == Some(B_POWR) {
+                    break;
+                }
+                w.tick(&[]);
+                ticks += 1;
+            }
+            ticks
+        };
+        let full = build_ticks(false);
+        let low = build_ticks(true);
+        assert!(
+            low > full,
+            "low power ({low} ticks) should be slower than full power ({full} ticks)"
+        );
+        // Floored at 1/2 power => at most ~2x slower (plus a small rounding slack).
+        assert!(
+            low <= full * 2 + 4,
+            "low-power throttle exceeded the 1/2 floor"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // ra-tester additions below: harvester FSM edges, production edges,
+    // full-loop economy determinism (M5 coverage build-out).
+    // -----------------------------------------------------------------
+
+    /// A `World` with a custom passability grid instead of the default
+    /// all-passable 128×128 (for tests that need to control what's reachable).
+    fn econ_world_on(passable: Passability, credits: i32) -> World {
+        let mut w = World::new(passable, 0x51ee_d123);
+        w.set_catalog(catalog());
+        w.init_houses(3, credits);
+        w
+    }
+
+    // === Harvester FSM edges ===========================================
+
+    #[test]
+    fn harvester_with_no_refinery_stays_idle_and_never_panics() {
+        let mut w = econ_world(1000);
+        let h = w.spawn_unit(1, 1, CellCoord::new(40, 40), Facing(0), 400, stats());
+        w.set_unit_harvester(h, true);
+        for _ in 0..50 {
+            w.tick(&[]);
+            assert_eq!(
+                w.units.get(h).unwrap().harvest.status,
+                HarvStatus::Idle,
+                "no refinery anywhere -> the FSM must guard-idle forever, never panic"
+            );
+        }
+    }
+
+    #[test]
+    fn ore_exhausted_mid_harvest_falls_back_to_looking_then_completes_the_cycle() {
+        let mut w = econ_world(1000);
+        w.spawn_building(B_PROC, 1, CellCoord::new(10, 10)).unwrap();
+        // A single isolated ore bail, directly on the harvester's spawn cell.
+        let total = 128 * 128;
+        let mut ov = vec![0xFFu8; total];
+        let ore_cell = CellCoord::new(40, 40);
+        ov[(ore_cell.y * 128 + ore_cell.x) as usize] = OVERLAY_GOLD_FIRST;
+        w.set_ore(OreField::from_overlay(128, 128, &ov));
+        assert_eq!(w.ore.at(ore_cell).bails, 1); // isolated cell -> _adj[0] -> 1 bail
+
+        let h = w.spawn_unit(1, 1, ore_cell, Facing(0), 400, stats());
+        w.set_unit_harvester(h, true);
+
+        // Run until the single bail is lifted and the cell empties out from
+        // under the harvester mid-`Harvesting`.
+        let mut left_harvesting = false;
+        for _ in 0..50 {
+            w.tick(&[]);
+            let hs = w.units.get(h).unwrap().harvest;
+            if hs.status != HarvStatus::Harvesting && hs.cargo > 0 {
+                left_harvesting = true;
+                break;
+            }
+        }
+        assert!(
+            left_harvesting,
+            "harvester should leave Harvesting the instant its cell's ore hits zero"
+        );
+        assert!(!w.ore.has_ore(ore_cell));
+        assert_eq!(w.units.get(h).unwrap().harvest.cargo, 1);
+
+        // With nowhere else to mine (cargo < capacity), the FSM must still
+        // route home on what it already has, not get stuck re-scanning for
+        // ore that no longer exists anywhere on the map.
+        let mut banked = false;
+        for _ in 0..2000 {
+            w.tick(&[]);
+            if w.house_credits(1) > 1000 {
+                banked = true;
+                break;
+            }
+        }
+        assert!(
+            banked,
+            "a partially-loaded harvester with no ore left anywhere should still complete a home cycle"
+        );
+    }
+
+    #[test]
+    fn refinery_removed_while_en_route_forces_idle_without_panic() {
+        // Buildings have no despawn/occupancy-clear path in this milestone
+        // (confirmed: nothing outside `World::spawn_building` ever calls
+        // `Passability::set_occupied`, and there is no `Command` or public
+        // `World` method that removes a building) — reported to ra-coder as
+        // a structural gap. This test simulates "destroyed" the only way
+        // available: removing the arena entry directly, which is exactly
+        // what `house_has_refinery`/`nearest_refinery` check (they iterate
+        // `world.buildings`, not the occupancy grid), so it is a faithful
+        // probe of the FSM's reaction even though no in-game action can
+        // trigger it yet.
+        let mut w = econ_world(1000);
+        let refinery = w.spawn_building(B_PROC, 1, CellCoord::new(60, 60)).unwrap();
+        let h = w.spawn_unit(1, 1, CellCoord::new(10, 10), Facing(0), 400, stats());
+        w.set_unit_harvester(h, true);
+        w.units.get_mut(h).unwrap().harvest.cargo = w.catalog.econ.bail_count; // already "full"
+
+        w.tick(&[]); // Looking(full) -> FindHome
+        w.tick(&[]); // FindHome -> HeadingHome, path assigned
+        w.tick(&[]); // genuinely en route
+        assert_eq!(
+            w.units.get(h).unwrap().harvest.status,
+            HarvStatus::HeadingHome
+        );
+        assert!(
+            w.units.get(h).unwrap().is_moving(),
+            "test setup: should be genuinely en route before the refinery vanishes"
+        );
+
+        w.buildings.remove(refinery);
+
+        for _ in 0..30 {
+            w.tick(&[]);
+            assert_eq!(
+                w.units.get(h).unwrap().harvest.status,
+                HarvStatus::Idle,
+                "with the refinery gone mid-route, the FSM must guard-idle, not panic or chase a stale home"
+            );
+        }
+    }
+
+    #[test]
+    fn refinery_removed_while_unloading_drops_the_pending_credit_and_goes_idle() {
+        // Same caveat as the en-route test above about how "destroyed" is
+        // simulated here. This one surfaces a real, documentable behavior:
+        // the no-refinery guard clause runs *before* the state match every
+        // tick, so it preempts `Unloading`'s own payout even one tick before
+        // it would have fired — the cargo's credit value is silently lost,
+        // and the harvester is left idle holding cargo it can never bank
+        // (there is no other refinery to re-home to). Worth a design call
+        // from ra-coder: original RA's harvester behavior on a
+        // destroyed-while-docked refinery is a `QUIRKS.md` candidate either
+        // way (DESIGN.md §5).
+        let mut w = econ_world(1000);
+        let refinery = w.spawn_building(B_PROC, 1, CellCoord::new(60, 60)).unwrap();
+        let dock = CellCoord::new(61, 63); // refinery's preferred south dock (centre x, tl.y+h)
+        let h = w.spawn_unit(1, 1, dock, Facing(0), 400, stats());
+        w.set_unit_harvester(h, true);
+        {
+            let u = w.units.get_mut(h).unwrap();
+            u.harvest.cargo = 10;
+            u.harvest.gold = 10;
+            u.harvest.status = HarvStatus::Unloading;
+            u.harvest.timer = 5; // mid-countdown: hasn't paid out yet
+            u.harvest.home = Some(refinery);
+        }
+        let credits_before = w.house_credits(1);
+
+        w.buildings.remove(refinery);
+        w.tick(&[]);
+
+        assert_eq!(
+            w.units.get(h).unwrap().harvest.status,
+            HarvStatus::Idle,
+            "the no-refinery guard fires before the Unloading arm even runs"
+        );
+        assert_eq!(
+            w.house_credits(1),
+            credits_before,
+            "documented edge case: cargo pending payout at the instant of destruction is lost, \
+             not credited"
+        );
+        assert_eq!(
+            w.units.get(h).unwrap().harvest.cargo,
+            10,
+            "cargo is not cleared either -- the unit sits idle holding it forever (no other refinery)"
+        );
+    }
+
+    #[test]
+    fn two_harvesters_share_one_refinery_without_deadlock() {
+        let mut w = econ_world(1000);
+        w.spawn_building(B_PROC, 1, CellCoord::new(40, 40)).unwrap();
+        // A generous ore patch so both harvesters always have somewhere to mine.
+        let total = 128 * 128;
+        let mut ov = vec![0xFFu8; total];
+        for y in 44..50 {
+            for x in 44..50 {
+                ov[y * 128 + x] = OVERLAY_GOLD_FIRST;
+            }
+        }
+        w.set_ore(OreField::from_overlay(128, 128, &ov));
+
+        let h1 = w.spawn_unit(1, 1, CellCoord::new(36, 44), Facing(0), 400, stats());
+        w.set_unit_harvester(h1, true);
+        let h2 = w.spawn_unit(1, 1, CellCoord::new(36, 46), Facing(0), 400, stats());
+        w.set_unit_harvester(h2, true);
+
+        // A dead-locked pair would show one or both harvesters permanently
+        // stuck carrying cargo that never reaches zero again; track each
+        // one's cargo independently and count every drop-to-zero (an
+        // unload completing) over a generous tick budget.
+        let mut unloads = [0u32; 2];
+        let mut prev_cargo = [0u16; 2];
+        for _ in 0..6000 {
+            w.tick(&[]);
+            for (i, h) in [h1, h2].iter().enumerate() {
+                let cargo = w.units.get(*h).unwrap().harvest.cargo;
+                if prev_cargo[i] > 0 && cargo == 0 {
+                    unloads[i] += 1;
+                }
+                prev_cargo[i] = cargo;
+            }
+        }
+        assert!(
+            unloads[0] >= 1,
+            "harvester 1 should have completed at least one full unload cycle"
+        );
+        assert!(
+            unloads[1] >= 1,
+            "harvester 2 should have completed at least one full unload cycle"
+        );
+    }
+
+    #[test]
+    fn harvester_full_with_zero_ore_on_map_still_finds_home_and_unloads() {
+        let mut w = econ_world(1000); // default OreField is empty -- no ore anywhere
+        w.spawn_building(B_PROC, 1, CellCoord::new(50, 50)).unwrap();
+        let h = w.spawn_unit(1, 1, CellCoord::new(20, 20), Facing(0), 400, stats());
+        w.set_unit_harvester(h, true);
+        {
+            let u = w.units.get_mut(h).unwrap();
+            u.harvest.cargo = w.catalog.econ.bail_count;
+            u.harvest.gold = w.catalog.econ.bail_count;
+        }
+        let mut banked = false;
+        for _ in 0..3000 {
+            w.tick(&[]);
+            if w.house_credits(1) > 1000 {
+                banked = true;
+                break;
+            }
+        }
+        assert!(
+            banked,
+            "a full harvester with no ore left anywhere must still route home and unload -- \
+             `Looking`'s cargo>=capacity check must win over its ore-scan, not the other way round"
+        );
+    }
+
+    // === Production edges ==============================================
+
+    #[test]
+    fn insufficient_funds_stalls_progress_and_credits_never_go_negative() {
+        let mut w = econ_world(1000);
+        w.spawn_building(B_FACT, 1, CellCoord::new(30, 30)).unwrap();
+        w.tick(&[Command::StartProduction {
+            house: 1,
+            item: BuildItem::Building(B_POWR),
+        }]);
+        for _ in 0..3 {
+            w.tick(&[]);
+        }
+        let progress_before_broke = w.house(1).unwrap().building_prod.unwrap().progress;
+        assert!(
+            progress_before_broke > 0,
+            "test setup: expected some progress first"
+        );
+
+        w.set_house_credits(1, 0);
+        for _ in 0..20 {
+            w.tick(&[]);
+            assert!(
+                w.house_credits(1) >= 0,
+                "credits must never go negative under a stalled installment"
+            );
+        }
+        let progress_after_broke = w.house(1).unwrap().building_prod.unwrap().progress;
+        assert_eq!(
+            progress_after_broke, progress_before_broke,
+            "production must stall (zero further progress) while credits are exhausted"
+        );
+
+        // Refund the treasury: production must resume and finish.
+        w.set_house_credits(1, 1000);
+        let mut ready = false;
+        for _ in 0..500 {
+            w.tick(&[]);
+            if w.house(1).unwrap().ready_building == Some(B_POWR) {
+                ready = true;
+                break;
+            }
+        }
+        assert!(
+            ready,
+            "production should resume and finish once funded again"
+        );
+    }
+
+    #[test]
+    fn cancel_mid_build_refunds_exactly_what_was_spent() {
+        let mut w = econ_world(1000);
+        w.spawn_building(B_FACT, 1, CellCoord::new(30, 30)).unwrap();
+        w.tick(&[Command::StartProduction {
+            house: 1,
+            item: BuildItem::Building(B_POWR),
+        }]);
+        for _ in 0..5 {
+            w.tick(&[]);
+        }
+        let spent = w.house(1).unwrap().building_prod.unwrap().spent;
+        assert!(
+            spent > 0,
+            "test setup: expected some spend before cancelling"
+        );
+        let credits_before_cancel = w.house_credits(1);
+
+        w.tick(&[Command::CancelProduction {
+            house: 1,
+            kind: ProdKind::Building,
+        }]);
+
+        assert!(w.house(1).unwrap().building_prod.is_none());
+        assert_eq!(
+            w.house_credits(1),
+            credits_before_cancel + spent,
+            "cancel must refund exactly the installments spent so far -- no more, no less"
+        );
+    }
+
+    #[test]
+    fn double_start_same_lane_is_rejected() {
+        // Two identical houses: one gets a hijack attempt on its busy lane
+        // every tick, the other never does. If the hijack were accepted (or
+        // silently spent anything extra), the two would diverge.
+        let mut w = econ_world(1000);
+        w.spawn_building(B_FACT, 1, CellCoord::new(30, 30)).unwrap();
+        w.spawn_building(B_FACT, 2, CellCoord::new(60, 60)).unwrap();
+        w.tick(&[
+            Command::StartProduction {
+                house: 1,
+                item: BuildItem::Building(B_POWR),
+            },
+            Command::StartProduction {
+                house: 2,
+                item: BuildItem::Building(B_POWR),
+            },
+        ]);
+        assert_eq!(
+            w.house(1).unwrap().building_prod.unwrap().item,
+            BuildItem::Building(B_POWR)
+        );
+
+        // POWR (cost 30) takes ~27 ticks to finish; stay well short of that so
+        // the lane is still busy (not yet moved to `ready_building`) for
+        // every iteration below.
+        for _ in 0..20 {
+            w.tick(&[Command::StartProduction {
+                house: 1,
+                item: BuildItem::Building(B_FACT), // hijack attempt, every tick
+            }]);
+            // House 2 is the control: same production, no hijack attempts.
+            let h1 = w.house(1).unwrap().building_prod.unwrap();
+            assert_eq!(
+                h1.item,
+                BuildItem::Building(B_POWR),
+                "a busy lane must reject a second StartProduction outright"
+            );
+        }
+        let h1_final = w.house(1).unwrap();
+        let h2_final = w.house(2).unwrap();
+        assert_eq!(
+            (h1_final.credits, h1_final.building_prod.map(|p| p.spent)),
+            (h2_final.credits, h2_final.building_prod.map(|p| p.spent)),
+            "the hijacked house must track the control house exactly -- \
+             repeated rejected StartProductions must never spend anything extra"
+        );
+    }
+
+    #[test]
+    fn war_factory_exit_fully_blocked_completes_but_never_spawns_without_panic() {
+        // A 3x3 grid exactly matching WEAP's 3x3 footprint: every ring cell
+        // `find_factory_exit` scans (the 1-cell border around the footprint)
+        // is off-grid, so no exit ever exists -- permanently. (A genuine
+        // dynamic block-then-unblock isn't constructible with today's API:
+        // see the "no despawn/occupancy-clear path" note on the refinery
+        // removal tests above; `war_factory_exit_partially_blocked_...`
+        // below covers the "still finds a free cell" half instead.)
+        let grid = Passability::new(3, 3, vec![true; 9]);
+        let mut w = econ_world_on(grid, 1000);
+        let weap = w.spawn_building(B_WEAP, 1, CellCoord::new(0, 0)).unwrap();
+        assert!(w.buildings.get(weap).unwrap().is_war_factory);
+
+        w.tick(&[Command::StartProduction {
+            house: 1,
+            item: BuildItem::Unit(U_TANK),
+        }]);
+        assert!(w.house(1).unwrap().unit_prod.is_some());
+
+        for _ in 0..3000 {
+            w.tick(&[]);
+        }
+        let prod = w.house(1).unwrap().unit_prod;
+        assert!(
+            prod.is_some(),
+            "the lane should still hold the completed-but-stuck production, not vanish"
+        );
+        assert!(
+            prod.unwrap().done,
+            "production should have finished paying for itself"
+        );
+        assert_eq!(
+            prod.unwrap().spent,
+            prod.unwrap().cost,
+            "cost is fully paid even though the unit never spawns"
+        );
+        assert_eq!(
+            w.units.len(),
+            0,
+            "a permanently walled-in exit must never spawn the unit"
+        );
+    }
+
+    #[test]
+    fn war_factory_exit_partially_blocked_still_finds_the_free_ring_cell() {
+        let mut w = econ_world(1000);
+        let weap = w.spawn_building(B_WEAP, 1, CellCoord::new(50, 50)).unwrap();
+        let (tl, fw, fh) = {
+            let b = w.buildings.get(weap).unwrap();
+            (b.cell, b.foot_w as i32, b.foot_h as i32)
+        };
+        // Block every ring cell except one corner, (tl.x-1, tl.y-1), with 1x1
+        // filler buildings placed directly (bypassing production).
+        let free = CellCoord::new(tl.x - 1, tl.y - 1);
+        for x in (tl.x - 1)..=(tl.x + fw) {
+            for y in (tl.y - 1)..=(tl.y + fh) {
+                let c = CellCoord::new(x, y);
+                let on_ring = x == tl.x - 1 || x == tl.x + fw || y == tl.y - 1 || y == tl.y + fh;
+                if on_ring && c != free {
+                    w.spawn_building(B_PAD, 1, c).unwrap();
+                }
+            }
+        }
+
+        w.tick(&[Command::StartProduction {
+            house: 1,
+            item: BuildItem::Unit(U_TANK),
+        }]);
+        let mut spawned = false;
+        for _ in 0..3000 {
+            w.tick(&[]);
+            if !w.units.is_empty() {
+                spawned = true;
+                break;
+            }
+        }
+        assert!(
+            spawned,
+            "the one remaining free ring cell should still be found and used"
+        );
+        let (_, u) = w.units.iter().next().unwrap();
+        assert_eq!(
+            u.cell(),
+            free,
+            "should exit at the sole unblocked ring cell"
+        );
+    }
+
+    #[test]
+    fn place_building_validation_rejects_bad_spots_and_accepts_valid_ones() {
+        let mut w = econ_world(1000);
+        let mcv = w.spawn_unit(0, 1, CellCoord::new(20, 20), Facing(0), 400, stats());
+        w.tick(&[Command::Deploy {
+            unit: mcv,
+            house: 1,
+        }]);
+        assert_eq!(w.buildings.len(), 1); // FACT at (19,19)-(21,21)
+
+        // Fabricate a ready POWR directly, isolating placement validation
+        // from the production system (already covered elsewhere).
+        w.houses[1].ready_building = Some(B_POWR);
+        let before = w.house_credits(1);
+
+        // Off-map: negative, and past the grid's far edge.
+        w.tick(&[Command::PlaceBuilding {
+            house: 1,
+            building: B_POWR,
+            cell: CellCoord::new(-1, -1),
+        }]);
+        assert_eq!(
+            w.house(1).unwrap().ready_building,
+            Some(B_POWR),
+            "negative-coordinate placement must be rejected"
+        );
+        w.tick(&[Command::PlaceBuilding {
+            house: 1,
+            building: B_POWR,
+            cell: CellCoord::new(MAP_CELL_W, MAP_CELL_H),
+        }]);
+        assert_eq!(
+            w.house(1).unwrap().ready_building,
+            Some(B_POWR),
+            "past-the-far-edge placement must be rejected"
+        );
+        assert_eq!(w.buildings.len(), 1);
+
+        // On occupied ground: right on top of the construction yard.
+        w.tick(&[Command::PlaceBuilding {
+            house: 1,
+            building: B_POWR,
+            cell: CellCoord::new(19, 19),
+        }]);
+        assert_eq!(
+            w.house(1).unwrap().ready_building,
+            Some(B_POWR),
+            "overlapping an existing footprint must be rejected"
+        );
+        assert_eq!(w.buildings.len(), 1);
+
+        // Non-adjacent: clear, on-map ground far from any owned building.
+        w.tick(&[Command::PlaceBuilding {
+            house: 1,
+            building: B_POWR,
+            cell: CellCoord::new(90, 90),
+        }]);
+        assert_eq!(
+            w.house(1).unwrap().ready_building,
+            Some(B_POWR),
+            "non-adjacent placement must be rejected by the proximity rule"
+        );
+        assert_eq!(w.buildings.len(), 1);
+
+        // Valid: adjacent to the yard, on clear ground.
+        w.tick(&[Command::PlaceBuilding {
+            house: 1,
+            building: B_POWR,
+            cell: CellCoord::new(22, 19),
+        }]);
+        assert_eq!(
+            w.house(1).unwrap().ready_building,
+            None,
+            "a valid adjacent placement must be accepted"
+        );
+        assert_eq!(w.buildings.len(), 2);
+        assert_eq!(
+            w.house_credits(1),
+            before,
+            "placement itself charges nothing extra (cost was already paid in installments)"
+        );
+    }
+
+    // === Full-loop economy determinism (item 3) ========================
+
+    /// Deploy an MCV, build+place POWR then PROC (spawns a free harvester
+    /// that mines and banks at least once), build+place WEAP, then produce a
+    /// TANK -- recording every tick's hash plus a sparse `(tick, commands)`
+    /// log of only the ticks that actually issued a command. All decisions
+    /// (when to place, when to start the next item) are made from
+    /// deterministic world state alone, so this is safe to call repeatedly
+    /// and expect byte-identical results.
+    fn run_full_econ_script(mut w: World) -> (Vec<u64>, Vec<(u32, Vec<Command>)>) {
+        let mcv = w.spawn_unit(0, 1, CellCoord::new(30, 30), Facing(0), 400, stats());
+        let mut hashes = Vec::new();
+        let mut log: Vec<(u32, Vec<Command>)> = Vec::new();
+        let mut step = |w: &mut World, cmds: Vec<Command>| {
+            let t = w.tick_count();
+            let h = w.tick(&cmds);
+            hashes.push(h);
+            if !cmds.is_empty() {
+                log.push((t, cmds));
+            }
+        };
+
+        step(
+            &mut w,
+            vec![Command::Deploy {
+                unit: mcv,
+                house: 1,
+            }],
+        );
+        step(
+            &mut w,
+            vec![Command::StartProduction {
+                house: 1,
+                item: BuildItem::Building(B_POWR),
+            }],
+        );
+        for _ in 0..300 {
+            if w.house(1).unwrap().ready_building == Some(B_POWR) {
+                step(
+                    &mut w,
+                    vec![Command::PlaceBuilding {
+                        house: 1,
+                        building: B_POWR,
+                        cell: CellCoord::new(32, 29),
+                    }],
+                );
+                break;
+            }
+            step(&mut w, vec![]);
+        }
+        assert!(
+            w.house(1).unwrap().owns_building(B_POWR),
+            "setup: POWR should be placed"
+        );
+
+        step(
+            &mut w,
+            vec![Command::StartProduction {
+                house: 1,
+                item: BuildItem::Building(B_PROC),
+            }],
+        );
+        for _ in 0..300 {
+            if w.house(1).unwrap().ready_building == Some(B_PROC) {
+                step(
+                    &mut w,
+                    vec![Command::PlaceBuilding {
+                        house: 1,
+                        building: B_PROC,
+                        cell: CellCoord::new(29, 32),
+                    }],
+                );
+                break;
+            }
+            step(&mut w, vec![]);
+        }
+        assert!(
+            w.house(1).unwrap().owns_building(B_PROC),
+            "setup: PROC should be placed"
+        );
+
+        let credits_before_harvest = w.house_credits(1);
+        for _ in 0..3000 {
+            if w.house_credits(1) > credits_before_harvest {
+                break;
+            }
+            step(&mut w, vec![]);
+        }
+        assert!(
+            w.house_credits(1) > credits_before_harvest,
+            "setup: the free harvester should have banked something"
+        );
+
+        step(
+            &mut w,
+            vec![Command::StartProduction {
+                house: 1,
+                item: BuildItem::Building(B_WEAP),
+            }],
+        );
+        for _ in 0..300 {
+            if w.house(1).unwrap().ready_building == Some(B_WEAP) {
+                step(
+                    &mut w,
+                    vec![Command::PlaceBuilding {
+                        house: 1,
+                        building: B_WEAP,
+                        cell: CellCoord::new(34, 29),
+                    }],
+                );
+                break;
+            }
+            step(&mut w, vec![]);
+        }
+        assert!(
+            w.house(1).unwrap().owns_building(B_WEAP),
+            "setup: WEAP should be placed"
+        );
+
+        step(
+            &mut w,
+            vec![Command::StartProduction {
+                house: 1,
+                item: BuildItem::Unit(U_TANK),
+            }],
+        );
+        let units_before = w.units.len();
+        for _ in 0..300 {
+            if w.units.len() > units_before {
+                break;
+            }
+            step(&mut w, vec![]);
+        }
+        assert!(
+            w.units.len() > units_before,
+            "setup: TANK should have spawned"
+        );
+
+        // Economy-only, no combat: the sim RNG must never be consumed. This
+        // guards the invariant M6's ore-growth work (which the ore module's
+        // own docs flag as RNG-consuming) will change on purpose.
+        assert_eq!(
+            w.rng_seed(),
+            0x51ee_d123,
+            "an economy-only script must never draw the sim RNG"
+        );
+
+        (hashes, log)
+    }
+
+    fn econ_script_world() -> World {
+        let mut w = econ_world(2000);
+        let total = 128 * 128;
+        let mut ov = vec![0xFFu8; total];
+        for y in 34..38 {
+            for x in 34..38 {
+                ov[y * 128 + x] = OVERLAY_GOLD_FIRST;
+            }
+        }
+        w.set_ore(OreField::from_overlay(128, 128, &ov));
+        w
+    }
+
+    #[test]
+    fn full_economy_loop_same_seed_twice_gives_identical_hash_chains() {
+        let (hashes_a, log_a) = run_full_econ_script(econ_script_world());
+        let (hashes_b, log_b) = run_full_econ_script(econ_script_world());
+        assert_eq!(
+            hashes_a, hashes_b,
+            "two independent runs of the identical full economy script must match tick-for-tick"
+        );
+        assert_eq!(log_a, log_b, "the same decisions must be made both times");
+    }
+
+    #[test]
+    fn full_economy_loop_command_log_replay_matches_live_run() {
+        let (live_hashes, log) = run_full_econ_script(econ_script_world());
+
+        // Replay: feed exactly the recorded (tick, commands) pairs -- no
+        // re-deciding anything from live state -- to a fresh world and
+        // confirm the hash chain matches tick-for-tick.
+        let mut replay = econ_script_world();
+        let _mcv = replay.spawn_unit(0, 1, CellCoord::new(30, 30), Facing(0), 400, stats());
+        let mut replay_hashes = Vec::with_capacity(live_hashes.len());
+        let mut li = 0usize;
+        for t in 0..live_hashes.len() as u32 {
+            let cmds: Vec<Command> = if li < log.len() && log[li].0 == t {
+                let c = log[li].1.clone();
+                li += 1;
+                c
+            } else {
+                Vec::new()
+            };
+            replay_hashes.push(replay.tick(&cmds));
+        }
+        assert_eq!(
+            li,
+            log.len(),
+            "replay should have consumed the whole recorded log"
+        );
+        assert_eq!(
+            live_hashes, replay_hashes,
+            "command-log replay must reproduce the live run's hash chain exactly"
+        );
     }
 }

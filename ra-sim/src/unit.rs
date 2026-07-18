@@ -4,9 +4,78 @@
 //! arena. All state is fixed-point / integer so the whole struct hashes
 //! bit-identically (§4.2).
 
+use crate::arena::Handle;
 use crate::combat::{Target, WeaponProfile};
 use crate::coords::{CellCoord, Facing, WorldCoord};
 use crate::hash::Fnv1a;
+
+/// The 5-state harvester mission FSM, ported from `UnitClass::Mission_Harvest`
+/// (`unit.cpp:2898`): scan for ore, drive to it, harvest until full, find a
+/// refinery, dock, and unload. `Idle` is the guard state the original drops into
+/// when there is no refinery or no ore (`unit.cpp:2922`, `:2975`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HarvStatus {
+    /// LOOKING: seek the nearest ore field and drive toward it.
+    Looking,
+    /// HARVESTING: lift bails from the current ore cell until full/exhausted.
+    Harvesting,
+    /// FINDHOME: pick the nearest owned refinery and route to its dock cell.
+    FindHome,
+    /// HEADINGHOME: driving to the refinery dock.
+    HeadingHome,
+    /// UNLOADING: at the dock, cashing the cargo in.
+    Unloading,
+    /// Guard/idle (no refinery, or no reachable ore).
+    Idle,
+}
+
+/// The harvester's working state (only meaningful when [`Unit::is_harvester`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HarvestState {
+    /// Current FSM state.
+    pub status: HarvStatus,
+    /// Bails currently carried (0..=`bail_count`).
+    pub cargo: u16,
+    /// Gold bails carried (books at `GoldValue` on unload).
+    pub gold: u16,
+    /// Gem bails carried (books at `GemValue` on unload).
+    pub gems: u16,
+    /// Countdown between harvest/unload steps (`OreDumpRate` cadence).
+    pub timer: u16,
+    /// The refinery being docked at, if any.
+    pub home: Option<Handle>,
+}
+
+impl Default for HarvestState {
+    fn default() -> HarvestState {
+        HarvestState {
+            status: HarvStatus::Looking,
+            cargo: 0,
+            gold: 0,
+            gems: 0,
+            timer: 0,
+            home: None,
+        }
+    }
+}
+
+impl HarvestState {
+    fn hash_into(&self, h: &mut Fnv1a) {
+        h.write_u8(self.status as u8);
+        h.write_u16(self.cargo);
+        h.write_u16(self.gold);
+        h.write_u16(self.gems);
+        h.write_u16(self.timer);
+        match self.home {
+            Some(handle) => {
+                h.write_u8(1);
+                h.write_u32(handle.index);
+                h.write_u32(handle.gen);
+            }
+            None => h.write_u8(0),
+        }
+    }
+}
 
 /// The immutable movement stats a unit carries, resolved from rules.ini at
 /// spawn time by `ra-data` (never hardcoded — DESIGN.md §3.8). Kept on the unit
@@ -63,6 +132,13 @@ pub struct Unit {
     pub target: Option<Target>,
     /// Rearm countdown in ticks (`Arm`): 0 = ready to fire, else counting down.
     pub arm: u16,
+
+    // --- Harvester capability (M5) ---
+    /// Whether this unit runs the harvest FSM (a named capability component,
+    /// DESIGN.md §3.8 — the sim never infers it from `type_id`).
+    pub is_harvester: bool,
+    /// Harvester working state (only meaningful when `is_harvester`).
+    pub harvest: HarvestState,
 }
 
 impl Unit {
@@ -91,7 +167,15 @@ impl Unit {
             turret_facing: facing,
             target: None,
             arm: 0,
+            is_harvester: false,
+            harvest: HarvestState::default(),
         }
+    }
+
+    /// Mark this unit as a harvester (drives the harvest FSM). Called by the
+    /// loader right after spawning, from the unit's [`crate::catalog::UnitProto`].
+    pub fn set_harvester(&mut self, is_harvester: bool) {
+        self.is_harvester = is_harvester;
     }
 
     /// Attach combat stats to a freshly-spawned unit (resolved from rules.ini by
@@ -186,6 +270,12 @@ impl Unit {
                 h.write_i32(c.x);
                 h.write_i32(c.y);
             }
+        }
+
+        // Harvester state.
+        h.write_u8(self.is_harvester as u8);
+        if self.is_harvester {
+            self.harvest.hash_into(h);
         }
     }
 }

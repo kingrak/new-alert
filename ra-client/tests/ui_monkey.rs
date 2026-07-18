@@ -212,6 +212,13 @@ fn apply_op_with_units(core: &mut AppCore, op: MonkeyOp, index: usize) {
             // M4: an attack order also carries the issuing unit + house; the same
             // liveness/ownership invariant applies.
             Command::Attack { unit, house, .. } => (unit, house),
+            // M5: deploy addresses a unit + house (same invariant); the
+            // production/placement commands do not address a unit, and the monkey
+            // never enables the sidebar so they cannot be emitted here anyway.
+            Command::Deploy { unit, house } => (unit, house),
+            Command::StartProduction { .. }
+            | Command::PlaceBuilding { .. }
+            | Command::CancelProduction { .. } => continue,
         };
         let owner = core.world().units.get(unit).unwrap_or_else(|| {
             panic!("drained {cmd:?} addresses a handle that isn't live in the world")
@@ -304,6 +311,10 @@ fn apply_op_with_armed_units(core: &mut AppCore, op: MonkeyOp, index: usize) {
             Command::Move { unit, house, .. } => (unit, house),
             Command::Stop { unit, house } => (unit, house),
             Command::Attack { unit, house, .. } => (unit, house),
+            Command::Deploy { unit, house } => (unit, house),
+            Command::StartProduction { .. }
+            | Command::PlaceBuilding { .. }
+            | Command::CancelProduction { .. } => continue,
         };
         let owner = core.world().units.get(unit).unwrap_or_else(|| {
             panic!("drained {cmd:?} addresses a handle that isn't live in the world")
@@ -360,5 +371,198 @@ proptest! {
     fn synthetic_monkey_with_armed_units_never_panics(ops in ops_strategy(200..800)) {
         let (mut core, _jeeps, _target) = support::synthetic_core_with_armed_units(0xA24E_D000);
         apply_ops_with_armed_units(&mut core, &ops);
+    }
+}
+
+// ---------------------------------------------------------------------
+// Econ/sidebar variant (M5, new): the units/armed-units variants above never
+// call `enable_sidebar`, so none of them can generate a sidebar-area click
+// or drive placement mode -- `StartProduction`/`PlaceBuilding`/
+// `CancelProduction` are structurally unreachable from any monkey run so
+// far (see the `continue` arms in `apply_op_with_units`/
+// `apply_op_with_armed_units` above). This variant closes that gap:
+// `support::synthetic_core_with_econ` has the sidebar enabled for house 1,
+// and the event strategy below adds `Key::Deploy` plus mouse coordinates
+// biased to land in the sidebar strip (not just the tactical area). A
+// deterministic prefix (deploy the MCV, start POWR) runs before the fuzzed
+// suffix so production has something to chew on within the tick budget --
+// otherwise "click a ready row" would depend on winning two separate
+// lotteries (randomly finish a multi-tick build *and* randomly click the
+// right pixel) before placement mode is ever reachable at all.
+// ---------------------------------------------------------------------
+
+/// Like [`key_strategy`] plus `Key::Deploy` (M5).
+fn econ_key_strategy() -> impl Strategy<Value = Key> {
+    prop_oneof![
+        Just(Key::Left),
+        Just(Key::Right),
+        Just(Key::Up),
+        Just(Key::Down),
+        Just(Key::Deploy),
+    ]
+}
+
+/// Like [`event_strategy`], but the mouse-position ranges are widened/biased
+/// so a meaningful fraction of `MouseDown`/`MouseUp`/`MouseMoved` events land
+/// inside the sidebar strip (`x >= tactical_width()`) rather than only the
+/// tactical area -- the general-purpose strategy's `x` range was sized for a
+/// map click, not a ~130px-wide UI panel off to the side of a much wider
+/// viewport.
+fn econ_event_strategy() -> impl Strategy<Value = InputEvent> {
+    prop_oneof![
+        3 => econ_key_strategy().prop_map(InputEvent::KeyDown),
+        3 => econ_key_strategy().prop_map(InputEvent::KeyUp),
+        3 => (-1000i32..=5000, -1000i32..=5000)
+            .prop_map(|(x, y)| InputEvent::MouseMoved { x, y }),
+        1 => Just(InputEvent::MouseLeft),
+        // General tactical-area-ish coordinates (as the other suites use)...
+        2 => (mouse_button_strategy(), -200i32..=1200, -200i32..=1200)
+            .prop_map(|(button, x, y)| InputEvent::MouseDown { button, x, y }),
+        2 => (mouse_button_strategy(), -200i32..=1200, -200i32..=1200)
+            .prop_map(|(button, x, y)| InputEvent::MouseUp { button, x, y }),
+        // ...plus a dedicated sidebar-biased range: x anchored past a small
+        // viewport's tactical width, y spanning the header + several rows
+        // (see `SIDEBAR_ROWS_TOP`/row height in `ui_scripted_drive.rs`).
+        3 => (mouse_button_strategy(), 400i32..=900, -20i32..=200)
+            .prop_map(|(button, x, y)| InputEvent::MouseDown { button, x, y }),
+        3 => (mouse_button_strategy(), 400i32..=900, -20i32..=200)
+            .prop_map(|(button, x, y)| InputEvent::MouseUp { button, x, y }),
+        // Deliberately bounded small, exactly like `event_strategy`'s Resize
+        // op above (this suite fuzzes sequencing, not allocation size/compose
+        // cost -- an early, much wider range here made this suite ~200x
+        // slower than its siblings for no extra sequencing coverage).
+        1 => (1u32..=200, 1u32..=200)
+            .prop_map(|(width, height)| InputEvent::Resize { width, height }),
+    ]
+}
+
+fn econ_op_strategy() -> impl Strategy<Value = MonkeyOp> {
+    prop_oneof![
+        5 => econ_event_strategy().prop_map(MonkeyOp::Event),
+        2 => (0u32..=20_000).prop_map(MonkeyOp::Update),
+    ]
+}
+
+fn econ_ops_strategy(len: std::ops::Range<usize>) -> impl Strategy<Value = Vec<MonkeyOp>> {
+    proptest::collection::vec(econ_op_strategy(), len)
+}
+
+/// Apply one op to the econ `core` and check: no panic (implicit); every
+/// drained command well-formed (live handle where one is addressed, `house`
+/// matches the real owner); every M5 command's house is exactly the
+/// controlled house 1 (there is no click path that can address house 2 --
+/// the sidebar/deploy/placement surface is unconditionally bound to
+/// `player_house`, so this is the "no command for enemy house" invariant);
+/// and `PlaceBuilding` never names a building type other than the one that
+/// was `ready_building` *before* this op ran (a `PlaceBuilding` can only be
+/// emitted from placement mode, which only `begin_placement` enters, which
+/// only `sidebar_click` calls, and only for a row already reporting
+/// `ready` -- "no placement without a completed building").
+fn apply_op_with_econ(core: &mut AppCore, op: MonkeyOp, index: usize) {
+    let ready_before = core.world().house(1).and_then(|h| h.ready_building);
+
+    match op {
+        MonkeyOp::Event(ev) => core.handle(ev),
+        MonkeyOp::Update(dt) => core.update(dt),
+    }
+
+    for cmd in core.drain_commands() {
+        match cmd {
+            Command::Move { unit, house, .. }
+            | Command::Stop { unit, house }
+            | Command::Attack { unit, house, .. }
+            | Command::Deploy { unit, house } => {
+                assert_eq!(
+                    house, 1,
+                    "drained {cmd:?} was not issued for the controlled house"
+                );
+                let owner = core.world().units.get(unit).unwrap_or_else(|| {
+                    panic!("drained {cmd:?} addresses a handle that isn't live in the world")
+                });
+                assert_eq!(house, owner.house);
+            }
+            Command::StartProduction { house, .. } | Command::CancelProduction { house, .. } => {
+                assert_eq!(
+                    house, 1,
+                    "drained {cmd:?} was not issued for the controlled house"
+                );
+            }
+            Command::PlaceBuilding {
+                house, building, ..
+            } => {
+                assert_eq!(
+                    house, 1,
+                    "drained {cmd:?} was not issued for the controlled house"
+                );
+                assert_eq!(
+                    Some(building),
+                    ready_before,
+                    "drained {cmd:?}, but building {building} was not the ready building \
+                     just before this op (ready was {ready_before:?}) -- placement without a \
+                     completed building"
+                );
+            }
+        }
+    }
+    if index.is_multiple_of(COMPOSE_EVERY) {
+        let frame = core.compose_camera();
+        let (vw, vh) = core.viewport_size();
+        assert_eq!(frame.width, vw);
+        assert_eq!(frame.height, vh);
+    }
+}
+
+/// Deterministic prefix: select + deploy the starter MCV, then start POWR
+/// production directly (bypassing sidebar-click luck) -- see the module docs
+/// above on why the fuzzed suffix alone can't reliably reach placement mode.
+fn econ_prefix(core: &mut AppCore) {
+    let mcv_cell = support::econ_mcv_cell();
+    const CELL_PIXELS: i32 = 24;
+    let (sx, sy) = (
+        mcv_cell.x * CELL_PIXELS + CELL_PIXELS / 2,
+        mcv_cell.y * CELL_PIXELS + CELL_PIXELS / 2,
+    );
+    core.handle(InputEvent::MouseDown {
+        button: MouseButton::Left,
+        x: sx,
+        y: sy,
+    });
+    core.handle(InputEvent::MouseUp {
+        button: MouseButton::Left,
+        x: sx,
+        y: sy,
+    });
+    core.handle(InputEvent::KeyDown(Key::Deploy));
+    core.handle(InputEvent::KeyUp(Key::Deploy));
+    for _ in 0..5 {
+        core.update(67);
+    }
+    core.drain_commands(); // the prefix's own commands are trusted by construction
+    core.start_production(ra_sim::BuildItem::Building(support::ECON_B_POWR));
+    core.drain_commands();
+}
+
+fn apply_ops_with_econ(core: &mut AppCore, ops: &[MonkeyOp]) {
+    core.handle(InputEvent::Resize {
+        width: 640,
+        height: 400,
+    });
+    econ_prefix(core);
+    for (i, &op) in ops.iter().enumerate() {
+        apply_op_with_econ(core, op, i);
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(64))]
+
+    /// Always-run: fuzzed event sequences (including sidebar-area clicks and
+    /// placement-mode drives) against the econ synthetic fixture. No panic,
+    /// every drained command well-formed and scoped to the controlled house,
+    /// and no placement without a completed building.
+    #[test]
+    fn synthetic_monkey_with_econ_never_panics(ops in econ_ops_strategy(200..800)) {
+        let (mut core, _mcv) = support::synthetic_core_with_econ(0xE58E_C0E1, 5000);
+        apply_ops_with_econ(&mut core, &ops);
     }
 }

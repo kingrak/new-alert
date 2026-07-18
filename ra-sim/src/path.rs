@@ -34,22 +34,38 @@ const NEIGHBORS: [(i32, i32, i32); 8] = [
     (-1, -1, DIAG_COST), // NW
 ];
 
-/// A read-only passability grid: `true` = a mover may occupy the cell.
+/// A passability grid with two layers (M5): a **static** terrain mask (water,
+/// cliffs — set once at load) and a **dynamic occupancy** mask that buildings
+/// stamp their footprint onto (DESIGN.md §3.7: "extend Passability to a dynamic
+/// occupancy layer distinct from static terrain"). A cell is drivable only when
+/// it is statically passable **and** not occupied.
+///
+/// The occupancy layer is a *cache* fully determined by the buildings arena
+/// (which is hashed), so it is not itself folded into the state hash — it is
+/// re-derivable from the hashed building placements, exactly like the static
+/// terrain mask.
 #[derive(Clone, Debug)]
 pub struct Passability {
     width: i32,
     height: i32,
+    /// Static terrain passability (`true` = drivable ground). Never mutated
+    /// after construction.
     cells: Vec<bool>,
+    /// Dynamic occupancy (`true` = a building footprint blocks this cell).
+    blocked: Vec<bool>,
 }
 
 impl Passability {
-    /// Build a grid from a row-major `width*height` passability mask.
+    /// Build a grid from a row-major `width*height` static passability mask,
+    /// with an empty (nothing-blocked) occupancy layer.
     pub fn new(width: i32, height: i32, cells: Vec<bool>) -> Passability {
         assert_eq!(cells.len(), (width * height) as usize);
+        let n = cells.len();
         Passability {
             width,
             height,
             cells,
+            blocked: vec![false; n],
         }
     }
 
@@ -72,12 +88,40 @@ impl Passability {
         self.height
     }
 
-    /// Whether `cell` is on-grid and passable.
+    /// Whether `cell` is on-grid.
+    fn in_bounds(&self, cell: CellCoord) -> bool {
+        cell.x >= 0 && cell.y >= 0 && cell.x < self.width && cell.y < self.height
+    }
+
+    /// Whether `cell` is on-grid and drivable **right now** (static terrain
+    /// passable and not occupied by a building). This is what pathfinding uses.
     pub fn is_passable(&self, cell: CellCoord) -> bool {
-        if cell.x < 0 || cell.y < 0 || cell.x >= self.width || cell.y >= self.height {
+        if !self.in_bounds(cell) {
             return false;
         }
-        self.cells[(cell.y * self.width + cell.x) as usize]
+        let i = (cell.y * self.width + cell.x) as usize;
+        self.cells[i] && !self.blocked[i]
+    }
+
+    /// Whether `cell`'s **static terrain** is passable, ignoring building
+    /// occupancy. Used by placement validation, which must judge the ground a
+    /// footprint would sit on, not whether the (not-yet-placed) building is
+    /// there. A footprint's own not-yet-placed cells are still "buildable".
+    pub fn is_static_passable(&self, cell: CellCoord) -> bool {
+        self.in_bounds(cell) && self.cells[(cell.y * self.width + cell.x) as usize]
+    }
+
+    /// Whether `cell` is currently occupied by a building footprint.
+    pub fn is_occupied(&self, cell: CellCoord) -> bool {
+        self.in_bounds(cell) && self.blocked[(cell.y * self.width + cell.x) as usize]
+    }
+
+    /// Stamp (or clear) a building's occupancy on `cell`. Off-grid cells are
+    /// ignored. Called by the sim when a building is placed or destroyed.
+    pub fn set_occupied(&mut self, cell: CellCoord, occupied: bool) {
+        if self.in_bounds(cell) {
+            self.blocked[(cell.y * self.width + cell.x) as usize] = occupied;
+        }
     }
 
     fn linear(&self, cell: CellCoord) -> u32 {

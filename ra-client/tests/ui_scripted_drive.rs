@@ -13,6 +13,8 @@
 
 mod support;
 
+use ra_client::appcore::AppCore;
+use ra_client::input::{InputEvent, Key, MouseButton};
 use ra_sim::coords::CellCoord;
 use ra_sim::Command;
 
@@ -567,4 +569,450 @@ fn real_battle_attack_kill_and_health_bar_rendering() {
         [0, 0, 0, 255],
         "post-death frame must no longer draw the real target's health bar"
     );
+}
+
+// ---------------------------------------------------------------------
+// M5 build-UI scripts (new): deploy via key event, sidebar clicks driving
+// production, click-to-place with footprint preview, and the selection
+// generational-handle regression (ra-coder's fix — pinned here).
+// All synthetic (no real assets needed): `support::synthetic_core_with_econ`.
+// ---------------------------------------------------------------------
+
+/// Row-geometry duplicated from `ra_client::appcore`'s private
+/// `sidebar_rows_top` (`font::GLYPH_H * 3 + 12`) — no public accessor, same
+/// rationale as this file's own `CELL_PIXELS` above.
+const SIDEBAR_ROWS_TOP: i32 = 7 * 3 + 12;
+
+/// Screen pixel at the centre of `cell` for a camera whose top-left (in map
+/// pixels) is `cam`.
+fn cell_center_screen(cam: (f32, f32), cell: CellCoord) -> (i32, i32) {
+    (
+        cell.x * CELL_PIXELS + CELL_PIXELS / 2 - cam.0 as i32,
+        cell.y * CELL_PIXELS + CELL_PIXELS / 2 - cam.1 as i32,
+    )
+}
+
+#[test]
+fn synthetic_deploy_via_key_event_creates_construction_yard() {
+    let (mut core, mcv) = support::synthetic_core_with_econ(0xE1E1_0001, 2000);
+    core.handle(InputEvent::Resize {
+        width: 900,
+        height: 600,
+    });
+    let mcv_cell = support::econ_mcv_cell();
+    let cam = (
+        (mcv_cell.x * CELL_PIXELS) as f32 - 300.0,
+        (mcv_cell.y * CELL_PIXELS) as f32 - 300.0,
+    );
+    core.set_camera(cam.0, cam.1);
+
+    let (sx, sy) = cell_center_screen(cam, mcv_cell);
+    core.handle(InputEvent::MouseDown {
+        button: MouseButton::Left,
+        x: sx,
+        y: sy,
+    });
+    core.handle(InputEvent::MouseUp {
+        button: MouseButton::Left,
+        x: sx,
+        y: sy,
+    });
+    assert_eq!(
+        core.selected_handles(),
+        vec![mcv],
+        "click should have selected exactly the MCV"
+    );
+
+    core.handle(InputEvent::KeyDown(Key::Deploy));
+    core.handle(InputEvent::KeyUp(Key::Deploy));
+    let emitted = core.drain_commands();
+    assert_eq!(
+        emitted.len(),
+        1,
+        "the Deploy key should emit exactly one command"
+    );
+    match emitted[0] {
+        Command::Deploy { unit, house } => {
+            assert_eq!(unit, mcv);
+            assert_eq!(house, 1);
+        }
+        other => panic!("expected Deploy, got {other:?}"),
+    }
+
+    for _ in 0..5 {
+        core.update(67);
+    }
+    assert!(
+        core.world()
+            .buildings
+            .iter()
+            .any(|(_, b)| b.house == 1 && b.is_construction_yard),
+        "a construction yard should exist once the Deploy command has been applied"
+    );
+    assert!(
+        !core.world().units.contains(mcv),
+        "the MCV unit should be gone, replaced by the yard"
+    );
+}
+
+#[test]
+fn synthetic_sidebar_click_starts_production_only_for_the_player_house_and_progress_advances() {
+    let (mut core, _mcv) = support::synthetic_core_with_econ(0xE1E1_0002, 2000);
+    core.handle(InputEvent::Resize {
+        width: 900,
+        height: 600,
+    });
+    let mcv_cell = support::econ_mcv_cell();
+    let cam = (
+        (mcv_cell.x * CELL_PIXELS) as f32 - 300.0,
+        (mcv_cell.y * CELL_PIXELS) as f32 - 300.0,
+    );
+    core.set_camera(cam.0, cam.1);
+
+    // Deploy first: POWR needs the construction yard as a prerequisite.
+    let (sx, sy) = cell_center_screen(cam, mcv_cell);
+    core.handle(InputEvent::MouseDown {
+        button: MouseButton::Left,
+        x: sx,
+        y: sy,
+    });
+    core.handle(InputEvent::MouseUp {
+        button: MouseButton::Left,
+        x: sx,
+        y: sy,
+    });
+    core.handle(InputEvent::KeyDown(Key::Deploy));
+    core.handle(InputEvent::KeyUp(Key::Deploy));
+    for _ in 0..5 {
+        core.update(67);
+    }
+    assert!(core
+        .world()
+        .buildings
+        .iter()
+        .any(|(_, b)| b.house == 1 && b.is_construction_yard));
+    core.drain_commands(); // discard the Deploy from the log
+
+    // Sidebar row 0 is POWR (`support::econ_buildables` order). The sidebar
+    // is bound to `player_house` (house 1) unconditionally -- there is no
+    // way to click it "as" house 2, which is exactly the "player house
+    // only" gating this test pins.
+    let tw = core.tactical_width() as i32;
+    let (bx, by) = (tw + 10, SIDEBAR_ROWS_TOP + 5);
+    core.handle(InputEvent::MouseDown {
+        button: MouseButton::Left,
+        x: bx,
+        y: by,
+    });
+    let emitted = core.drain_commands();
+    assert_eq!(
+        emitted.len(),
+        1,
+        "clicking a buildable sidebar row should emit exactly one command"
+    );
+    match emitted[0] {
+        Command::StartProduction { house, item } => {
+            assert_eq!(
+                house, 1,
+                "the sidebar always issues for the controlled house"
+            );
+            assert_eq!(item, ra_sim::BuildItem::Building(support::ECON_B_POWR));
+        }
+        other => panic!("expected StartProduction, got {other:?}"),
+    }
+
+    // Progress advances on virtual time.
+    core.update(67);
+    let p1 = core
+        .sidebar_items()
+        .into_iter()
+        .find(|i| i.name == "POWR")
+        .and_then(|i| i.progress);
+    assert!(p1.is_some(), "POWR should show in-progress after starting");
+    for _ in 0..20 {
+        core.update(67);
+    }
+    let p2 = core
+        .sidebar_items()
+        .into_iter()
+        .find(|i| i.name == "POWR")
+        .and_then(|i| i.progress);
+    assert!(
+        p2.unwrap() > p1.unwrap(),
+        "build progress should advance with virtual time: {p1:?} -> {p2:?}"
+    );
+}
+
+#[test]
+fn synthetic_placement_preview_rejects_invalid_click_and_accepts_valid_one() {
+    let (mut core, mcv) = support::synthetic_core_with_econ(0xE1E1_0003, 2000);
+    core.handle(InputEvent::Resize {
+        width: 1200,
+        height: 700,
+    });
+    let mcv_cell = support::econ_mcv_cell();
+    let cam = (
+        (mcv_cell.x * CELL_PIXELS) as f32 - 400.0,
+        (mcv_cell.y * CELL_PIXELS) as f32 - 300.0,
+    );
+    core.set_camera(cam.0, cam.1);
+
+    let (sx, sy) = cell_center_screen(cam, mcv_cell);
+    core.handle(InputEvent::MouseDown {
+        button: MouseButton::Left,
+        x: sx,
+        y: sy,
+    });
+    core.handle(InputEvent::MouseUp {
+        button: MouseButton::Left,
+        x: sx,
+        y: sy,
+    });
+    core.handle(InputEvent::KeyDown(Key::Deploy));
+    core.handle(InputEvent::KeyUp(Key::Deploy));
+    for _ in 0..5 {
+        core.update(67);
+    }
+    assert!(
+        !core.world().units.contains(mcv),
+        "the MCV should be gone after deploying"
+    );
+    let yard_cell = CellCoord::new(mcv_cell.x - 1, mcv_cell.y - 1);
+    assert!(core
+        .world()
+        .buildings
+        .iter()
+        .any(|(_, b)| b.house == 1 && b.cell == yard_cell && b.is_construction_yard));
+
+    core.start_production(ra_sim::BuildItem::Building(support::ECON_B_POWR));
+    let mut ready = false;
+    for _ in 0..1000 {
+        core.update(67);
+        if core
+            .sidebar_items()
+            .iter()
+            .any(|i| i.name == "POWR" && i.ready)
+        {
+            ready = true;
+            break;
+        }
+    }
+    assert!(ready, "POWR should finish within the tick budget");
+    core.drain_commands();
+
+    core.begin_placement(support::ECON_B_POWR);
+    assert_eq!(core.placing(), Some(support::ECON_B_POWR));
+
+    // Exercise the preview path (must not panic) before ever clicking.
+    core.handle(InputEvent::MouseMoved { x: 60, y: 60 });
+    let _ = core.compose(core.camera_rect());
+
+    // Invalid click: on-map, clear ground, but far from any owned building
+    // -- rejected by the proximity rule.
+    let far_cell = CellCoord::new(mcv_cell.x + 60, mcv_cell.y + 60);
+    let (fx, fy) = cell_center_screen(cam, far_cell);
+    core.handle(InputEvent::MouseMoved { x: fx, y: fy });
+    core.handle(InputEvent::MouseDown {
+        button: MouseButton::Left,
+        x: fx,
+        y: fy,
+    });
+    assert!(
+        core.drain_commands().is_empty(),
+        "an invalid placement click must emit no command"
+    );
+    assert_eq!(
+        core.placing(),
+        Some(support::ECON_B_POWR),
+        "placement mode must stay active after a rejected click, for a retry"
+    );
+
+    // Valid click: touching the yard's east edge (FACT is 3x3).
+    let valid_cell = CellCoord::new(yard_cell.x + 3, yard_cell.y);
+    let (vx, vy) = cell_center_screen(cam, valid_cell);
+    core.handle(InputEvent::MouseMoved { x: vx, y: vy });
+    core.handle(InputEvent::MouseDown {
+        button: MouseButton::Left,
+        x: vx,
+        y: vy,
+    });
+    let emitted = core.drain_commands();
+    assert_eq!(emitted.len(), 1);
+    match emitted[0] {
+        Command::PlaceBuilding {
+            house,
+            building,
+            cell,
+        } => {
+            assert_eq!(house, 1);
+            assert_eq!(building, support::ECON_B_POWR);
+            assert_eq!(cell, valid_cell);
+        }
+        other => panic!("expected PlaceBuilding, got {other:?}"),
+    }
+    assert_eq!(
+        core.placing(),
+        None,
+        "placement mode should clear after a successful placement"
+    );
+    for _ in 0..3 {
+        core.update(67);
+    }
+    assert!(core
+        .world()
+        .buildings
+        .iter()
+        .any(|(_, b)| b.house == 1 && b.cell == valid_cell));
+}
+
+/// Regression pin for the selection generational-handle fix: `AppCore` used
+/// to track `selected` as raw unit **indices** (`BTreeSet<u32>`), so once a
+/// selected unit died and a later spawn reused its arena slot, the new
+/// occupant would silently inherit the old selection (same index, different
+/// generation). The fix stores full `Handle`s (index *and* generation) and
+/// compares by value everywhere. This drives the exact scenario end to end
+/// through the real `AppCore` seam: select a unit, kill it, force a fresh
+/// unit into the freed slot (a refinery's free harvester), and confirm the
+/// new unit is not selected.
+#[test]
+fn synthetic_selection_does_not_survive_slot_reuse_after_kill() {
+    // FACT + POWR are pre-placed directly by the fixture (bypassing the
+    // deploy/build UI) precisely so this script never has to `update()`
+    // before it gets a chance to select the victim -- the defender kills it
+    // within the first tick or two, so "select the victim" must be the very
+    // first thing this test does after construction.
+    let (world, victim) = support::synthetic_world_for_selection_regression(0xE1E1_0004);
+    let (raster, palette) = support::synthetic_fixture();
+    let mut core = AppCore::with_sim(raster.clone(), *palette, world, Vec::new(), Vec::new());
+    core.enable_sidebar(1, support::econ_buildables());
+
+    let mcv_cell = support::econ_mcv_cell();
+    core.handle(InputEvent::Resize {
+        width: 1400,
+        height: 700,
+    });
+    let cam = (
+        (mcv_cell.x * CELL_PIXELS) as f32 - 300.0,
+        (mcv_cell.y * CELL_PIXELS) as f32 - 300.0,
+    );
+    core.set_camera(cam.0, cam.1);
+    let yard_cell = CellCoord::new(mcv_cell.x - 1, mcv_cell.y - 1);
+    assert!(core
+        .world()
+        .buildings
+        .iter()
+        .any(|(_, b)| b.house == 1 && b.cell == yard_cell && b.is_construction_yard));
+
+    // Select the victim -- and only the victim -- at tick 0, guaranteed
+    // alive (no `update()` call has happened yet).
+    let victim_cell = core.world().units.get(victim).unwrap().cell();
+    let (vx, vy) = cell_center_screen(cam, victim_cell);
+    core.handle(InputEvent::MouseDown {
+        button: MouseButton::Left,
+        x: vx,
+        y: vy,
+    });
+    core.handle(InputEvent::MouseUp {
+        button: MouseButton::Left,
+        x: vx,
+        y: vy,
+    });
+    assert_eq!(
+        core.selected_handles(),
+        vec![victim],
+        "test setup: the victim should be selected, alone"
+    );
+
+    // Let the pre-armed defender kill it. Never touch selection again.
+    let mut died = false;
+    for _ in 0..300 {
+        core.update(67);
+        if !core.world().units.contains(victim) {
+            died = true;
+            break;
+        }
+    }
+    assert!(
+        died,
+        "test setup: the victim should die within the tick budget"
+    );
+    assert!(
+        core.selected_handles().is_empty(),
+        "sanity check: a dead unit's stale handle must already read back as unselected"
+    );
+
+    // Build + place PROC (south side of the yard) through the ordinary
+    // sidebar/placement path: this spawns a free harvester -- the fresh unit
+    // that should land in the victim's freed slot.
+    core.start_production(ra_sim::BuildItem::Building(support::ECON_B_PROC));
+    assert!(wait_for_ready(&mut core, "PROC"), "PROC should finish");
+    let harvesters_before = core
+        .world()
+        .units
+        .iter()
+        .filter(|(_, u)| u.is_harvester)
+        .count();
+    core.begin_placement(support::ECON_B_PROC);
+    core.place_building(
+        support::ECON_B_PROC,
+        CellCoord::new(yard_cell.x, yard_cell.y + 3),
+    );
+    for _ in 0..3 {
+        core.update(67);
+    }
+    let harvester = core
+        .world()
+        .units
+        .iter()
+        .find(|(_, u)| u.is_harvester)
+        .map(|(h, _)| h);
+    assert!(
+        core.world()
+            .units
+            .iter()
+            .filter(|(_, u)| u.is_harvester)
+            .count()
+            > harvesters_before,
+        "PROC should have spawned its free harvester"
+    );
+    let harvester = harvester.expect("free harvester should exist");
+
+    // Confirm this test actually exercised slot reuse (not a different
+    // slot) -- otherwise the regression check below would pass vacuously.
+    assert_eq!(
+        harvester.index, victim.index,
+        "test setup: the harvester should have landed exactly in the victim's freed slot"
+    );
+    assert_ne!(
+        harvester.gen, victim.gen,
+        "test setup: the slot's generation must have advanced"
+    );
+
+    // The regression check: the stale (never-reselected) victim selection
+    // must not silently apply to the new occupant of its old slot.
+    assert!(
+        core.selected_handles().is_empty(),
+        "a new unit reusing a dead selected unit's arena slot must not be selected"
+    );
+
+    // And the render path (the actual bug site) must not panic either.
+    let _ = core.compose(core.camera_rect());
+}
+
+/// Step `core` until the named sidebar item reports `ready`, or `false` if
+/// it never does within a generous tick budget.
+fn wait_for_ready(core: &mut AppCore, name: &str) -> bool {
+    for _ in 0..2000 {
+        if core
+            .sidebar_items()
+            .iter()
+            .any(|i| i.name == name && i.ready)
+        {
+            return true;
+        }
+        core.update(67);
+    }
+    core.sidebar_items()
+        .iter()
+        .any(|i| i.name == name && i.ready)
 }

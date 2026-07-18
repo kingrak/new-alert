@@ -13,6 +13,7 @@
 //! - [`house`]        — the eight countries and their colour-remap tables.
 //! - [`passability`]  — a coarse passable/impassable grid from terrain (§3.7).
 
+pub mod buildings;
 pub mod combat;
 pub mod house;
 pub mod passability;

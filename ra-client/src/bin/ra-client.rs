@@ -12,13 +12,14 @@
 
 use std::process::ExitCode;
 
-use ra_client::assets::{self, LoadedGame, LoadedTerrain};
-use ra_client::input::{InputEvent, MouseButton, Rect};
+use ra_client::assets::{self, EconGame, LoadedGame, LoadedTerrain};
+use ra_client::input::{InputEvent, Key, MouseButton, Rect};
 use ra_client::platform;
 use ra_client::png;
 use ra_client::AppCore;
 use ra_formats::tmpl::{ICON_HEIGHT, ICON_WIDTH};
 use ra_sim::coords::CellCoord;
+use ra_sim::BuildItem;
 
 type BoxErr = Box<dyn std::error::Error>;
 
@@ -69,9 +70,10 @@ fn run(args: &[String]) -> Result<(), BoxErr> {
         "window" => cmd_window(args),
         "sim" => cmd_sim(args),
         "battle" => cmd_battle(args),
+        "econ" => cmd_econ(args),
         _ => {
             eprintln!(
-                "usage:\n  ra-client dump   [--assets DIR] [--scenario NAME] [--out PATH.png] [--rect CX CY CW CH] [--playable]\n  ra-client window [--assets DIR] [--scenario NAME] [--smoke-seconds N]\n  ra-client sim    [--assets DIR] [--scenario NAME] [--out-dir DIR]\n  ra-client battle [--assets DIR] [--scenario NAME] [--out-dir DIR]"
+                "usage:\n  ra-client dump   [--assets DIR] [--scenario NAME] [--out PATH.png] [--rect CX CY CW CH] [--playable]\n  ra-client window [--assets DIR] [--scenario NAME] [--smoke-seconds N]\n  ra-client sim    [--assets DIR] [--scenario NAME] [--out-dir DIR]\n  ra-client battle [--assets DIR] [--scenario NAME] [--out-dir DIR]\n  ra-client econ   [--assets DIR] [--scenario NAME] [--out-dir DIR] [--credits N]"
             );
             Err("unknown or missing subcommand".into())
         }
@@ -191,31 +193,65 @@ fn cmd_window(mut args: Vec<String>) -> Result<(), BoxErr> {
         .map(|s| s.parse::<f32>())
         .transpose()
         .map_err(|_| "--smoke-seconds needs a number")?;
-    // Prefer the full game view (terrain + units); fall back to terrain-only if
-    // the unit/rules archives can't be resolved.
-    let game = load_game(&mut args);
-    let mut core = match game {
+    let credits: i32 = take_flag(&mut args, "--credits")
+        .map(|s| s.parse())
+        .transpose()
+        .map_err(|_| "--credits needs an integer")?
+        .unwrap_or(8000);
+    // Prefer the M5 economy view (terrain + ore + build sidebar + a starter MCV
+    // to deploy). Fall back to terrain+units, then terrain-only, if the
+    // ore/rules/unit archives can't be resolved for the chosen scenario.
+    let assets_flag = args
+        .iter()
+        .position(|a| a == "--assets")
+        .and_then(|i| args.get(i + 1).cloned());
+    let scenario = args
+        .iter()
+        .position(|a| a == "--scenario")
+        .and_then(|i| args.get(i + 1).cloned())
+        .unwrap_or_else(|| "scg05eb.ini".to_string());
+    let econ = platform::resolve_assets_dir(assets_flag.as_deref())
+        .ok_or_else(|| BoxErr::from("no assets dir"))
+        .and_then(|dir| assets::load_econ_from_dir(&dir, &scenario, credits));
+
+    let core = match econ {
         Ok(g) => {
-            report_spawns(&g);
-            let start = center_camera_start(&g);
+            eprintln!(
+                "econ game: controlled house {}, MCV at ({},{}) — press D to deploy, click the sidebar to build",
+                g.controlled, g.start_cell.x, g.start_cell.y
+            );
             let mut core = g.core;
-            core.set_camera(start.0, start.1);
+            core.set_camera(
+                (g.start_cell.x * CELL as i32) as f32 - 430.0,
+                (g.start_cell.y * CELL as i32) as f32 - 360.0,
+            );
             core
         }
         Err(e) => {
-            eprintln!("note: falling back to terrain-only view ({e})");
-            let loaded = load(&mut args)?;
-            describe(&loaded);
-            let start = (
-                (loaded.scenario.map_x as f32) * CELL as f32,
-                (loaded.scenario.map_y as f32) * CELL as f32,
-            );
-            let mut core = loaded.into_appcore();
-            core.set_camera(start.0, start.1);
-            core
+            eprintln!("note: economy view unavailable ({e}); trying terrain+units");
+            match load_game(&mut args) {
+                Ok(g) => {
+                    report_spawns(&g);
+                    let start = center_camera_start(&g);
+                    let mut core = g.core;
+                    core.set_camera(start.0, start.1);
+                    core
+                }
+                Err(e2) => {
+                    eprintln!("note: falling back to terrain-only view ({e2})");
+                    let loaded = load(&mut args)?;
+                    describe(&loaded);
+                    let start = (
+                        (loaded.scenario.map_x as f32) * CELL as f32,
+                        (loaded.scenario.map_y as f32) * CELL as f32,
+                    );
+                    let mut core = loaded.into_appcore();
+                    core.set_camera(start.0, start.1);
+                    core
+                }
+            }
         }
     };
-    let _ = &mut core;
     ra_client::shell::run_window(core, smoke);
     Ok(())
 }
@@ -684,4 +720,351 @@ fn pick_destination(core: &AppCore, anchor: CellCoord) -> CellCoord {
         }
     }
     anchor
+}
+
+// ===========================================================================
+// M5 economy verification: deploy MCV -> build base -> harvest -> build tank.
+// ===========================================================================
+
+/// The `econ` subcommand: drive the full M5 economy loop through the AppCore
+/// seam on a real ore-bearing scenario — deploy an MCV into a construction yard,
+/// build & place POWR then PROC (which spawns a free harvester), watch the
+/// harvester mine ore and credits rise, build & place a WEAP, then produce a
+/// 2TNK. Dumps a PNG sequence, reports credit numbers vs hand-computed
+/// expectations, and proves determinism by replaying the identical script and
+/// comparing the per-tick sim-hash chains.
+fn cmd_econ(mut args: Vec<String>) -> Result<(), BoxErr> {
+    let out_dir = take_flag(&mut args, "--out-dir").unwrap_or_else(|| ".".to_string());
+    let credits: i32 = take_flag(&mut args, "--credits")
+        .map(|s| s.parse())
+        .transpose()
+        .map_err(|_| "--credits needs an integer")?
+        .unwrap_or(8000);
+    let assets_flag = take_flag(&mut args, "--assets");
+    // scg05eb has a large temperate gold field with open ground near the centre
+    // (reported by an overlay survey of general.mix); a good early econ map.
+    let scenario = take_flag(&mut args, "--scenario").unwrap_or_else(|| "scg05eb.ini".to_string());
+    let dir = platform::resolve_assets_dir(assets_flag.as_deref())
+        .ok_or("could not find an assets directory (try --assets DIR or RA_ASSETS_DIR)")?;
+    eprintln!(
+        "assets: {}  scenario: {scenario}  start credits: {credits}",
+        dir.display()
+    );
+
+    let g1 = assets::load_econ_from_dir(&dir, &scenario, credits)?;
+    let g2 = assets::load_econ_from_dir(&dir, &scenario, credits)?;
+    eprintln!(
+        "controlled house: {}  MCV start cell: ({},{})  nearest ore: {:?}",
+        g1.controlled, g1.start_cell.x, g1.start_cell.y, g1.ore_cell
+    );
+
+    let (report, hashes1) = drive_econ(g1, &out_dir, true, credits)?;
+    let (_r2, hashes2) = drive_econ(g2, &out_dir, false, credits)?;
+    eprintln!("--- economy loop ---\n{report}");
+
+    if hashes1 == hashes2 {
+        eprintln!(
+            "DETERMINISM OK: identical {}-tick hash chains across two runs (final {:#018x})",
+            hashes1.len(),
+            hashes1.last().copied().unwrap_or(0)
+        );
+        Ok(())
+    } else {
+        let first = hashes1
+            .iter()
+            .zip(&hashes2)
+            .position(|(a, b)| a != b)
+            .unwrap_or(hashes1.len());
+        Err(format!("determinism FAILED: hash chains diverge at tick {first}").into())
+    }
+}
+
+/// Step the sim `n` virtual frames (~1 tick each), recording the per-tick hash.
+fn econ_step(core: &mut AppCore, hashes: &mut Vec<u64>, n: u32) {
+    for _ in 0..n {
+        core.update(67);
+        hashes.push(core.sim_hash());
+    }
+}
+
+/// Step until `pred` holds or `max` ticks pass. Returns whether it held.
+fn econ_wait<F: Fn(&AppCore) -> bool>(
+    core: &mut AppCore,
+    hashes: &mut Vec<u64>,
+    max: u32,
+    pred: F,
+) -> bool {
+    for _ in 0..max {
+        if pred(core) {
+            return true;
+        }
+        core.update(67);
+        hashes.push(core.sim_hash());
+    }
+    pred(core)
+}
+
+/// The building type id inside a `BuildItem::Building`.
+fn building_id(item: BuildItem) -> Option<u32> {
+    match item {
+        BuildItem::Building(id) => Some(id),
+        _ => None,
+    }
+}
+
+/// Find the sidebar item with the given short name.
+fn sidebar_named(core: &AppCore, name: &str) -> Option<ra_client::appcore::SidebarItem> {
+    core.sidebar_items().into_iter().find(|i| i.name == name)
+}
+
+/// Scan cells around the controlled house's construction yard for the first
+/// footprint top-left where `building_id` is a legal placement.
+fn find_placement(core: &AppCore, house: u8, id: u32) -> Option<CellCoord> {
+    // Anchor on the construction yard, else the first owned building.
+    let anchor = core
+        .world()
+        .buildings
+        .iter()
+        .find(|(_, b)| b.house == house && b.is_construction_yard)
+        .or_else(|| {
+            core.world()
+                .buildings
+                .iter()
+                .find(|(_, b)| b.house == house)
+        })
+        .map(|(_, b)| b.cell)?;
+    for r in 1..12 {
+        for dy in -r..=r {
+            for dx in -r..=r {
+                let c = CellCoord::new(anchor.x + dx, anchor.y + dy);
+                if core.world().can_place_building(house, id, c) {
+                    return Some(c);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Build one structure end to end: start production, wait for it to finish, then
+/// place it at a found cell. Returns the placement cell (or an error string).
+fn build_structure(
+    core: &mut AppCore,
+    hashes: &mut Vec<u64>,
+    house: u8,
+    name: &str,
+) -> Result<CellCoord, String> {
+    let item = sidebar_named(core, name).ok_or_else(|| format!("{name} not in sidebar"))?;
+    if !item.buildable {
+        return Err(format!("{name} not buildable (prereqs/factory/funds)"));
+    }
+    core.start_production(item.item);
+    // Wait for the ready flag.
+    let ready = econ_wait(core, hashes, 4000, |c| {
+        sidebar_named(c, name).map(|i| i.ready).unwrap_or(false)
+    });
+    if !ready {
+        return Err(format!("{name} never completed"));
+    }
+    let id = building_id(item.item).ok_or("not a building")?;
+    let cell = find_placement(core, house, id).ok_or_else(|| format!("no spot for {name}"))?;
+    core.begin_placement(id);
+    core.place_building(id, cell);
+    econ_step(core, hashes, 2);
+    // Confirm it landed.
+    let placed = core
+        .world()
+        .buildings
+        .iter()
+        .any(|(_, b)| b.house == house && b.cell == cell);
+    if !placed {
+        return Err(format!(
+            "{name} placement rejected at ({},{})",
+            cell.x, cell.y
+        ));
+    }
+    Ok(cell)
+}
+
+/// Map a cell centre to a tactical viewport pixel at the current camera.
+fn cell_to_screen(core: &AppCore, cell: CellCoord) -> (i32, i32) {
+    let r = core.camera_rect();
+    (
+        (cell.x * CELL as i32 + CELL as i32 / 2 - r.x as i32),
+        (cell.y * CELL as i32 + CELL as i32 / 2 - r.y as i32),
+    )
+}
+
+/// Drive the whole economy loop; returns a report and the per-tick hash chain.
+fn drive_econ(
+    game: EconGame,
+    out_dir: &str,
+    write_png: bool,
+    start_credits: i32,
+) -> Result<(String, Vec<u64>), BoxErr> {
+    let EconGame {
+        mut core,
+        controlled,
+        start_cell,
+        ..
+    } = game;
+    let mut hashes: Vec<u64> = Vec::new();
+    let mut report = String::new();
+
+    let (vw, vh) = (1000u32, 720u32);
+    core.handle(InputEvent::Resize {
+        width: vw,
+        height: vh,
+    });
+    // Centre the camera on the base start (tactical area width excludes sidebar).
+    let tw = core.tactical_width();
+    core.set_camera(
+        (start_cell.x * CELL as i32) as f32 - tw as f32 / 2.0,
+        (start_cell.y * CELL as i32) as f32 - vh as f32 / 2.0,
+    );
+
+    let gold_value = core.world().catalog.econ.gold_value;
+    let gem_value = core.world().catalog.econ.gem_value;
+    let bail_count = core.world().catalog.econ.bail_count;
+
+    // 1) Select the MCV (click it) and deploy it into a construction yard.
+    let (mx, my) = cell_to_screen(&core, start_cell);
+    core.handle(InputEvent::MouseDown {
+        button: MouseButton::Left,
+        x: mx,
+        y: my,
+    });
+    core.handle(InputEvent::MouseUp {
+        button: MouseButton::Left,
+        x: mx,
+        y: my,
+    });
+    let selected = core.selected_handles().len();
+    core.handle(InputEvent::KeyDown(Key::Deploy));
+    core.handle(InputEvent::KeyUp(Key::Deploy));
+    core.handle(InputEvent::MouseLeft); // stop any edge scroll
+    econ_step(&mut core, &mut hashes, 3);
+    let has_cy = core
+        .world()
+        .buildings
+        .iter()
+        .any(|(_, b)| b.house == controlled && b.is_construction_yard);
+    report.push_str(&format!(
+        "selected {selected} unit(s); deployed MCV -> construction yard: {has_cy}\n"
+    ));
+    if !has_cy {
+        return Err("MCV failed to deploy".into());
+    }
+    let credits_after_deploy = core.credits();
+    if write_png {
+        dump(&core, out_dir, "econ_1_deployed")?;
+    }
+
+    // 2) Build + place POWR, then PROC (spawns the free harvester).
+    let powr_cell = build_structure(&mut core, &mut hashes, controlled, "POWR")
+        .map_err(|e| format!("POWR: {e}"))?;
+    report.push_str(&format!(
+        "built POWR at ({},{})\n",
+        powr_cell.x, powr_cell.y
+    ));
+    let (po, pd) = core.power();
+    report.push_str(&format!("power after POWR: output {po} / drain {pd}\n"));
+
+    let proc_cell = build_structure(&mut core, &mut hashes, controlled, "PROC")
+        .map_err(|e| format!("PROC: {e}"))?;
+    let harvesters = core
+        .world()
+        .units
+        .iter()
+        .filter(|(_, u)| u.is_harvester)
+        .count();
+    report.push_str(&format!(
+        "built PROC at ({},{}); free harvesters now: {harvesters}\n",
+        proc_cell.x, proc_cell.y
+    ));
+    let credits_before_harvest = core.credits();
+
+    // 3) Let the harvester mine. Capture a frame with it on ore, then wait for a
+    // full unload cycle (credits jump).
+    let on_ore = econ_wait(&mut core, &mut hashes, 3000, |c| {
+        c.world()
+            .units
+            .iter()
+            .any(|(_, u)| u.is_harvester && c.world().ore.has_ore(u.cell()))
+    });
+    report.push_str(&format!("harvester reached an ore cell: {on_ore}\n"));
+    if write_png {
+        dump(&core, out_dir, "econ_2_harvesting")?;
+    }
+    // Wait for the first unload: credits strictly exceed the pre-harvest figure.
+    let unloaded = econ_wait(&mut core, &mut hashes, 8000, |c| {
+        c.credits() > credits_before_harvest
+    });
+    let credits_after_harvest = core.credits();
+    let gained = credits_after_harvest - credits_before_harvest;
+    report.push_str(&format!(
+        "first unload happened: {unloaded}; credits {credits_before_harvest} -> {credits_after_harvest} (+{gained})\n"
+    ));
+    // Hand-check: a full gold load is bail_count * gold_value credits.
+    report.push_str(&format!(
+        "  expected full gold load = {bail_count} bails * {gold_value} = {} credits (gem bail = {gem_value})\n",
+        bail_count as i32 * gold_value
+    ));
+    if gained > 0 && gained % gold_value == 0 {
+        report.push_str(&format!(
+            "  gained is an exact multiple of GoldValue: {} gold bails\n",
+            gained / gold_value
+        ));
+    }
+
+    // 4) Build + place WEAP, then produce a 2TNK; confirm the tank spawns.
+    let weap_cell = build_structure(&mut core, &mut hashes, controlled, "WEAP")
+        .map_err(|e| format!("WEAP: {e}"))?;
+    report.push_str(&format!(
+        "built WEAP at ({},{})\n",
+        weap_cell.x, weap_cell.y
+    ));
+
+    let vehicles_before = core.world().units.len();
+    let tnk = sidebar_named(&core, "2TNK").ok_or("2TNK not in sidebar")?;
+    if !tnk.buildable {
+        return Err("2TNK not buildable after WEAP".into());
+    }
+    let credits_before_tank = core.credits();
+    core.start_production(tnk.item);
+    let spawned = econ_wait(&mut core, &mut hashes, 4000, |c| {
+        c.world().units.len() > vehicles_before
+    });
+    let credits_after_tank = core.credits();
+    report.push_str(&format!(
+        "2TNK produced: {spawned}; credits {credits_before_tank} -> {credits_after_tank} (cost {})\n",
+        credits_before_tank - credits_after_tank
+    ));
+    econ_step(&mut core, &mut hashes, 20);
+    if write_png {
+        dump(&core, out_dir, "econ_3_tank")?;
+    }
+
+    // Credit ledger summary.
+    report.push_str(&format!(
+        "ledger: start {start_credits}  after-deploy {credits_after_deploy}  \
+         before-harvest {credits_before_harvest}  after-harvest {credits_after_harvest}  \
+         final {}\n",
+        core.credits()
+    ));
+    if !spawned {
+        return Err("2TNK never spawned".into());
+    }
+
+    Ok((report, hashes))
+}
+
+/// Compose the game view and write it as a PNG.
+fn dump(core: &AppCore, out_dir: &str, name: &str) -> Result<(), BoxErr> {
+    let f = core.compose_camera();
+    let path = format!("{out_dir}/{name}.png");
+    let bytes = png::encode_rgba(f.width, f.height, &f.pixels);
+    std::fs::write(&path, &bytes)?;
+    eprintln!("wrote {path} ({}x{} px)", f.width, f.height);
+    Ok(())
 }

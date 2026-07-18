@@ -18,6 +18,7 @@
 pub mod appcore;
 pub mod assets;
 pub mod compositor;
+pub mod font;
 pub mod input;
 pub mod platform;
 pub mod png;
