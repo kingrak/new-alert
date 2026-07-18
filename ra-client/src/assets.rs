@@ -500,6 +500,9 @@ pub struct GameContent {
     pub unit_sprites: Vec<UnitSprite>,
     /// Building idle sprites, indexed by building type id.
     pub building_sprites: Vec<UnitSprite>,
+    /// Optional per-building overlay shape drawn over the base sprite
+    /// (the war factory's WEAP2 roof/door; building.cpp:513). Same indexing.
+    pub building_overlays: Vec<Option<UnitSprite>>,
     /// Sidebar buildable list, in display order.
     pub buildables: Vec<BuildItem>,
 }
@@ -723,10 +726,19 @@ pub fn build_content(rules: &Ini, conquer: &MixArchive) -> Result<GameContent, B
     ];
     let mut buildings = Vec::new();
     let mut building_sprites = Vec::new();
+    let mut building_overlays = Vec::new();
     for (id, (name, is_cy, is_ref, is_wf)) in bspecs.iter().enumerate() {
         let stats = building_stats(rules, name)
             .ok_or_else(|| format!("no building stats/footprint for {name}"))?;
         building_sprites.push(load_unit_sprite(conquer, name)?);
+        // The war factory is two shapes in the original: WEAP (base) plus the
+        // WEAP2 roof/door overlay drawn on top (building.cpp:513, bdata.cpp:3052).
+        // Missing overlay art degrades gracefully to the base shape alone.
+        building_overlays.push(if *is_wf {
+            load_unit_sprite(conquer, "weap2").ok()
+        } else {
+            None
+        });
         buildings.push(BuildingProto {
             name: name.to_string(),
             foot_w: stats.foot_w,
@@ -811,6 +823,7 @@ pub fn build_content(rules: &Ini, conquer: &MixArchive) -> Result<GameContent, B
         catalog,
         unit_sprites,
         building_sprites,
+        building_overlays,
         buildables,
     })
 }
@@ -932,6 +945,7 @@ pub fn load_econ_from_bytes(
 
     let mut core = AppCore::with_sim(raster, palette, world, content.unit_sprites, remaps);
     core.set_building_sprites(content.building_sprites);
+    core.set_building_overlays(content.building_overlays);
     core.enable_sidebar(controlled, content.buildables.clone());
     // M7 cosmetic art (ore/gem tiles, explosion/buildup anims, cameos, radar) so
     // the econ view shows real ore fields thinning as they are harvested.
@@ -1081,6 +1095,7 @@ pub fn load_skirmish_from_bytes(
 
     let mut core = AppCore::with_sim(raster, palette, world, content.unit_sprites, remaps);
     core.set_building_sprites(content.building_sprites);
+    core.set_building_overlays(content.building_overlays);
     core.enable_sidebar(player_house, content.buildables.clone());
 
     // M7 cosmetic art: ore/gem tiles, explosion + buildup anims, cameos, radar.

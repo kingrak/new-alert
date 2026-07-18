@@ -242,6 +242,7 @@ pub struct AppCore {
     player_house: Option<u8>,
     /// Building idle sprites, indexed by building type id.
     building_sprites: Vec<UnitSprite>,
+    building_overlays: Vec<Option<UnitSprite>>,
     /// The buildable items the sidebar lists, in display order.
     buildables: Vec<BuildItem>,
     /// Active placement mode: a completed building type id awaiting a map click.
@@ -334,6 +335,7 @@ impl AppCore {
             sidebar_enabled: false,
             player_house: None,
             building_sprites: Vec::new(),
+            building_overlays: Vec::new(),
             buildables: Vec::new(),
             placing: None,
             show_help: false,
@@ -390,6 +392,12 @@ impl AppCore {
     /// Install building idle sprites, indexed by building type id.
     pub fn set_building_sprites(&mut self, sprites: Vec<UnitSprite>) {
         self.building_sprites = sprites;
+    }
+
+    /// Optional overlay shapes drawn over the base building sprite (the war
+    /// factory's WEAP2 roof/door; building.cpp:513). Indexed like the sprites.
+    pub fn set_building_overlays(&mut self, overlays: Vec<Option<UnitSprite>>) {
+        self.building_overlays = overlays;
     }
 
     /// Enable the build sidebar for the controlled `player_house`, listing
@@ -1667,6 +1675,13 @@ impl AppCore {
                     draw_sprite_topleft(frame, px as i32, py as i32, f, &remap, &self.palette);
                 })
             });
+            // Two-part buildings: overlay shape on top of the base (WEAP2 roof/
+            // door for the war factory, building.cpp:513).
+            if let Some(Some(ov)) = self.building_overlays.get(b.type_id as usize) {
+                if let Some(f) = ov.frames.first() {
+                    draw_sprite_topleft(frame, px as i32, py as i32, f, &remap, &self.palette);
+                }
+            }
             if drawn.is_none() {
                 // No sprite: fall back to a filled footprint so it is visible.
                 fill_rect(
