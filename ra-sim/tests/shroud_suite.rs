@@ -258,6 +258,7 @@ fn shroud_reveal_is_sticky_after_unit_moves_away() {
 
 fn proto(name: &str, foot_w: u8, foot_h: u8, sight: u8) -> BuildingProto {
     BuildingProto {
+        is_barracks: false,
         name: name.to_string(),
         foot_w,
         foot_h,

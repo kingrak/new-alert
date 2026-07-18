@@ -15,7 +15,9 @@
 use core::cmp::Ordering;
 use std::collections::BinaryHeap;
 
-use crate::coords::{CellCoord, MAP_CELL_H, MAP_CELL_W};
+use crate::arena::Handle;
+use crate::coords::{CellCoord, Locomotor, MAP_CELL_H, MAP_CELL_W};
+use crate::occupancy::UnitGrid;
 
 /// Cost of an orthogonal (N/E/S/W) step.
 const ORTHO_COST: i32 = 10;
@@ -34,37 +36,69 @@ const NEIGHBORS: [(i32, i32, i32); 8] = [
     (-1, -1, DIAG_COST), // NW
 ];
 
-/// A passability grid with two layers (M5): a **static** terrain mask (water,
-/// cliffs — set once at load) and a **dynamic occupancy** mask that buildings
-/// stamp their footprint onto (DESIGN.md §3.7: "extend Passability to a dynamic
-/// occupancy layer distinct from static terrain"). A cell is drivable only when
-/// it is statically passable **and** not occupied.
+/// A passability grid with per-locomotor static terrain layers plus a dynamic
+/// building-occupancy layer (DESIGN.md §3.7). Each of the three ground
+/// locomotors (`Foot`/`Track`/`Wheel`) has its own static-terrain mask derived
+/// from per-cell land types (`Ground[land].Cost[speed] != 0`, `unit.cpp:3429`) —
+/// so rock/cliffs block everything, rivers/water block ground, and infantry vs
+/// vehicles get genuinely different terrain rules. A cell is drivable by a given
+/// locomotor only when its static mask is passable **and** it is not occupied by
+/// a building.
 ///
 /// The occupancy layer is a *cache* fully determined by the buildings arena
 /// (which is hashed), so it is not itself folded into the state hash — it is
 /// re-derivable from the hashed building placements, exactly like the static
-/// terrain mask.
+/// terrain masks.
 #[derive(Clone, Debug)]
 pub struct Passability {
     width: i32,
     height: i32,
-    /// Static terrain passability (`true` = drivable ground). Never mutated
-    /// after construction.
-    cells: Vec<bool>,
+    /// Static terrain passability for infantry (`Foot`), row-major.
+    foot: Vec<bool>,
+    /// Static terrain passability for tracked vehicles (`Track`).
+    track: Vec<bool>,
+    /// Static terrain passability for wheeled vehicles (`Wheel`).
+    wheel: Vec<bool>,
     /// Dynamic occupancy (`true` = a building footprint blocks this cell).
     blocked: Vec<bool>,
 }
 
 impl Passability {
-    /// Build a grid from a row-major `width*height` static passability mask,
-    /// with an empty (nothing-blocked) occupancy layer.
+    /// Build a grid from a single row-major `width*height` static passability
+    /// mask applied uniformly to **all three locomotors** — the synthetic /
+    /// movement-test constructor (a uniform mask keeps foot == track == wheel, so
+    /// every existing golden that builds a grid this way is byte-for-byte
+    /// unchanged). The per-locomotor land-type build uses [`Passability::per_locomotor`].
     pub fn new(width: i32, height: i32, cells: Vec<bool>) -> Passability {
         assert_eq!(cells.len(), (width * height) as usize);
-        let n = cells.len();
         Passability {
             width,
             height,
-            cells,
+            foot: cells.clone(),
+            track: cells.clone(),
+            wheel: cells,
+            blocked: vec![false; (width * height) as usize],
+        }
+    }
+
+    /// Build a grid from three per-locomotor static masks (from land types).
+    pub fn per_locomotor(
+        width: i32,
+        height: i32,
+        foot: Vec<bool>,
+        track: Vec<bool>,
+        wheel: Vec<bool>,
+    ) -> Passability {
+        let n = (width * height) as usize;
+        assert_eq!(foot.len(), n);
+        assert_eq!(track.len(), n);
+        assert_eq!(wheel.len(), n);
+        Passability {
+            width,
+            height,
+            foot,
+            track,
+            wheel,
             blocked: vec![false; n],
         }
     }
@@ -93,22 +127,40 @@ impl Passability {
         cell.x >= 0 && cell.y >= 0 && cell.x < self.width && cell.y < self.height
     }
 
-    /// Whether `cell` is on-grid and drivable **right now** (static terrain
-    /// passable and not occupied by a building). This is what pathfinding uses.
+    /// The static-terrain mask for a locomotor.
+    fn loco_mask(&self, loco: Locomotor) -> &[bool] {
+        match loco {
+            Locomotor::Foot => &self.foot,
+            Locomotor::Track => &self.track,
+            Locomotor::Wheel => &self.wheel,
+        }
+    }
+
+    /// Whether `cell` is on-grid and drivable **right now** by the generic
+    /// ground-vehicle (`Track`) locomotor: static terrain passable and not
+    /// occupied by a building. This is the back-compatible query used by
+    /// vehicle/harvester/factory-exit/placement contexts; infantry-aware callers
+    /// use [`Passability::is_passable_loco`].
     pub fn is_passable(&self, cell: CellCoord) -> bool {
+        self.is_passable_loco(cell, Locomotor::Track)
+    }
+
+    /// Whether `cell` is on-grid and drivable right now by `loco` (its static
+    /// land mask passable and not building-occupied). Pathfinding uses this.
+    pub fn is_passable_loco(&self, cell: CellCoord, loco: Locomotor) -> bool {
         if !self.in_bounds(cell) {
             return false;
         }
         let i = (cell.y * self.width + cell.x) as usize;
-        self.cells[i] && !self.blocked[i]
+        self.loco_mask(loco)[i] && !self.blocked[i]
     }
 
-    /// Whether `cell`'s **static terrain** is passable, ignoring building
-    /// occupancy. Used by placement validation, which must judge the ground a
-    /// footprint would sit on, not whether the (not-yet-placed) building is
-    /// there. A footprint's own not-yet-placed cells are still "buildable".
+    /// Whether `cell`'s **static terrain** is passable (ground vehicle), ignoring
+    /// building occupancy. Used by placement validation, which must judge the
+    /// ground a footprint would sit on, not whether the (not-yet-placed) building
+    /// is there. A footprint's own not-yet-placed cells are still "buildable".
     pub fn is_static_passable(&self, cell: CellCoord) -> bool {
-        self.in_bounds(cell) && self.cells[(cell.y * self.width + cell.x) as usize]
+        self.in_bounds(cell) && self.track[(cell.y * self.width + cell.x) as usize]
     }
 
     /// Whether `cell` is currently occupied by a building footprint.
@@ -172,8 +224,51 @@ fn heuristic(a: CellCoord, b: CellCoord) -> i32 {
 /// `start == goal` short-circuit: an off-grid (or impassable) cell asked to
 /// "path to itself" returns `None`, not `Some(empty)`. Short-circuiting first
 /// let a degenerate off-grid start slip through as a spurious success.
-pub fn find_path(grid: &Passability, start: CellCoord, goal: CellCoord) -> Option<Vec<CellCoord>> {
-    if !grid.is_passable(start) || !grid.is_passable(goal) {
+pub fn find_path(
+    grid: &Passability,
+    start: CellCoord,
+    goal: CellCoord,
+    loco: Locomotor,
+) -> Option<Vec<CellCoord>> {
+    find_path_inner(grid, start, goal, loco, None)
+}
+
+/// Like [`find_path`], but additionally treats cells occupied by a **vehicle
+/// other than `self_handle`** (per `occ`) as impassable — used to re-route a
+/// blocked vehicle *around* a traffic jam / head-on deadlock (the original's
+/// `drive.cpp` reaction to a `MOVE_MOVING_BLOCK`). `start` is always allowed
+/// (the unit stands there); the goal must be reachable and itself unoccupied.
+pub fn find_path_avoiding(
+    grid: &Passability,
+    start: CellCoord,
+    goal: CellCoord,
+    loco: Locomotor,
+    occ: &UnitGrid,
+    self_handle: Handle,
+) -> Option<Vec<CellCoord>> {
+    find_path_inner(grid, start, goal, loco, Some((occ, self_handle)))
+}
+
+fn find_path_inner(
+    grid: &Passability,
+    start: CellCoord,
+    goal: CellCoord,
+    loco: Locomotor,
+    occ: Option<(&UnitGrid, Handle)>,
+) -> Option<Vec<CellCoord>> {
+    // A cell is enterable for pathing if its terrain/building passability holds
+    // and (when avoiding units) it is not occupied by another vehicle. `start` is
+    // exempt from the unit check (the mover stands on it).
+    let passable = |cell: CellCoord| -> bool {
+        if !grid.is_passable_loco(cell, loco) {
+            return false;
+        }
+        match occ {
+            Some((g, self_h)) if cell != start => !g.vehicle_blocked_for(cell, self_h),
+            _ => true,
+        }
+    };
+    if !passable(start) || !passable(goal) {
         return None;
     }
     if start == goal {
@@ -212,15 +307,18 @@ pub fn find_path(grid: &Passability, start: CellCoord, goal: CellCoord) -> Optio
 
         for &(dx, dy, cost) in &NEIGHBORS {
             let next = CellCoord::new(cur.x + dx, cur.y + dy);
-            if !grid.is_passable(next) {
+            if !passable(next) {
                 continue;
             }
             // No corner cutting: a diagonal step needs both shared orthogonal
-            // neighbours passable.
+            // neighbours enterable. Uses the same `passable` predicate as the step
+            // itself, so in unit-avoiding mode a vehicle beside the corner blocks
+            // the diagonal too (preventing a rerouted path from corner-clipping an
+            // occupied cell); in plain pathing this is terrain-only, unchanged.
             if dx != 0 && dy != 0 {
                 let side_a = CellCoord::new(cur.x + dx, cur.y);
                 let side_b = CellCoord::new(cur.x, cur.y + dy);
-                if !grid.is_passable(side_a) || !grid.is_passable(side_b) {
+                if !passable(side_a) || !passable(side_b) {
                     continue;
                 }
             }
@@ -268,13 +366,19 @@ mod tests {
     fn same_cell_is_empty_path() {
         let g = open_grid();
         let c = CellCoord::new(5, 5);
-        assert_eq!(find_path(&g, c, c), Some(Vec::new()));
+        assert_eq!(find_path(&g, c, c, Locomotor::Track), Some(Vec::new()));
     }
 
     #[test]
     fn straight_line_open_field() {
         let g = open_grid();
-        let path = find_path(&g, CellCoord::new(0, 0), CellCoord::new(3, 0)).unwrap();
+        let path = find_path(
+            &g,
+            CellCoord::new(0, 0),
+            CellCoord::new(3, 0),
+            Locomotor::Track,
+        )
+        .unwrap();
         assert_eq!(
             path,
             vec![
@@ -288,7 +392,13 @@ mod tests {
     #[test]
     fn diagonal_is_taken_in_open_field() {
         let g = open_grid();
-        let path = find_path(&g, CellCoord::new(0, 0), CellCoord::new(3, 3)).unwrap();
+        let path = find_path(
+            &g,
+            CellCoord::new(0, 0),
+            CellCoord::new(3, 3),
+            Locomotor::Track,
+        )
+        .unwrap();
         // Pure diagonal: 3 steps, each incrementing both axes.
         assert_eq!(path.len(), 3);
         assert_eq!(path.last(), Some(&CellCoord::new(3, 3)));
@@ -307,7 +417,13 @@ mod tests {
             cells[(y * w + 2) as usize] = false;
         }
         let g = Passability::new(w, h, cells);
-        let path = find_path(&g, CellCoord::new(0, 0), CellCoord::new(4, 0)).unwrap();
+        let path = find_path(
+            &g,
+            CellCoord::new(0, 0),
+            CellCoord::new(4, 0),
+            Locomotor::Track,
+        )
+        .unwrap();
         // Must reach the goal and never step onto the wall.
         assert_eq!(path.last(), Some(&CellCoord::new(4, 0)));
         for step in &path {
@@ -334,7 +450,10 @@ mod tests {
             }
         }
         let g = Passability::new(w, h, cells);
-        assert_eq!(find_path(&g, CellCoord::new(0, 0), goal), None);
+        assert_eq!(
+            find_path(&g, CellCoord::new(0, 0), goal, Locomotor::Track),
+            None
+        );
     }
 
     #[test]
@@ -349,7 +468,12 @@ mod tests {
         // Going from (0,0) to (1,1): the direct diagonal is blocked by the
         // corner, and both orthogonal detours are walled, so it's unreachable.
         assert_eq!(
-            find_path(&g, CellCoord::new(0, 0), CellCoord::new(1, 1)),
+            find_path(
+                &g,
+                CellCoord::new(0, 0),
+                CellCoord::new(1, 1),
+                Locomotor::Track
+            ),
             None
         );
     }
@@ -357,8 +481,20 @@ mod tests {
     #[test]
     fn deterministic_across_runs() {
         let g = open_grid();
-        let a = find_path(&g, CellCoord::new(2, 7), CellCoord::new(40, 33)).unwrap();
-        let b = find_path(&g, CellCoord::new(2, 7), CellCoord::new(40, 33)).unwrap();
+        let a = find_path(
+            &g,
+            CellCoord::new(2, 7),
+            CellCoord::new(40, 33),
+            Locomotor::Track,
+        )
+        .unwrap();
+        let b = find_path(
+            &g,
+            CellCoord::new(2, 7),
+            CellCoord::new(40, 33),
+            Locomotor::Track,
+        )
+        .unwrap();
         assert_eq!(a, b);
     }
 }

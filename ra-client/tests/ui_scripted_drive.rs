@@ -81,17 +81,27 @@ fn synthetic_box_select_move_and_converge() {
         "emitted commands should address exactly the 3 spawned jeeps"
     );
 
-    // Convergence: every jeep ended up at (or adjacent to, since 3 units
-    // can't all occupy one cell center exactly if paths interleave — but on
-    // an open map with plenty of settle ticks they should all reach the
-    // destination cell exactly) the destination.
+    // Convergence with **dispersal** (M7.6 cell occupancy): three vehicles can
+    // no longer stack on one cell, so a group ordered to one destination settles
+    // into distinct adjacent cells clustered on the target (`Adjust_Dest`
+    // scatter), not all on the exact destination cell. Assert: every jeep
+    // finished moving, all three occupy *distinct* cells (the one-vehicle-per-cell
+    // rule), and every jeep is close to the destination.
+    let mut end_cells = std::collections::BTreeSet::new();
     for h in &jeeps {
         let u = core.world().units.get(*h).unwrap();
         assert!(!u.is_moving(), "jeep should have finished its path by now");
-        assert_eq!(
-            u.cell(),
-            SYNTHETIC_DEST,
-            "jeep did not converge to the destination"
+        let c = u.cell();
+        assert!(
+            end_cells.insert((c.x, c.y)),
+            "two jeeps ended on the same cell — one-vehicle-per-cell violated"
+        );
+        let dist = (c.x - SYNTHETIC_DEST.x)
+            .abs()
+            .max((c.y - SYNTHETIC_DEST.y).abs());
+        assert!(
+            dist <= 2,
+            "jeep settled at {c:?}, too far from the destination {SYNTHETIC_DEST:?}"
         );
     }
 

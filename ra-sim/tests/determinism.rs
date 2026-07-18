@@ -636,26 +636,164 @@ fn real_scg01ea_hash_chain_prefix_golden() {
     // harvesters, and there are no buildings/houses/ore, so every M5 addition
     // hashes its empty/default value — the *behavior* is byte-identical to M3.
     // The companion audit `m4_repin_is_justified_movement_unaffected_by_combat_fields`
-    // proves this: its independent movement-only hash chain (`state_hash_m3_shaped`)
-    // is UNCHANGED across M4 and M5, so only the full-state hash *formula* grew.
-    // Re-pinned deterministically (values read back from the run once).
+    // proves the M4/M5 additions were formula-only.
+    //
+    // **Re-pinned for M7.6 (infantry + occupancy) — a real BEHAVIOR change, not a
+    // hash-formula change.** This script moves all four units to the *same* cell
+    // (70,55). M7.6 adds unit cell occupancy: vehicles are one-per-cell, and a
+    // group ordered to one cell now **disperses** to distinct nearby free cells
+    // (`Adjust_Dest` scatter) instead of stacking. So the four JEEPs/HARV settle
+    // in different cells and the movement — hence the hash chain — legitimately
+    // changes. This is the coordinator-authorised occupancy re-pin (see QUIRKS
+    // Q5/Q6); the independent movement-only oracle chain in the companion audit is
+    // re-pinned in the same pass. Re-derived deterministically (read back once).
     let golden: [u64; 10] = [
-        0xcbce_34ae_694c_1b1b,
-        0x8b61_f02b_76f2_2214,
-        0x70c3_f119_6b95_c141,
-        0x6de3_46e5_acaa_572a,
-        0x1e0f_3148_562b_7c17,
-        0xb335_8f45_5866_9d1c,
-        0x6635_14a6_9441_d8ca,
-        0xb3a6_f70c_edff_2790,
-        0x039f_0658_6157_7422,
-        0x59c2_824e_ed65_7fd4,
+        0xe6ce_37fb_c98b_9e8d,
+        0x8f12_8151_a357_4fa6,
+        0xedbc_01c3_1509_1f6b,
+        0x443b_4be3_7df3_e8cc,
+        0xebf9_01c4_2c38_fa89,
+        0xc8e1_58e8_d905_e6c9,
+        0x6e60_ee66_16b9_f6c7,
+        0x9cea_f6d1_10f9_4505,
+        0xa11d_bbc4_be5e_0bd3,
+        0x420e_84c6_f0d5_eb15,
     ];
     assert_eq!(
         chain, golden,
         "scg01ea hash-chain prefix changed — either a real determinism regression \
          (movement/pathing/hashing) or a deliberate change; update the pin with a comment"
     );
+}
+
+// ---------------------------------------------------------------------
+// 4b. Independent single-unit movement oracle (M7.6 re-pin audit).
+// ---------------------------------------------------------------------
+//
+// `real_scg01ea_hash_chain_prefix_golden` above just moved for the second
+// time in the project's history — first for the M4/M5 hash-formula growth
+// (inert-field, not a behavior change), now for a genuine M7.6 movement
+// *behavior* change (occupancy/dispersal). The M4-era companion audit
+// (`repin_audit::m4_repin_is_justified_movement_unaffected_by_combat_fields`)
+// used to be the project's only *independent* movement oracle protecting
+// against silent movement regressions — but M7.6 proved that oracle is not
+// immune to *movement* changes: its own 4-units-to-one-cell script disperses
+// under the new occupancy rule, so it moved too (re-pinned alongside this
+// test, see its doc comment and QUIRKS Q5).
+//
+// This is a **new** oracle, constructed to never need re-pinning again for
+// any *future* multi-unit occupancy/collision/dispersal change, by
+// construction: **exactly one unit** exists in this fixture. With no other
+// unit on the map, `UnitGrid::vehicle_blocked_for` and `pick_dest`'s
+// `dest_ok` can never observe a collision (there is nothing to collide
+// with), so `move_units`'s occupancy gate/re-route/dispersal branches are
+// dead code for this script by construction — not merely by accident of the
+// current destinations chosen. Only a change to the *base* movement math
+// itself (waypoint advance, facing rotation, path consumption) can ever
+// move this golden. Kept purely synthetic (no real assets) so it always
+// runs, and it exercises a re-issued order (stop + new destination) the
+// same way the M3/M4-era fixtures do, so it is not trivially only a
+// straight-line no-op case.
+const SINGLE_UNIT_ORACLE_TICKS: usize = 40;
+
+fn single_unit_oracle_log(unit: Handle) -> Vec<Vec<Command>> {
+    let mut log = vec![Vec::new(); SINGLE_UNIT_ORACLE_TICKS];
+    log[0].push(Command::Move {
+        unit,
+        dest: CellCoord::new(100, 90),
+        house: 1,
+    });
+    // Re-issue mid-flight: stop, then send it somewhere else — exercises the
+    // same "interrupted order" path the M3/M4 fixtures do, still solo.
+    log[15].push(Command::Stop { unit, house: 1 });
+    log[16].push(Command::Move {
+        unit,
+        dest: CellCoord::new(12, 80),
+        house: 1,
+    });
+    log
+}
+
+/// A lone unit alone on an open synthetic map: the one-vehicle-per-cell gate,
+/// `find_path_avoiding` re-route, and group-dispersal `pick_dest` scatter
+/// (M7.6) can never trigger — there is no other unit to collide with. See the
+/// module-doc comment above for why this makes the golden below immune to any
+/// future occupancy/collision/dispersal change by construction.
+#[test]
+fn single_unit_no_collision_movement_oracle_golden() {
+    let mut world = World::new(Passability::all_passable(), 0x0501_7E17);
+    let unit = world.spawn_unit(0, 1, CellCoord::new(5, 5), Facing(32), 500, stats(18, 6));
+    let log = single_unit_oracle_log(unit);
+    let chain = run(&mut world, &log);
+
+    // Derived once via `cargo test -p ra-sim --test determinism \
+    // single_unit_no_collision_movement_oracle_golden -- --nocapture` and
+    // copied from the printed chain (same "computed once, read back, and
+    // pinned" policy as every other golden hash in this repo).
+    let golden: [u64; SINGLE_UNIT_ORACLE_TICKS] = [
+        0xfb94_37e6_2da2_4d6d,
+        0xc3f3_82fe_5777_725f,
+        0xafef_6bf9_3b7b_4e65,
+        0x8609_86ca_1722_0d4f,
+        0x1d38_2221_1006_b859,
+        0x91db_04cf_73bc_0a9c,
+        0x3125_c2e9_4566_7a73,
+        0x08dc_77dc_6a25_db7d,
+        0x6611_63b5_f78f_9552,
+        0xc9f2_019f_9a08_5d27,
+        0x8974_b56d_0165_c8a0,
+        0x80b2_4220_2c58_c0d1,
+        0x070a_ca94_0fb6_06e6,
+        0x76f9_5f77_8b57_c003,
+        0xbd7f_a403_6326_a422,
+        0x3fc0_74c7_b83e_2c3e,
+        0x2532_aea9_89ee_2c24,
+        0x49dc_cfbe_1018_cd7d,
+        0xcda1_4d9a_4c0a_0c9a,
+        0x64dd_7cae_a528_8a4f,
+        0xc62d_4095_9845_a5f8,
+        0x8540_712b_d7bc_2cb9,
+        0xd06d_4475_80c2_2176,
+        0x43ea_fc3b_3017_5be0,
+        0xe405_b5d5_63d4_6dbf,
+        0xd1bd_71c2_b239_e7db,
+        0x7260_305e_0fc1_63a3,
+        0x0b91_44b6_b7c9_76a7,
+        0x64b5_505d_0a7f_ebcb,
+        0x36eb_79fa_3f8c_1923,
+        0x1da1_e9b4_c2b1_a4d6,
+        0x23c0_f391_654e_8538,
+        0x9c0e_d2e5_c1ff_bb61,
+        0x9245_f1b3_3af6_26d0,
+        0xc53b_8e06_fd03_b313,
+        0xf73c_e08e_694a_2ebe,
+        0x61db_0022_bc4e_bd4d,
+        0x4d4e_e65d_f7cd_7c85,
+        0xf24e_b3c9_eddc_8e46,
+        0x597d_15db_7aa5_732b,
+    ];
+    assert_eq!(
+        chain, golden,
+        "single-unit no-collision movement oracle changed — this must ONLY ever move on a \
+         change to the base movement math itself (waypoint advance / facing rotation / path \
+         consumption), never on an occupancy, dispersal, or collision-avoidance change (there is \
+         only one unit on the map, so those branches never fire here)"
+    );
+}
+
+/// Same fixture, same-seed-twice — this oracle must itself be deterministic
+/// before it's trustworthy as a regression pin.
+#[test]
+fn single_unit_no_collision_movement_oracle_is_deterministic() {
+    let mut wa = World::new(Passability::all_passable(), 0x0501_7E17);
+    let ua = wa.spawn_unit(0, 1, CellCoord::new(5, 5), Facing(32), 500, stats(18, 6));
+    let chain_a = run(&mut wa, &single_unit_oracle_log(ua));
+
+    let mut wb = World::new(Passability::all_passable(), 0x0501_7E17);
+    let ub = wb.spawn_unit(0, 1, CellCoord::new(5, 5), Facing(32), 500, stats(18, 6));
+    let chain_b = run(&mut wb, &single_unit_oracle_log(ub));
+
+    assert_eq!(chain_a, chain_b);
 }
 
 // ---------------------------------------------------------------------
@@ -1136,22 +1274,28 @@ mod repin_audit {
         // "computed once, read back, and pinned" policy as every other
         // golden hash in this repo — see `real_scg01ea_hash_chain_prefix_golden`'s
         // doc comment above).
+        // Re-pinned for M7.6: the four-units-to-one-cell script now disperses
+        // (unit cell occupancy — one vehicle per cell), a real movement change, so
+        // this independent movement-only chain legitimately moves too. It still
+        // serves its purpose — proving the M4/M5 combat/economy hash-formula
+        // additions do not perturb movement — now baselined on the M7.6 movement
+        // behavior. (Coordinator-authorised occupancy re-pin; QUIRKS Q5/Q6.)
         let m3_shaped_golden: [u64; 10] = [
-            0xce98_2d5a_ca35_d87b,
-            0x82f9_8cb4_ec25_24f4,
-            0x4170_8686_c784_8b21,
-            0x82fc_ffb8_11c4_25ca,
-            0xcf3a_3496_8299_0177,
-            0x168f_a8cc_f70f_76fc,
-            0xfcb2_571a_f069_1b8a,
-            0x7350_ec3c_3981_89f0,
-            0xd994_2162_06de_4422,
-            0x03d2_04f5_a7f6_0334,
+            0xcae7_fe64_e3cd_ae2d,
+            0x1928_72a0_34f4_4186,
+            0x6653_655a_b6a8_268b,
+            0x8f06_f304_54b6_feec,
+            0x5989_8d2f_e58b_6829,
+            0xf81f_1d18_e728_d5a9,
+            0x7279_54ba_4564_3647,
+            0xf3d8_8841_8016_23e5,
+            0x5dd4_fa64_d7cb_acd3,
+            0x5656_76e4_e86d_d635,
         ];
         assert_eq!(
             m3_shaped_chain, m3_shaped_golden,
-            "movement-only (M3-field-shaped) hash chain changed — this is the real regression \
-             this audit exists to catch, independent of the M4 hash-formula change"
+            "movement-only (M3-field-shaped) hash chain changed — expected to move only on a \
+             deliberate movement change (M7.6 occupancy/dispersal); otherwise a real regression"
         );
 
         // And finally: the production hash chain must equal the golden
@@ -1160,16 +1304,16 @@ mod repin_audit {
         assert_eq!(
             prod_chain,
             [
-                0xcbce_34ae_694c_1b1b,
-                0x8b61_f02b_76f2_2214,
-                0x70c3_f119_6b95_c141,
-                0x6de3_46e5_acaa_572a,
-                0x1e0f_3148_562b_7c17,
-                0xb335_8f45_5866_9d1c,
-                0x6635_14a6_9441_d8ca,
-                0xb3a6_f70c_edff_2790,
-                0x039f_0658_6157_7422,
-                0x59c2_824e_ed65_7fd4,
+                0xe6ce_37fb_c98b_9e8d,
+                0x8f12_8151_a357_4fa6,
+                0xedbc_01c3_1509_1f6b,
+                0x443b_4be3_7df3_e8cc,
+                0xebf9_01c4_2c38_fa89,
+                0xc8e1_58e8_d905_e6c9,
+                0x6e60_ee66_16b9_f6c7,
+                0x9cea_f6d1_10f9_4505,
+                0xa11d_bbc4_be5e_0bd3,
+                0x420e_84c6_f0d5_eb15,
             ],
             "this audit's script diverged from real_scg01ea_hash_chain_prefix_golden's script"
         );

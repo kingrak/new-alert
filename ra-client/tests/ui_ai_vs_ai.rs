@@ -71,7 +71,7 @@ fn load_ai_vs_ai_from_bytes(
     let house_b = if house_a == 2 { 0 } else { 2 };
 
     let conquer = main.open_nested("conquer.mix")?;
-    let content = build_content(&rules, &conquer)?;
+    let content = build_content(&rules, &conquer, None)?;
 
     let passable = ra_data::passability::build(&scenario);
     let grid = Passability::new(128, 128, passable);

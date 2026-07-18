@@ -43,6 +43,8 @@ pub struct Building {
     pub is_construction_yard: bool,
     /// War factory (WEAP): builds vehicles.
     pub is_war_factory: bool,
+    /// Barracks (TENT/BARR): builds infantry (M7.6).
+    pub is_barracks: bool,
 }
 
 impl Building {

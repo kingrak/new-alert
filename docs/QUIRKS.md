@@ -139,3 +139,118 @@ at its attacker (`FootClass::Take_Damage → Assign_Target(source)`,
    the exact playtest complaint that motivated this item. The warhead-can-harm
    and AI threat-comparison gates are omitted; we require only that the retaliator
    is armed and the source is a live enemy unit.
+
+---
+
+## Q5 — Unit cell occupancy: one vehicle per cell, group dispersal, simplified blocker reaction
+
+**Milestone:** M7.6 (coordinator scope additions — vehicle stacking + group move).
+
+**Our behavior.** `move_units` (`ra-sim/src/world.rs`) maintains a per-tick
+[`UnitGrid`] cache and enforces the original's cell-ownership rules:
+
+- **One vehicle per cell.** A vehicle never moves onto a cell another vehicle
+  occupies (`CellClass::Occupier` / `Can_Enter_Cell`, `unit.cpp:3400`). The
+  guard validates the **actual landing cell** of each tick's straight-line step
+  (not just the path's next cell), so a diagonal step cannot corner-clip an
+  occupied neighbour. A `debug_assert` verifies movement never increases the
+  vehicle-overlap count each tick (zero in a real game — a harness that
+  deliberately spawns stacked units, e.g. the splash-armor tests, is tolerated).
+- **Up to five infantry per cell**, one per sub-cell spot (see Q7).
+- **Group dispersal.** A box-selected group ordered to one cell disperses to
+  distinct nearby free cells (`Adjust_Dest` scatter, `unit.cpp`): `pick_dest`
+  spirals out from the target, one vehicle per cell / up to five infantry per
+  cell, so a tank group ends packed *adjacently*, not stacked.
+
+**Simplifications vs. the original (documented deviations).**
+1. **No ask-the-blocker-to-scatter radio protocol** (`drive.cpp` `MOVE_MOVING_BLOCK`
+   → `Do_Uncloak`/radio). A vehicle blocked by another vehicle re-routes **around**
+   it (`find_path_avoiding` — our A* ignores units, so a blocker in the straight
+   path is routed around at drive time); if no detour helps this tick it simply
+   **holds** and retries. A genuine head-on swap resolves because *both* units
+   re-route around each other. A true 1-wide corridor with no detour just waits
+   (rare; benign).
+2. **Closest-free-spot centre fallback** uses the fixed `_sequence[0]` order rather
+   than the RNG-picked `_alternate` row (`cell.cpp:1948`), avoiding a new sim-RNG
+   draw in the movement path (determinism, and it keeps existing goldens' RNG
+   sequence intact).
+3. **No crushing.** Heavy vehicles do not crush infantry (`unit.cpp:Overrun`);
+   a vehicle simply cannot enter a cell whose infantry spots leave it (for the
+   movement gate) impassable-equivalent. Deferred.
+
+**Hash impact.** This is a real movement behavior change and legitimately moves
+real-map movement goldens (re-pinned in `determinism.rs` / `ui_shroud_golden.rs`
+with this citation). **Single-unit and non-colliding movement is byte-identical**
+to pre-M7.6 (the advance is the original multi-waypoint step computed on a copy;
+the gate/dispersal/re-route only fire on an actual collision), so synthetic
+single-unit goldens are unchanged.
+
+---
+
+## Q6 — Land-type passability: impassability modelled, per-class speed deferred
+
+**Milestone:** M7.6 (coordinator scope addition — real land types).
+
+**Our behavior.** Passability is now **per-locomotor** (`Foot`/`Track`/`Wheel`),
+replacing the M3 water-only stand-in. A cell's land type comes from its theater
+tileset's per-icon **ColorMap control byte** run through the fixed 16-entry table
+(`TemplateTypeClass::Land_Type`, `cdata.cpp:1011`); whether a locomotor may enter
+is `Ground[land].Cost[speed] != 0` (`unit.cpp:3429`, `infantry.cpp:1568`), with
+the cost percentages read from rules.ini `[Clear]/[Road]/[Water]/[Rock]/[Wall]/
+[Ore]/[Beach]/[Rough]/[River]` `Foot=`/`Track=`/`Wheel=` (`rules.cpp:831`). So
+rock/cliff/slope templates block **everything**, water/river block **ground** (all
+three land locomotors), and infantry (Foot) vs vehicles (Track/Wheel) get their
+genuinely different rules. Tanks are `Track`, jeep/APC/harvester `Wheel`, infantry
+`Foot` (`udata.cpp:1301`, `idata.cpp:1081`).
+
+**Deferrals (documented).**
+1. **Speed *modifiers* per land class are not modelled** — only impassability
+   (`cost == 0`). The `<100%` costs (Beach/Rough slowing vehicles, etc.) are
+   collapsed to "passable"; every unit moves at full MPH on any drivable cell.
+   The must-have (movement correctness — no driving over mountains/cliffs) is met.
+2. **Wall overlays** (`SBAG`/`BRIK`/… → `LAND_WALL`, `odata.cpp`) are not yet
+   folded into the masks; only *template* land types are. Ore overlays are
+   correctly passable. Wall-blocking is a small follow-up (the playtest complaint
+   was cliffs/mountains, which are templates).
+3. **Misparse safety:** a cell whose template has no ColorMap, or an unloaded
+   template, or a clear sentinel, resolves to `Clear` (passable) — so a bad parse
+   degrades to drivable rather than walling the map off.
+
+**Hash impact.** Real-map pathing changes (units route around cliffs/water), so
+real-map goldens that legitimately move are re-pinned with this citation. Synthetic
+grids (built via `Passability::new` from a uniform mask) apply the same mask to all
+three locomotors, so every synthetic movement golden is byte-identical.
+
+---
+
+## Q7 — Infantry: sub-cell spots first-class; prone/veterancy/death-variants deferred
+
+**Milestone:** M7.6 (the milestone's core: soldiers + barracks).
+
+**Our behavior.** Infantry live in the shared `Units` arena with a `kind`
+discriminant (not a separate arena — DESIGN §4.3), so movement, combat, targeting,
+retaliation, bullets, and selection treat them as first-class with no duplication
+(matching the existing `is_harvester` capability pattern). Each infantryman
+occupies one of **five sub-cell spots** — centre + 4 quadrants at the original's
+`StoppingCoordAbs` lepton offsets (`const.cpp:282`) — tracked as a 5-bit occupancy
+mask like `CellClass::Flag.Occupy` (`cell.h:207`); on arrival it settles into the
+closest free spot (`Closest_Free_Spot`, `cell.cpp:1897`). Infantry pathfind
+cell-to-cell over the same grid with the `Foot` locomotor and MPH speed from
+rules.ini. E1 (M1Carbine), E2 (grenade), E3 (RedEye) fight through the existing
+weapon/warhead/Verses path; `Armor=none` means a JEEP's SA machine gun does full
+damage. The barracks (TENT) is a third production strip (`ProdKind::Infantry`),
+independent of the war factory, matching the original's separate infantry queue.
+
+**Deferrals (documented).**
+1. **Prone/crawling** (`DO_PRONE`/`DO_CRAWL`) — infantry always move/fire upright;
+   the prone speed/defence bonus is not modelled.
+2. **No veterancy** (RA1 has none anyway).
+3. **Death animations + `InfDeath` variants** (`DO_GUN_DEATH`/`EXPLOSION_DEATH`/…)
+   — infantry are removed from the arena on death like vehicles; the client draws
+   the shared explosion, not the per-warhead infantry death SHP band.
+4. **Arcing grenade → straight flight.** E2's grenade is `Arcing` in rules.ini;
+   the projectile flies the straight flat-trajectory path (`bullet.rs` advance) —
+   the arc is cosmetic and the impact point is the same. (`bullet.cpp:751` fires
+   straight; the arc is a draw-time parabola we do not render.)
+5. **Vehicle/infantry cell coexistence simplified:** a vehicle blocks a whole cell
+   for *entry* but does not crush infantry already there (see Q5.3).

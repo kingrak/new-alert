@@ -69,6 +69,12 @@ pub struct Template {
     /// Offset of the per-icon land/terrain-type table, RA layout only. Best
     /// effort: the field exists but its length is not self-describing.
     color_map_off: Option<usize>,
+    /// Template map dimensions in *cells* (`MapWidth`@0x08 / `MapHeight`@0x0A) —
+    /// the size of the icon-number → control-byte grid, needed to index the
+    /// ColorMap the way `TemplateTypeClass::Land_Type` does (`cdata.cpp:1038`:
+    /// `map[icon % (Map_Width()*Map_Height())]`).
+    map_w: u16,
+    map_h: u16,
 }
 
 impl Template {
@@ -77,6 +83,9 @@ impl Template {
         let width = read_u16(data, 0, "tmpl width")?;
         let height = read_u16(data, 2, "tmpl height")?;
         let count = read_u16(data, 4, "tmpl count")?;
+        // MapWidth/MapHeight (cells) — present in both layouts at 0x08/0x0A.
+        let map_w = read_u16(data, 8, "tmpl map width").unwrap_or(1).max(1);
+        let map_h = read_u16(data, 10, "tmpl map height").unwrap_or(1).max(1);
 
         if width == 0 || height == 0 {
             return Err(FormatError::Invalid {
@@ -124,6 +133,8 @@ impl Template {
             trans_off,
             color_map_off: color_map_off.filter(|&o| o != 0 && o < data.len()),
             map_off: Some(map_off).filter(|&o| o != 0 && o < data.len()),
+            map_w,
+            map_h,
         })
     }
 
@@ -168,6 +179,17 @@ impl Template {
             pixels,
             transparent,
         })
+    }
+
+    /// The land-control byte (0..15) for logical icon number `icon`, read from
+    /// the ColorMap the way `TemplateTypeClass::Land_Type` does (`cdata.cpp:1038`):
+    /// `map[icon % (MapWidth*MapHeight)]`. Callers pass this through the
+    /// control-byte → `LandType` table. `None` when the template has no ColorMap.
+    pub fn land_control(&self, icon: usize) -> Option<u8> {
+        let off = self.color_map_off?;
+        let cells = self.map_w as usize * self.map_h as usize;
+        let idx = if cells == 0 { icon } else { icon % cells };
+        self.raw.get(off + idx).copied()
     }
 
     /// Best-effort per-icon land/terrain-type bytes (RA layout only). The

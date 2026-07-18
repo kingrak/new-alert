@@ -285,6 +285,77 @@ pub fn dir_to_32(facing: Facing) -> u8 {
     (((facing.0 as u16 + 4) >> 3) & 31) as u8
 }
 
+/// A unit's ground-movement class (`SpeedType`, `defines.h`): which column of the
+/// land-type cost table (`Ground[land].Cost[speed]`, `rules.cpp` `Land_Types`)
+/// governs whether it may enter a cell. Infantry are `Foot`; tracked vehicles
+/// (tanks) are `Track`; wheeled vehicles (jeep/APC/harvester) are `Wheel`. The
+/// three differ in their per-land passability (rock/water block all; rivers block
+/// ground; infantry cross terrain a vehicle cannot), which is exactly the
+/// distinction infantry movement needs.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Hash)]
+pub enum Locomotor {
+    /// Infantry (`SPEED_FOOT`).
+    Foot,
+    /// Tracked vehicle (`SPEED_TRACK`) — tanks.
+    #[default]
+    Track,
+    /// Wheeled vehicle (`SPEED_WHEEL`) — jeep, APC, harvester.
+    Wheel,
+}
+
+/// Number of infantry sub-cell spots per cell (`center + 4 quadrants`).
+pub const SUBCELL_COUNT: usize = 5;
+
+/// Lepton offsets of each sub-cell spot from a cell's **top-left** corner,
+/// transcribed verbatim from `StoppingCoordAbs[5]` (`const.cpp:282`): index
+/// 0=center, 1=NW, 2=NE, 3=SW, 4=SE. The array index doubles as the cell
+/// occupancy bit position (`CellClass::Flag.Occupy`, `cell.h:207`).
+pub const SPOT_OFFSET: [(i32, i32); SUBCELL_COUNT] = [
+    (128, 128), // 0 center
+    (64, 64),   // 1 upper-left  (NW)
+    (192, 64),  // 2 upper-right (NE)
+    (64, 192),  // 3 lower-left  (SW)
+    (192, 192), // 4 lower-right (SE)
+];
+
+impl CellCoord {
+    /// The world coordinate of sub-cell `spot` (0..[`SUBCELL_COUNT`]) within this
+    /// cell — the cell's top-left plus [`SPOT_OFFSET`]. `spot` is clamped so an
+    /// out-of-range index resolves to the centre.
+    pub fn spot_center(self, spot: u8) -> WorldCoord {
+        let (ox, oy) = SPOT_OFFSET[(spot as usize).min(SUBCELL_COUNT - 1)];
+        WorldCoord {
+            x: Lepton(self.x * LEPTONS_PER_CELL + ox),
+            y: Lepton(self.y * LEPTONS_PER_CELL + oy),
+        }
+    }
+}
+
+/// The sub-cell spot index (0..[`SUBCELL_COUNT`]) a world coordinate falls in —
+/// port of `CellClass::Spot_Index` (`cell.cpp:1845`): within 60 leptons of the
+/// cell centre → spot 0; otherwise the quadrant chosen by whether the sub-cell
+/// fraction exceeds 128 on each axis (`+1` for the right column, `+2` for the
+/// bottom row, then `+1` to skip the centre slot).
+pub fn spot_index(coord: WorldCoord) -> u8 {
+    let fx = coord.x.0.rem_euclid(LEPTONS_PER_CELL);
+    let fy = coord.y.0.rem_euclid(LEPTONS_PER_CELL);
+    // Octagonal `Distance` from the cell centre (128,128) < 60 → centre spot.
+    let dx = (fx - 128).abs();
+    let dy = (fy - 128).abs();
+    let dist = if dx > dy { dx + dy / 2 } else { dy + dx / 2 };
+    if dist < 60 {
+        return 0;
+    }
+    let mut index = 0u8;
+    if fx > 128 {
+        index |= 0x01;
+    }
+    if fy > 128 {
+        index |= 0x02;
+    }
+    index + 1
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

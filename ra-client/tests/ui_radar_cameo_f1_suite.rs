@@ -237,6 +237,7 @@ fn radar_victory_fixture(seed: u32) -> AppCore {
     let mut world = World::new(Passability::all_passable(), seed);
     world.set_catalog(Catalog {
         buildings: vec![BuildingProto {
+            is_barracks: false,
             name: "HUT".to_string(),
             foot_w: 1,
             foot_h: 1,
@@ -354,6 +355,7 @@ fn cameo_row_core(seed: u32) -> AppCore {
     use ra_sim::{BuildingProto, Catalog, EconRules, MoveStats, Passability, UnitProto, World};
 
     let bproto = |name: &str, wf: bool| BuildingProto {
+        is_barracks: false,
         name: name.to_string(),
         foot_w: 2,
         foot_h: 2,
@@ -370,6 +372,8 @@ fn cameo_row_core(seed: u32) -> AppCore {
         sprite_id: 0,
     };
     let uproto = |name: &str| UnitProto {
+        is_infantry: false,
+        locomotor: 1,
         name: name.to_string(),
         sprite_id: 0,
         max_health: 100,

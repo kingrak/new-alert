@@ -72,6 +72,8 @@ fn run(args: &[String]) -> Result<(), BoxErr> {
         "battle" => cmd_battle(args),
         "econ" => cmd_econ(args),
         "skirmish" => cmd_skirmish(args),
+        "verify-m76" => cmd_verify_m76(args),
+        "verify-terrain" => cmd_verify_terrain(args),
         _ => {
             eprintln!(
                 "usage:\n  ra-client dump     [--assets DIR] [--scenario NAME] [--out PATH.png] [--rect CX CY CW CH] [--playable]\n  ra-client window   [--assets DIR] [--scenario NAME] [--smoke-seconds N]\n  ra-client sim      [--assets DIR] [--scenario NAME] [--out-dir DIR]\n  ra-client battle   [--assets DIR] [--scenario NAME] [--out-dir DIR]\n  ra-client econ     [--assets DIR] [--scenario NAME] [--out-dir DIR] [--credits N]\n  ra-client skirmish [--assets DIR] [--scenario NAME] [--out-dir DIR] [--credits N] [--difficulty easy|normal|hard] [--ticks N]"
@@ -1303,7 +1305,14 @@ fn drive_skirmish(
         })
         .find(|&c| core.world().passability().is_passable(c));
     let connected = probe
-        .and_then(|c| ra_sim::path::find_path(core.world().passability(), player_start, c))
+        .and_then(|c| {
+            ra_sim::path::find_path(
+                core.world().passability(),
+                player_start,
+                c,
+                ra_sim::coords::Locomotor::Track,
+            )
+        })
         .is_some();
     report.push_str(&format!(
         "land route player<->AI area: {connected} (ground-reachable)\n"
@@ -1527,4 +1536,374 @@ fn drive_skirmish(
     ));
 
     Ok((report, hashes))
+}
+
+// ===========================================================================
+// M7.6 infantry + barracks verification (scripted, real assets).
+// ===========================================================================
+
+// Fixed catalog ids (mirror ra_client::assets::build_content declaration order).
+const V_FACT: u32 = 0;
+const V_POWR: u32 = 1;
+const V_TENT: u32 = 4;
+const V_JEEP: u32 = 4;
+const V_E1: u32 = 5;
+const V_E2: u32 = 6;
+const V_E3: u32 = 7;
+
+/// Scripted end-to-end verification of infantry + barracks (M7.6): place a
+/// barracks, produce an E1/E2/E3 squad, pack it into one cell (5-per-cell sub-cell
+/// spots), have it attack a JEEP and a building, have the JEEP kill infantry
+/// (Armor=none), and dump PNG evidence. Runs the whole script twice and asserts
+/// identical hash chains.
+fn cmd_verify_m76(mut args: Vec<String>) -> Result<(), BoxErr> {
+    use ra_sim::{Command, Target};
+    let out_dir = take_flag(&mut args, "--out-dir").unwrap_or_else(|| ".".to_string());
+    let assets_flag = take_flag(&mut args, "--assets");
+    let scenario = take_flag(&mut args, "--scenario").unwrap_or_else(|| "scg05eb.ini".to_string());
+    let dir = platform::resolve_assets_dir(assets_flag.as_deref())
+        .ok_or("could not find an assets directory (try --assets DIR or RA_ASSETS_DIR)")?;
+    eprintln!("assets: {}  scenario: {scenario}", dir.display());
+
+    let run = |dump: bool| -> Result<(String, Vec<u64>), BoxErr> {
+        let game = assets::load_econ_from_dir(&dir, &scenario, 20000)?;
+        let mut core = game.core;
+        let house = game.controlled;
+        let enemy: u8 = if house == 2 { 3 } else { 2 };
+        let base = game.start_cell;
+        let mut hashes: Vec<u64> = Vec::new();
+        let mut report = String::new();
+
+        // --- Setup: stamp a base (yard/power/barracks) for the player house and
+        // an enemy structure, directly (the loader path, no build UI needed). ---
+        {
+            let w = core.world_mut();
+            let yard = CellCoord::new(base.x, base.y);
+            w.spawn_building(V_FACT, house, yard);
+            w.spawn_building(V_POWR, house, CellCoord::new(base.x + 4, base.y));
+            w.spawn_building(V_TENT, house, CellCoord::new(base.x, base.y + 5));
+            // Enemy power plant a few cells away — an infantry attack target.
+            w.spawn_building(V_POWR, enemy, CellCoord::new(base.x + 10, base.y + 6));
+        }
+        report.push_str(&format!(
+            "player {house} base at ({},{}); barracks at ({},{})\n",
+            base.x,
+            base.y,
+            base.x,
+            base.y + 5
+        ));
+
+        // --- Produce an E1/E2/E3 squad through the barracks strip. ---
+        let squad_types = [V_E1, V_E1, V_E3, V_E2, V_E2];
+        let mut squad: Vec<ra_sim::Handle> = Vec::new();
+        for &ut in &squad_types {
+            match produce_one_infantry(&mut core, house, ut, &mut hashes) {
+                Some(h) => squad.push(h),
+                None => return Err(format!("infantry proto {ut} never spawned").into()),
+            }
+        }
+        report.push_str(&format!(
+            "produced {} infantry via TENT strip\n",
+            squad.len()
+        ));
+
+        // --- Pack the squad into ONE cell — verify distinct sub-cell spots. ---
+        let pack_cell = CellCoord::new(base.x + 6, base.y + 10);
+        for &h in &squad {
+            core.inject_command(Command::Move {
+                unit: h,
+                dest: pack_cell,
+                house,
+            });
+        }
+        // Step until they settle (paths empty), up to a budget.
+        for _ in 0..600 {
+            core.update(67);
+            hashes.push(core.sim_hash());
+            if squad.iter().all(|&h| {
+                core.world()
+                    .units
+                    .get(h)
+                    .map(|u| !u.is_moving())
+                    .unwrap_or(true)
+            }) {
+                break;
+            }
+        }
+        // Report the cells + spots the squad settled into.
+        let mut packed_cells = std::collections::BTreeMap::<i64, Vec<u8>>::new();
+        for &h in &squad {
+            if let Some(u) = core.world().units.get(h) {
+                let c = u.cell();
+                packed_cells
+                    .entry((c.y as i64) * 1000 + c.x as i64)
+                    .or_default()
+                    .push(u.sub_cell);
+            }
+        }
+        let max_per_cell = packed_cells.values().map(|v| v.len()).max().unwrap_or(0);
+        report.push_str(&format!(
+            "squad packed into {} cell(s), up to {} infantry/cell, spots: {:?}\n",
+            packed_cells.len(),
+            max_per_cell,
+            packed_cells.values().collect::<Vec<_>>()
+        ));
+        // Frame camera on the squad and dump the "packed" PNG.
+        center_camera_on(&mut core, pack_cell);
+        if dump {
+            dump_game_png(&mut core, &out_dir, "m76_squad_packed.png")?;
+        }
+
+        // --- Spawn an enemy JEEP; squad attacks it and the enemy building; the
+        // JEEP fires back and kills infantry (Armor=none takes full damage). ---
+        let jeep_cell = CellCoord::new(pack_cell.x + 3, pack_cell.y);
+        let jeep = spawn_combat_unit(&mut core, V_JEEP, enemy, jeep_cell);
+        let enemy_bldg = core
+            .world()
+            .buildings
+            .iter()
+            .find(|(_, b)| b.house == enemy)
+            .map(|(h, _)| h);
+        // First two infantry target the building, the rest the JEEP.
+        for (i, &h) in squad.iter().enumerate() {
+            let target = if i < 2 {
+                enemy_bldg
+                    .map(Target::Building)
+                    .unwrap_or(Target::Unit(jeep))
+            } else {
+                Target::Unit(jeep)
+            };
+            core.inject_command(Command::Attack {
+                unit: h,
+                target,
+                house,
+            });
+        }
+        // The JEEP fires on the nearest infantryman.
+        if let Some(&first) = squad.first() {
+            core.inject_command(Command::Attack {
+                unit: jeep,
+                target: Target::Unit(first),
+                house: enemy,
+            });
+        }
+        // Mid-fight snapshot after a few ticks.
+        for _ in 0..25 {
+            core.update(67);
+            hashes.push(core.sim_hash());
+        }
+        if dump {
+            dump_game_png(&mut core, &out_dir, "m76_midfight.png")?;
+        }
+        // Resolve the skirmish.
+        let mut jeep_dead_tick = None;
+        for _ in 0..400 {
+            core.update(67);
+            hashes.push(core.sim_hash());
+            if jeep_dead_tick.is_none() && !core.world().units.contains(jeep) {
+                jeep_dead_tick = Some(core.world().tick_count());
+            }
+        }
+        let alive_inf = squad
+            .iter()
+            .filter(|&&h| core.world().units.contains(h))
+            .count();
+        let jeep_alive = core.world().units.contains(jeep);
+        let bldg_alive = enemy_bldg
+            .map(|h| core.world().buildings.get(h).is_some_and(|b| b.is_alive()))
+            .unwrap_or(false);
+        report.push_str(&format!(
+            "after fight: {alive_inf}/{} infantry alive, JEEP alive={jeep_alive} (died tick {:?}), \
+             enemy building alive={bldg_alive}\n",
+            squad.len(),
+            jeep_dead_tick
+        ));
+        if dump {
+            dump_game_png(&mut core, &out_dir, "m76_aftermath.png")?;
+        }
+        Ok((report, hashes))
+    };
+
+    let (report, h1) = run(true)?;
+    let (_r2, h2) = run(false)?;
+    eprintln!("--- M7.6 infantry verification ---\n{report}");
+    if h1 == h2 {
+        eprintln!(
+            "DETERMINISM OK: identical {}-tick hash chains across two runs (final {:#018x})",
+            h1.len(),
+            h1.last().copied().unwrap_or(0)
+        );
+        Ok(())
+    } else {
+        let first = h1.iter().zip(&h2).position(|(a, b)| a != b).unwrap_or(0);
+        Err(format!("determinism FAILED: hash chains diverge at tick {first}").into())
+    }
+}
+
+/// Start one infantryman of proto `unit_id` at `house`'s barracks and step until
+/// it spawns; returns its handle (or `None` on timeout).
+fn produce_one_infantry(
+    core: &mut AppCore,
+    house: u8,
+    unit_id: u32,
+    hashes: &mut Vec<u64>,
+) -> Option<ra_sim::Handle> {
+    let before: std::collections::BTreeSet<u32> = core
+        .world()
+        .units
+        .handles()
+        .into_iter()
+        .map(|h| h.index)
+        .collect();
+    core.inject_command(ra_sim::Command::StartProduction {
+        house,
+        item: BuildItem::Unit(unit_id),
+    });
+    for _ in 0..4000 {
+        core.update(67);
+        hashes.push(core.sim_hash());
+        // Find a brand-new infantry unit of this house.
+        let found = core
+            .world()
+            .units
+            .iter()
+            .find(|(h, u)| u.house == house && u.is_infantry() && !before.contains(&h.index));
+        if let Some((h, _)) = found {
+            return Some(h);
+        }
+    }
+    None
+}
+
+/// Spawn a combat-ready unit of catalog proto `unit_id` for `house` at `cell`
+/// (wiring stats from the catalog), returning its handle.
+fn spawn_combat_unit(
+    core: &mut AppCore,
+    unit_id: u32,
+    house: u8,
+    cell: CellCoord,
+) -> ra_sim::Handle {
+    let proto = core
+        .world()
+        .catalog
+        .unit(unit_id)
+        .cloned()
+        .expect("proto present");
+    let w = core.world_mut();
+    let h = w.spawn_unit(
+        proto.sprite_id,
+        house,
+        cell,
+        ra_sim::coords::Facing(0),
+        proto.max_health,
+        proto.stats,
+    );
+    w.set_unit_max_health(h, proto.max_health);
+    w.set_unit_combat(h, proto.armor, proto.weapon, proto.has_turret);
+    h
+}
+
+/// Centre the camera on `cell` (map-space) for a game-surface dump.
+fn center_camera_on(core: &mut AppCore, cell: CellCoord) {
+    let px = (cell.x * CELL as i32) as f32 - core.tactical_width() as f32 / 2.0;
+    let py = (cell.y * CELL as i32) as f32 - core.viewport_size().1 as f32 / 2.0;
+    core.set_camera(px.max(0.0), py.max(0.0));
+}
+
+/// Demonstrate real land-type passability: find an impassable barrier
+/// (rock/cliff/water) with drivable ground on both sides, spawn a tank on one
+/// side, order it to the far side, and show it routes *around* the barrier (never
+/// onto an impassable cell) rather than driving over it. Dumps a PNG mid-route.
+fn cmd_verify_terrain(mut args: Vec<String>) -> Result<(), BoxErr> {
+    use ra_sim::coords::Locomotor;
+    let out_dir = take_flag(&mut args, "--out-dir").unwrap_or_else(|| ".".to_string());
+    let assets_flag = take_flag(&mut args, "--assets");
+    let scenario = take_flag(&mut args, "--scenario").unwrap_or_else(|| "scg05eb.ini".to_string());
+    let dir = platform::resolve_assets_dir(assets_flag.as_deref())
+        .ok_or("could not find an assets directory (try --assets DIR or RA_ASSETS_DIR)")?;
+
+    let game = assets::load_econ_from_dir(&dir, &scenario, 5000)?;
+    let mut core = game.core;
+    let pass = core.world().passability();
+
+    // Scan for a start/goal pair straddling an impassable barrier: a passable
+    // start, a passable goal a few cells east, with at least one impassable cell
+    // on the straight line between them, and a real (routed-around) path.
+    let mut chosen: Option<(CellCoord, CellCoord, usize, usize)> = None;
+    'outer: for y in 2..126 {
+        for x in 2..114 {
+            let start = CellCoord::new(x, y);
+            let goal = CellCoord::new(x + 10, y);
+            if !pass.is_passable(start) || !pass.is_passable(goal) {
+                continue;
+            }
+            let barrier = (1..10).any(|d| !pass.is_passable(CellCoord::new(x + d, y)));
+            if !barrier {
+                continue;
+            }
+            if let Some(path) = ra_sim::path::find_path(pass, start, goal, Locomotor::Track) {
+                // A routed-around path is strictly longer than the 10-cell straight line.
+                if path.len() > 10 {
+                    chosen = Some((start, goal, path.len(), 10));
+                    break 'outer;
+                }
+            }
+        }
+    }
+    let Some((start, goal, path_len, straight)) = chosen else {
+        return Err("no impassable barrier with a routed-around path found on this map".into());
+    };
+    eprintln!(
+        "barrier demo: tank at ({},{}) -> ({},{}); straight line = {straight} cells crosses \
+         impassable terrain, A* route = {path_len} cells (goes around)",
+        start.x, start.y, goal.x, goal.y
+    );
+
+    let tank = spawn_combat_unit(&mut core, V_JEEP, game.controlled, start);
+    core.inject_command(ra_sim::Command::Move {
+        unit: tank,
+        dest: goal,
+        house: game.controlled,
+    });
+    // Step and record every cell the tank occupies; assert none is impassable.
+    let mut crossed_impassable = false;
+    for _ in 0..600 {
+        core.update(67);
+        let c = core.world().units.get(tank).map(|u| u.cell());
+        if let Some(c) = c {
+            if !core.world().passability().is_passable(c) {
+                crossed_impassable = true;
+            }
+        }
+        if core
+            .world()
+            .units
+            .get(tank)
+            .map(|u| !u.is_moving())
+            .unwrap_or(true)
+        {
+            break;
+        }
+    }
+    let end = core.world().units.get(tank).map(|u| u.cell());
+    eprintln!(
+        "tank ended at {end:?} (goal {goal:?}); ever stood on an impassable cell: {crossed_impassable}"
+    );
+    center_camera_on(&mut core, CellCoord::new((start.x + goal.x) / 2, start.y));
+    dump_game_png(&mut core, &out_dir, "m76_terrain_route.png")?;
+    if crossed_impassable {
+        return Err("tank drove over impassable terrain — land-type passability failed".into());
+    }
+    eprintln!("LAND-TYPE OK: tank routed around the barrier without crossing impassable terrain");
+    Ok(())
+}
+
+/// Compose the game surface and write it to `out_dir/name`.
+fn dump_game_png(core: &mut AppCore, out_dir: &str, name: &str) -> Result<(), BoxErr> {
+    let f = core.compose_game();
+    let bytes = png::encode_rgba(f.width, f.height, &f.pixels);
+    let path = std::path::Path::new(out_dir).join(name);
+    std::fs::write(&path, &bytes)?;
+    eprintln!("wrote {}", path.display());
+    Ok(())
 }

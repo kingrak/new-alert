@@ -7,8 +7,12 @@
 
 use std::collections::HashMap;
 
+use ra_data::landtype::{
+    land_from_control, LandCosts, LandType, LOCO_FOOT, LOCO_TRACK, LOCO_WHEEL,
+};
 use ra_data::scenario::{Scenario, MAP_CELL_H, MAP_CELL_W};
 use ra_data::templates;
+use ra_formats::ini::Ini;
 use ra_formats::tmpl::{Template, ICON_HEIGHT, ICON_WIDTH};
 
 use crate::compositor::IndexedImage;
@@ -57,6 +61,55 @@ impl TileSet {
         let ic = t.icon(icon as usize)?;
         Some((ic.pixels, ic.transparent))
     }
+
+    /// The land type of a cell, from its template's per-icon ColorMap control
+    /// byte (`TemplateTypeClass::Land_Type`, `cdata.cpp:1011`). Clear-sentinel and
+    /// unloaded-template cells (and templates without a ColorMap) resolve to
+    /// `Clear`, so misparsed or missing art degrades to passable rather than
+    /// walling the map off.
+    pub fn land_type(&self, template: u16, icon: u8) -> LandType {
+        if is_clear(template) {
+            return LandType::Clear;
+        }
+        match self.templates.get(&template) {
+            Some(t) => t
+                .land_control(icon as usize)
+                .map(land_from_control)
+                .unwrap_or(LandType::Clear),
+            None => LandType::Clear,
+        }
+    }
+}
+
+/// Build the three per-locomotor static passability masks (Foot/Track/Wheel) for
+/// a scenario from its per-cell land types and the rules.ini land-cost sections
+/// (`Ground[land].Cost[speed] != 0`). Returns `(foot, track, wheel)`, each a
+/// row-major `128×128` mask (`true` = drivable). This replaces the M3 water-only
+/// stand-in: rock/cliff/slope templates block every locomotor, water and river
+/// block ground, and infantry vs vehicles get their genuinely different rules.
+pub fn build_passability_masks(
+    scenario: &Scenario,
+    tiles: &TileSet,
+    rules: &Ini,
+) -> (Vec<bool>, Vec<bool>, Vec<bool>) {
+    let costs = LandCosts::from_rules(rules);
+    let w = MAP_CELL_W;
+    let h = MAP_CELL_H;
+    let n = (w * h) as usize;
+    let mut foot = vec![true; n];
+    let mut track = vec![true; n];
+    let mut wheel = vec![true; n];
+    for cy in 0..h {
+        for cx in 0..w {
+            let cell = scenario.cell(cx, cy);
+            let land = tiles.land_type(cell.template, cell.icon);
+            let i = (cy * w + cx) as usize;
+            foot[i] = costs.passable(land, LOCO_FOOT);
+            track[i] = costs.passable(land, LOCO_TRACK);
+            wheel[i] = costs.passable(land, LOCO_WHEEL);
+        }
+    }
+    (foot, track, wheel)
 }
 
 /// Is this template id a "clear" cell (rendered from CLEAR1 with a scrambled

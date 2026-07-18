@@ -23,7 +23,7 @@ use crate::font;
 use crate::input::{InputEvent, Key, MouseButton, Rect};
 use crate::unit_render::{
     draw_health_bar, draw_rect_outline, draw_sprite_centered, draw_sprite_topleft, fill_rect,
-    UnitSprite,
+    infantry_frame, InfAction, InfantryAnim, UnitSprite,
 };
 
 /// Sim commands the UI emits. Re-exported from the sim so the whole app speaks
@@ -243,6 +243,9 @@ pub struct AppCore {
     /// Building idle sprites, indexed by building type id.
     building_sprites: Vec<UnitSprite>,
     building_overlays: Vec<Option<UnitSprite>>,
+    /// Per-unit-type infantry animation layout, indexed by `Unit::type_id`
+    /// (`None` = a vehicle). Drives the Do-table frame selection in `draw_units`.
+    infantry_anim: Vec<Option<InfantryAnim>>,
     /// The buildable items the sidebar lists, in display order.
     buildables: Vec<BuildItem>,
     /// Active placement mode: a completed building type id awaiting a map click.
@@ -336,6 +339,7 @@ impl AppCore {
             player_house: None,
             building_sprites: Vec::new(),
             building_overlays: Vec::new(),
+            infantry_anim: Vec::new(),
             buildables: Vec::new(),
             placing: None,
             show_help: false,
@@ -392,6 +396,13 @@ impl AppCore {
     /// Install building idle sprites, indexed by building type id.
     pub fn set_building_sprites(&mut self, sprites: Vec<UnitSprite>) {
         self.building_sprites = sprites;
+    }
+
+    /// Install the per-unit-type infantry animation layouts (indexed by
+    /// `Unit::type_id`; `None` for vehicles). Enables the infantry Do-table frame
+    /// selection in the unit renderer.
+    pub fn set_infantry_anim(&mut self, anim: Vec<Option<InfantryAnim>>) {
+        self.infantry_anim = anim;
     }
 
     /// Optional overlay shapes drawn over the base building sprite (the war
@@ -494,9 +505,15 @@ impl AppCore {
                     .map(|p| p.progress_permille());
                 (prog, ready)
             }
-            (BuildItem::Unit(_), Some(h)) => {
-                let prog = h
-                    .unit_prod
+            (BuildItem::Unit(id), Some(h)) => {
+                // Infantry build on their own barracks strip (infantry_prod);
+                // vehicles on the war-factory lane (unit_prod).
+                let lane = if cat.unit(id).map(|p| p.is_infantry).unwrap_or(false) {
+                    &h.infantry_prod
+                } else {
+                    &h.unit_prod
+                };
+                let prog = lane
                     .filter(|p| p.item == item)
                     .map(|p| p.progress_permille());
                 (prog, false)
@@ -520,14 +537,25 @@ impl AppCore {
                     .unwrap_or(false);
                 (yard, free)
             }
-            BuildItem::Unit(_) => {
-                let fac = self
-                    .world
-                    .buildings
-                    .iter()
-                    .any(|(_, b)| b.house == house && b.is_war_factory && b.is_alive());
-                let free = hs.map(|h| h.unit_prod.is_none()).unwrap_or(false);
-                (fac, free)
+            BuildItem::Unit(id) => {
+                let is_inf = cat.unit(id).map(|p| p.is_infantry).unwrap_or(false);
+                if is_inf {
+                    let fac = self
+                        .world
+                        .buildings
+                        .iter()
+                        .any(|(_, b)| b.house == house && b.is_barracks && b.is_alive());
+                    let free = hs.map(|h| h.infantry_prod.is_none()).unwrap_or(false);
+                    (fac, free)
+                } else {
+                    let fac = self
+                        .world
+                        .buildings
+                        .iter()
+                        .any(|(_, b)| b.house == house && b.is_war_factory && b.is_alive());
+                    let free = hs.map(|h| h.unit_prod.is_none()).unwrap_or(false);
+                    (fac, free)
+                }
             }
         };
         let funds = self.world.house_credits(house) > 0;
@@ -561,6 +589,20 @@ impl AppCore {
     /// Borrow the simulation world (read-only view for tests/tools).
     pub fn world(&self) -> &World {
         &self.world
+    }
+
+    /// Harness/verification hook (§4.8 scripted drives): mutable access to the
+    /// sim world for constructing a controlled scenario (spawning test units and
+    /// buildings) before driving it. The game shell never calls this.
+    pub fn world_mut(&mut self) -> &mut World {
+        &mut self.world
+    }
+
+    /// Harness hook: queue a raw sim [`Command`] for the next tick, exactly as the
+    /// input layer would — so a scripted drive can issue Move/Attack/Deploy
+    /// without synthesizing pixel-accurate mouse events.
+    pub fn inject_command(&mut self, cmd: Command) {
+        self.pending.push(cmd);
     }
 
     /// The current sim state hash — the determinism backbone surfaced through
@@ -1114,15 +1156,44 @@ impl AppCore {
                 .copied()
                 .unwrap_or_else(identity_remap);
 
+            let is_inf = unit.is_infantry();
             if let Some(sprite) = self.sprites.get(unit.type_id as usize) {
-                // Body sprite.
-                if let Some(sframe) = sprite.frame_for(unit.facing) {
-                    draw_sprite_centered(frame, sx, sy, sframe, &remap, &self.palette);
-                }
-                // Turret overlay (turreted vehicles whose SHP has turret frames).
-                if unit.has_turret {
-                    if let Some(tframe) = sprite.turret_frame_for(unit.turret_facing) {
-                        draw_sprite_centered(frame, sx, sy, tframe, &remap, &self.palette);
+                if is_inf {
+                    // Infantry: pick the Do-table band (idle / walk / fire) and the
+                    // animation stage from the cosmetic clock (sim-independent), then
+                    // index the SHP by facing (`Shape_Number`, infantry.cpp:524).
+                    let anim = self
+                        .infantry_anim
+                        .get(unit.type_id as usize)
+                        .and_then(|a| *a)
+                        .unwrap_or_else(|| InfantryAnim::for_name(""));
+                    let firing = unit.has_target()
+                        && unit.weapon.is_some()
+                        && unit.arm + 3 >= { unit.weapon.map(|w| w.rof).unwrap_or(0) }
+                        && unit.arm != 0;
+                    let action = if firing {
+                        InfAction::Fire
+                    } else if unit.is_moving() {
+                        InfAction::Walk
+                    } else {
+                        InfAction::Idle
+                    };
+                    // ~8 fps animation stage from the cosmetic clock.
+                    let stage = (self.anim_ms / 120) as u32;
+                    let fi = infantry_frame(&anim, unit.facing, action, stage);
+                    if let Some(sframe) = sprite.frame_at(fi) {
+                        draw_sprite_centered(frame, sx, sy, sframe, &remap, &self.palette);
+                    }
+                } else {
+                    // Vehicle body sprite.
+                    if let Some(sframe) = sprite.frame_for(unit.facing) {
+                        draw_sprite_centered(frame, sx, sy, sframe, &remap, &self.palette);
+                    }
+                    // Turret overlay (turreted vehicles whose SHP has turret frames).
+                    if unit.has_turret {
+                        if let Some(tframe) = sprite.turret_frame_for(unit.turret_facing) {
+                            draw_sprite_centered(frame, sx, sy, tframe, &remap, &self.palette);
+                        }
                     }
                 }
             }
@@ -1143,24 +1214,31 @@ impl AppCore {
             }
 
             let selected = self.selected.contains(&h);
+            // Infantry are small targets: their selection box and health bar are
+            // scaled to roughly a sub-cell footprint rather than a full cell.
+            let marker_half = if is_inf {
+                CELL_PIXELS / 4
+            } else {
+                CELL_PIXELS / 2
+            };
             if selected {
-                let half = CELL_PIXELS / 2;
                 draw_rect_outline(
                     frame,
-                    sx - half,
-                    sy - half,
-                    sx + half,
-                    sy + half,
+                    sx - marker_half,
+                    sy - marker_half,
+                    sx + marker_half,
+                    sy + marker_half,
                     SELECT_RGB,
                 );
             }
             // Health bar on selected or damaged units.
             if selected || unit.health < unit.max_health {
+                let bar_w = if is_inf { CELL_PIXELS / 2 } else { CELL_PIXELS };
                 draw_health_bar(
                     frame,
                     sx,
-                    sy - CELL_PIXELS / 2 - 4,
-                    CELL_PIXELS,
+                    sy - marker_half - 4,
+                    bar_w,
                     unit.health_permille(),
                 );
             }

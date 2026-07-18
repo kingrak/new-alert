@@ -275,6 +275,7 @@ fn econ_catalog() -> Catalog {
                   cy: bool,
                   refin: bool,
                   wf: bool| BuildingProto {
+        is_barracks: false,
         name: name.to_string(),
         foot_w: w,
         foot_h: h,
@@ -292,6 +293,8 @@ fn econ_catalog() -> Catalog {
     };
     let uproto =
         |name: &str, harv: bool, deploys: Option<u32>, cost: i32, prereq: Vec<u32>| UnitProto {
+            is_infantry: false,
+            locomotor: 1,
             name: name.to_string(),
             sprite_id: if harv { 1 } else { 0 },
             max_health: 400,

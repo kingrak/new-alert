@@ -29,6 +29,78 @@ pub struct UnitSprite {
     pub frames: Vec<SpriteFrame>,
 }
 
+/// The infantry action currently animating — selects which Do-table band of the
+/// SHP to index (`InfantryClass::Shape_Number`, `infantry.cpp:524`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InfAction {
+    /// Standing (`DO_STAND_READY`): one frame per facing.
+    Idle,
+    /// Walking (`DO_WALK`): a 6-frame cycle per facing.
+    Walk,
+    /// Firing (`DO_FIRE_WEAPON`): a per-type-length cycle per facing.
+    Fire,
+}
+
+/// Per-type infantry SHP frame layout (`DoControls`, `idata.cpp:178+`). Only the
+/// three actions the client animates are carried; idle/walk are the same for
+/// every human infantry, fire differs (E2's grenade throw is longer).
+#[derive(Clone, Copy, Debug)]
+pub struct InfantryAnim {
+    /// Fire band start frame (`DO_FIRE_WEAPON.Frame`, 64 for E1/E2/E3).
+    pub fire_frame: i32,
+    /// Fire frames per facing (`Count`): E1/E3 = 8, E2 = 20.
+    pub fire_count: i32,
+    /// Fire facing stride (`Jump`): E1/E3 = 8, E2 = 20.
+    pub fire_jump: i32,
+}
+
+impl InfantryAnim {
+    /// The Do-table layout for a human infantry type by short name. E2 (grenadier)
+    /// has the long 20-frame fire cycle; E1/E3 use the 8-frame cycle
+    /// (`idata.cpp:178/202/226`).
+    pub fn for_name(name: &str) -> InfantryAnim {
+        match name.trim().to_ascii_uppercase().as_str() {
+            "E2" => InfantryAnim {
+                fire_frame: 64,
+                fire_count: 20,
+                fire_jump: 20,
+            },
+            _ => InfantryAnim {
+                fire_frame: 64,
+                fire_count: 8,
+                fire_jump: 8,
+            },
+        }
+    }
+}
+
+/// The 32→8 facing reduction infantry sprites use (`InfantryClass::HumanShape`,
+/// `infantry.cpp:91`): a `Dir_To_32` index maps to one of 8 sprite facings.
+const HUMAN_SHAPE: [u8; 32] = [
+    0, 0, 7, 7, 7, 7, 6, 6, 6, 6, 5, 5, 5, 5, 5, 4, 4, 4, 3, 3, 3, 3, 2, 2, 2, 2, 1, 1, 1, 1, 1, 0,
+];
+
+/// The 0..8 infantry sprite facing for a body `facing` (`HumanShape[Dir_To_32]`).
+pub fn infantry_facing_index(facing: Facing) -> usize {
+    HUMAN_SHAPE[dir_to_32(facing) as usize] as usize
+}
+
+/// The SHP frame to draw for an infantryman, port of the `Shape_Number` math
+/// (`infantry.cpp:524-543`): `Frame + facing*Jump + (stage % Count)`. Idle is
+/// frame `facing` (band 0, count 1); walk is `16 + facing*6 + stage%6`
+/// (`DO_WALK`); fire uses the per-type band from [`InfantryAnim`].
+pub fn infantry_frame(anim: &InfantryAnim, facing: Facing, action: InfAction, stage: u32) -> usize {
+    let f = infantry_facing_index(facing);
+    let idx = match action {
+        InfAction::Idle => f as i32,
+        InfAction::Walk => 16 + f as i32 * 6 + (stage % 6) as i32,
+        InfAction::Fire => {
+            anim.fire_frame + f as i32 * anim.fire_jump + (stage as i32 % anim.fire_count.max(1))
+        }
+    };
+    idx.max(0) as usize
+}
+
 impl UnitSprite {
     /// Decode every frame of a unit SHP.
     pub fn from_shp_bytes(bytes: &[u8]) -> Result<UnitSprite, ra_formats::FormatError> {
@@ -69,6 +141,16 @@ impl UnitSprite {
     /// The frame to draw for `facing`, or `None` if the sprite has no frames.
     pub fn frame_for(&self, facing: Facing) -> Option<&SpriteFrame> {
         self.frames.get(self.body_frame(facing))
+    }
+
+    /// The frame at raw index `i` (for infantry Do-table indexing), clamped into
+    /// range so a mis-mapped index never panics.
+    pub fn frame_at(&self, i: usize) -> Option<&SpriteFrame> {
+        if self.frames.is_empty() {
+            None
+        } else {
+            self.frames.get(i.min(self.frames.len() - 1))
+        }
     }
 
     /// Whether this sprite carries a separate turret (≥ 64 frames: 32 body +

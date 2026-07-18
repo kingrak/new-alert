@@ -445,6 +445,7 @@ fn building_covering_impact_cell_takes_direct_hit_regardless_of_center_distance(
 fn splash_building_catalog() -> ra_sim::Catalog {
     use ra_sim::{BuildingProto, EconRules};
     let proto = |w: u8, h: u8| BuildingProto {
+        is_barracks: false,
         name: "PAD".to_string(),
         foot_w: w,
         foot_h: h,

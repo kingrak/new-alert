@@ -13,11 +13,15 @@ use crate::building::Building;
 use crate::bullet::Bullet;
 use crate::catalog::Catalog;
 use crate::combat::{aligned_to_fire, modify_damage, Target};
-use crate::coords::{coord_move, isqrt, leptons_distance, CellCoord, Facing, WorldCoord};
+use crate::coords::{
+    coord_move, isqrt, leptons_distance, spot_index, CellCoord, Facing, Locomotor, WorldCoord,
+    SUBCELL_COUNT,
+};
 use crate::hash::Fnv1a;
 use crate::house::{BuildItem, House, ProdKind, Production};
+use crate::occupancy::UnitGrid;
 use crate::ore::OreField;
-use crate::path::{find_path, Passability};
+use crate::path::{find_path, find_path_avoiding, Passability};
 use crate::rng::RandomLcg;
 use crate::shroud::Shroud;
 use crate::unit::{HarvStatus, MoveStats, Unit};
@@ -407,6 +411,7 @@ impl World {
             is_refinery: proto.is_refinery,
             is_construction_yard: proto.is_construction_yard,
             is_war_factory: proto.is_war_factory,
+            is_barracks: proto.is_barracks,
         };
         let handle = self.buildings.insert(building);
         // Stamp occupancy.
@@ -758,14 +763,19 @@ fn apply_command(world: &mut World, cmd: Command) {
         Command::Move { unit, dest, house } => {
             // Ownership check (§4.6): silently ignore orders for units the
             // issuing house does not own, or stale handles.
-            let start = match world.units.get(unit) {
-                Some(u) if u.house == house => u.cell(),
+            let (start, loco, is_inf) = match world.units.get(unit) {
+                Some(u) if u.house == house => (u.cell(), u.locomotor, u.is_infantry()),
                 _ => return,
             };
-            if let Some(path) = find_path(&world.passable, start, dest) {
+            // Group dispersal (`Adjust_Dest`/scatter, `unit.cpp`): a box-selected
+            // group ordered to one cell must not all stack there. Each unit picks
+            // the nearest free cell not already claimed by another unit's
+            // destination — vehicles one per cell, infantry up to five per cell.
+            let goal = pick_dest(world, dest, unit, is_inf, loco);
+            if let Some(path) = find_path(&world.passable, start, goal, loco) {
                 if let Some(u) = world.units.get_mut(unit) {
                     u.path = path;
-                    u.dest = Some(dest);
+                    u.dest = Some(goal);
                     u.target = None; // a move order overrides an attack
                                      // A manual move interrupts harvesting; the FSM resumes
                                      // (state `Idle` → `Looking`) once the unit arrives.
@@ -862,13 +872,30 @@ fn apply_start_production(world: &mut World, house: u8, item: BuildItem) {
     };
 
     // Resolve cost + prerequisites + the required factory for this item.
-    let (cost, prereq, need_yard, need_factory, kind) = match item {
+    // Infantry (a unit proto with `is_infantry`) build on their own barracks
+    // strip, independent of the war factory's vehicle lane (M7.6).
+    let (cost, prereq, need_yard, need_factory, need_barracks, kind) = match item {
         BuildItem::Building(id) => match world.catalog.building(id) {
-            Some(p) => (p.cost, p.prereq.clone(), true, false, ProdKind::Building),
+            Some(p) => (
+                p.cost,
+                p.prereq.clone(),
+                true,
+                false,
+                false,
+                ProdKind::Building,
+            ),
             None => return,
         },
         BuildItem::Unit(id) => match world.catalog.unit(id) {
-            Some(p) => (p.cost, p.prereq.clone(), false, true, ProdKind::Unit),
+            Some(p) if p.is_infantry => (
+                p.cost,
+                p.prereq.clone(),
+                false,
+                false,
+                true,
+                ProdKind::Infantry,
+            ),
+            Some(p) => (p.cost, p.prereq.clone(), false, true, false, ProdKind::Unit),
             None => return,
         },
     };
@@ -877,6 +904,7 @@ fn apply_start_production(world: &mut World, house: u8, item: BuildItem) {
     let slot_busy = match kind {
         ProdKind::Building => hs.building_prod.is_some() || hs.ready_building.is_some(),
         ProdKind::Unit => hs.unit_prod.is_some(),
+        ProdKind::Infantry => hs.infantry_prod.is_some(),
     };
     if slot_busy {
         return;
@@ -895,7 +923,14 @@ fn apply_start_production(world: &mut World, house: u8, item: BuildItem) {
         .buildings
         .iter()
         .any(|(_, b)| b.house == house && b.is_war_factory);
-    if (need_yard && !has_yard) || (need_factory && !has_factory) {
+    let has_barracks = world
+        .buildings
+        .iter()
+        .any(|(_, b)| b.house == house && b.is_barracks);
+    if (need_yard && !has_yard)
+        || (need_factory && !has_factory)
+        || (need_barracks && !has_barracks)
+    {
         return;
     }
     // Must be able to afford at least the first installment (any credits).
@@ -928,6 +963,7 @@ fn apply_start_production(world: &mut World, house: u8, item: BuildItem) {
         match kind {
             ProdKind::Building => hs.building_prod = Some(prod),
             ProdKind::Unit => hs.unit_prod = Some(prod),
+            ProdKind::Infantry => hs.infantry_prod = Some(prod),
         }
     }
 }
@@ -998,6 +1034,11 @@ fn apply_cancel_production(world: &mut World, house: u8, kind: ProdKind) {
             hs.unit_prod = None;
             r
         }
+        ProdKind::Infantry => {
+            let r = hs.infantry_prod.map(|p| p.spent).unwrap_or(0);
+            hs.infantry_prod = None;
+            r
+        }
     };
     refund_credits(world, house, refund);
 }
@@ -1042,6 +1083,7 @@ fn remove_building(world: &mut World, handle: Handle) {
     let type_id = b.type_id;
     let was_construction_yard = b.is_construction_yard;
     let was_war_factory = b.is_war_factory;
+    let was_barracks = b.is_barracks;
     let cells: Vec<CellCoord> = b.footprint().collect();
     for c in cells {
         world.passable.set_occupied(c, false);
@@ -1069,6 +1111,17 @@ fn remove_building(world: &mut World, handle: Handle) {
     if was_war_factory && !house_has_war_factory(world, house) {
         abandon_production_lane(world, house, ProdKind::Unit);
     }
+    if was_barracks && !house_has_barracks(world, house) {
+        abandon_production_lane(world, house, ProdKind::Infantry);
+    }
+}
+
+/// Whether `house` still owns a live barracks (infantry factory).
+fn house_has_barracks(world: &World, house: u8) -> bool {
+    world
+        .buildings
+        .iter()
+        .any(|(_, b)| b.house == house && b.is_barracks && b.is_alive())
 }
 
 /// Whether `house` still owns a live construction yard.
@@ -1098,6 +1151,7 @@ fn abandon_production_lane(world: &mut World, house: u8, kind: ProdKind) {
         match kind {
             ProdKind::Building => hs.building_prod.take().map(|p| p.spent).unwrap_or(0),
             ProdKind::Unit => hs.unit_prod.take().map(|p| p.spent).unwrap_or(0),
+            ProdKind::Infantry => hs.infantry_prod.take().map(|p| p.spent).unwrap_or(0),
         }
     } else {
         0
@@ -1164,16 +1218,19 @@ fn spawn_free_harvester(
     let Some(proto) = world.catalog.unit(unit_id).cloned() else {
         return;
     };
-    // Find a free, passable spawn cell: prefer the dock, else scan outward.
-    let spawn_cell = if world.passable.is_passable(dock) {
+    // Find a free, passable, vehicle-unoccupied spawn cell: prefer the dock, else
+    // scan outward (the dock/ring must not already hold a vehicle, or the free
+    // harvester would violate the one-vehicle-per-cell rule).
+    let free = |w: &World, c: CellCoord| w.passable.is_passable(c) && !vehicle_in_cell(w, c, None);
+    let spawn_cell = if free(world, dock) {
         dock
     } else {
         let mut found = dock;
-        'search: for r in 1..6 {
+        'search: for r in 1..8 {
             for dy in -r..=r {
                 for dx in -r..=r {
                     let c = CellCoord::new(refinery_cell.x + dx, refinery_cell.y + dy);
-                    if world.passable.is_passable(c) {
+                    if free(world, c) {
                         found = c;
                         break 'search;
                     }
@@ -1193,6 +1250,9 @@ fn spawn_free_harvester(
     world.set_unit_max_health(handle, proto.max_health);
     world.set_unit_combat(handle, proto.armor, proto.weapon, proto.has_turret);
     world.set_unit_harvester(handle, proto.is_harvester);
+    if let Some(u) = world.units.get_mut(handle) {
+        u.set_locomotor(loco_from_index(proto.locomotor));
+    }
     world.set_unit_sight(handle, proto.sight);
 }
 
@@ -1289,7 +1349,12 @@ fn run_combat(world: &mut World) {
                 .map(|u| u.path.is_empty() || u.dest != Some(goal))
                 .unwrap_or(false);
             if need_path {
-                if let Some(path) = find_path(&world.passable, coord.cell(), goal) {
+                let loco = world
+                    .units
+                    .get(handle)
+                    .map(|u| u.locomotor)
+                    .unwrap_or(Locomotor::Track);
+                if let Some(path) = find_path(&world.passable, coord.cell(), goal, loco) {
                     if let Some(u) = world.units.get_mut(handle) {
                         u.path = path;
                         u.dest = Some(goal);
@@ -1623,6 +1688,7 @@ fn run_production(world: &mut World) {
     for hi in 0..world.houses.len() {
         advance_production(world, hi, ProdKind::Building);
         advance_production(world, hi, ProdKind::Unit);
+        advance_production(world, hi, ProdKind::Infantry);
     }
 }
 
@@ -1633,6 +1699,7 @@ fn advance_production(world: &mut World, house_idx: usize, kind: ProdKind) {
         Some(h) => match kind {
             ProdKind::Building => h.building_prod.take(),
             ProdKind::Unit => h.unit_prod.take(),
+            ProdKind::Infantry => h.infantry_prod.take(),
         },
         None => return,
     };
@@ -1681,6 +1748,7 @@ fn store_production(world: &mut World, house_idx: usize, kind: ProdKind, prod: O
         match kind {
             ProdKind::Building => h.building_prod = prod,
             ProdKind::Unit => h.unit_prod = prod,
+            ProdKind::Infantry => h.infantry_prod = prod,
         }
     }
 }
@@ -1698,11 +1766,19 @@ fn finish_or_retry(world: &mut World, house_idx: usize, kind: ProdKind, prod: Op
         }
         BuildItem::Unit(id) => {
             let house = house_idx as u8;
-            match find_factory_exit(world, house) {
+            // Infantry exit the barracks; vehicles exit the war factory.
+            let exit = match kind {
+                ProdKind::Infantry => find_barracks_exit(world, house),
+                _ => find_factory_exit(world, house),
+            };
+            match exit {
                 Some(exit) => {
                     spawn_produced_unit(world, id, house, exit);
                     if let Some(h) = world.houses.get_mut(house_idx) {
-                        h.unit_prod = None;
+                        match kind {
+                            ProdKind::Infantry => h.infantry_prod = None,
+                            _ => h.unit_prod = None,
+                        }
                     }
                 }
                 None => {
@@ -1720,15 +1796,47 @@ fn finish_or_retry(world: &mut World, house_idx: usize, kind: ProdKind, prod: Op
 /// building-specific coordinates via `Exit_Coord`/`Exit_Object`
 /// (`building.cpp:2106`); we use the nearest free adjacent cell instead.
 fn find_factory_exit(world: &World, house: u8) -> Option<CellCoord> {
+    factory_exit_ring(world, house, |b| b.is_war_factory, Locomotor::Track)
+}
+
+/// A free passable cell adjacent to the house's barracks for a completed
+/// infantryman to exit onto (foot locomotor; the cell must have a free sub-cell
+/// spot, not just be empty of vehicles).
+fn find_barracks_exit(world: &World, house: u8) -> Option<CellCoord> {
+    factory_exit_ring(world, house, |b| b.is_barracks, Locomotor::Foot)
+}
+
+/// Shared factory-exit search: a passable, unoccupied cell in the producing
+/// building's adjacency ring (south-of-centre preferred). "Unoccupied" now also
+/// respects **unit** occupancy — a vehicle exit rejects a cell already holding a
+/// vehicle; an infantry (foot) exit rejects a cell whose five spots are full — so
+/// produced units never stack (the exit-blocked retry in `finish_or_retry`
+/// handles a fully blocked ring).
+fn factory_exit_ring(
+    world: &World,
+    house: u8,
+    is_kind: impl Fn(&Building) -> bool,
+    loco: Locomotor,
+) -> Option<CellCoord> {
     let factory = world
         .buildings
         .iter()
-        .find(|(_, b)| b.house == house && b.is_war_factory && b.is_alive())
+        .find(|(_, b)| b.house == house && is_kind(b) && b.is_alive())
         .map(|(_, b)| (b.cell, b.foot_w as i32, b.foot_h as i32, b.center_cell()))?;
     let (tl, w, h, center) = factory;
+    let free = |c: CellCoord| -> bool {
+        if !world.passable.is_passable_loco(c, loco) {
+            return false;
+        }
+        if loco == Locomotor::Foot {
+            !infantry_cell_full(world, c, None)
+        } else {
+            !vehicle_in_cell(world, c, None)
+        }
+    };
     // Preferred: straight south of centre.
     let south = CellCoord::new(center.x, tl.y + h);
-    if world.passable.is_passable(south) {
+    if free(south) {
         return Some(south);
     }
     // Otherwise the whole 1-cell ring around the footprint.
@@ -1736,7 +1844,7 @@ fn find_factory_exit(world: &World, house: u8) -> Option<CellCoord> {
         for y in (tl.y - 1)..=(tl.y + h) {
             let c = CellCoord::new(x, y);
             let on_ring = x == tl.x - 1 || x == tl.x + w || y == tl.y - 1 || y == tl.y + h;
-            if on_ring && world.passable.is_passable(c) {
+            if on_ring && free(c) {
                 return Some(c);
             }
         }
@@ -1744,7 +1852,117 @@ fn find_factory_exit(world: &World, house: u8) -> Option<CellCoord> {
     None
 }
 
-/// Spawn a produced vehicle at `cell`, wiring its stats from the catalog proto.
+/// Whether a **vehicle** other than `except` currently occupies `cell` (a live
+/// vehicle unit whose cell is `cell`). O(n) scan — used at command/spawn time
+/// where the per-tick [`UnitGrid`] is not maintained.
+fn vehicle_in_cell(world: &World, cell: CellCoord, except: Option<Handle>) -> bool {
+    world
+        .units
+        .iter()
+        .any(|(h, u)| !u.is_infantry() && u.cell() == cell && Some(h) != except)
+}
+
+/// The infantry sub-cell spot occupancy bitmask of `cell` (bits 0..5), excluding
+/// `except`. Built by scanning infantry resting in / assigned to the cell.
+fn infantry_spot_bits(world: &World, cell: CellCoord, except: Option<Handle>) -> u8 {
+    let mut bits = 0u8;
+    for (h, u) in world.units.iter() {
+        if u.is_infantry() && u.cell() == cell && Some(h) != except {
+            bits |= 1 << u.sub_cell;
+        }
+    }
+    bits
+}
+
+/// Whether `cell`'s five infantry spots are all taken.
+fn infantry_cell_full(world: &World, cell: CellCoord, except: Option<Handle>) -> bool {
+    (infantry_spot_bits(world, cell, except) & 0x1F) == 0x1F
+}
+
+/// Whether a vehicle other than `except` is *heading to* `cell` (its ordered
+/// `dest`). Used with [`vehicle_in_cell`] so a same-tick group move spreads.
+fn vehicle_targeting(world: &World, cell: CellCoord, except: Option<Handle>) -> bool {
+    world
+        .units
+        .iter()
+        .any(|(h, u)| !u.is_infantry() && Some(h) != except && u.dest == Some(cell))
+}
+
+/// How many infantry other than `except` are resting in **or** heading to
+/// `cell` — the load against the five-per-cell cap for dispersal.
+fn infantry_load(world: &World, cell: CellCoord, except: Option<Handle>) -> i32 {
+    let resting = (infantry_spot_bits(world, cell, except) & 0x1F).count_ones() as i32;
+    let heading = world
+        .units
+        .iter()
+        .filter(|(h, u)| {
+            u.is_infantry() && Some(*h) != except && u.dest == Some(cell) && u.cell() != cell
+        })
+        .count() as i32;
+    resting + heading
+}
+
+/// Whether `cell` can be a destination for `unit`: passable for its locomotor
+/// and not already claimed. Vehicles need the cell free of any vehicle (present
+/// or inbound); infantry need fewer than five infantry claiming it.
+fn dest_ok(
+    world: &World,
+    cell: CellCoord,
+    unit: Handle,
+    is_infantry: bool,
+    loco: Locomotor,
+) -> bool {
+    if !world.passable.is_passable_loco(cell, loco) {
+        return false;
+    }
+    if is_infantry {
+        infantry_load(world, cell, Some(unit)) < SUBCELL_COUNT as i32
+    } else {
+        !vehicle_in_cell(world, cell, Some(unit)) && !vehicle_targeting(world, cell, Some(unit))
+    }
+}
+
+/// Choose a destination cell for a move order, dispersing off an occupied/claimed
+/// target to the nearest free cell (`Adjust_Dest` scatter, `unit.cpp`). Spirals
+/// outward from `dest` in rings; falls back to `dest` if nothing free is found.
+fn pick_dest(
+    world: &World,
+    dest: CellCoord,
+    unit: Handle,
+    is_infantry: bool,
+    loco: Locomotor,
+) -> CellCoord {
+    if dest_ok(world, dest, unit, is_infantry, loco) {
+        return dest;
+    }
+    for r in 1..=12i32 {
+        for dy in -r..=r {
+            for dx in -r..=r {
+                if dx.abs() != r && dy.abs() != r {
+                    continue; // ring perimeter only
+                }
+                let c = CellCoord::new(dest.x + dx, dest.y + dy);
+                if dest_ok(world, c, unit, is_infantry, loco) {
+                    return c;
+                }
+            }
+        }
+    }
+    dest
+}
+
+/// Map a catalog locomotor index (0=Foot,1=Track,2=Wheel) to [`Locomotor`].
+fn loco_from_index(i: u8) -> Locomotor {
+    match i {
+        0 => Locomotor::Foot,
+        2 => Locomotor::Wheel,
+        _ => Locomotor::Track,
+    }
+}
+
+/// Spawn a produced unit at `cell`, wiring its stats from the catalog proto. A
+/// unit whose proto is infantry is placed into a free sub-cell spot of the exit
+/// cell (up to five share a cell); a vehicle takes the whole cell.
 fn spawn_produced_unit(world: &mut World, unit_id: u32, house: u8, cell: CellCoord) {
     let Some(proto) = world.catalog.unit(unit_id).cloned() else {
         return;
@@ -1760,6 +1978,16 @@ fn spawn_produced_unit(world: &mut World, unit_id: u32, house: u8, cell: CellCoo
     world.set_unit_max_health(handle, proto.max_health);
     world.set_unit_combat(handle, proto.armor, proto.weapon, proto.has_turret);
     world.set_unit_harvester(handle, proto.is_harvester);
+    if let Some(u) = world.units.get_mut(handle) {
+        u.set_locomotor(loco_from_index(proto.locomotor));
+    }
+    if proto.is_infantry {
+        let bits = infantry_spot_bits(world, cell, Some(handle));
+        let spot = crate::occupancy::closest_free_spot_bits(bits, 0).unwrap_or(0);
+        if let Some(u) = world.units.get_mut(handle) {
+            u.make_infantry(spot);
+        }
+    }
     world.set_unit_sight(handle, proto.sight);
 }
 
@@ -1790,6 +2018,11 @@ fn process_harvester(world: &mut World, handle: Handle) {
         Some(u) => (u.cell(), u.house, u.harvest, !u.path.is_empty()),
         None => return,
     };
+    let loco = world
+        .units
+        .get(handle)
+        .map(|u| u.locomotor)
+        .unwrap_or(Locomotor::Track);
     let cap = world.catalog.econ.bail_count;
     let dump_rate = world.catalog.econ.ore_dump_rate;
 
@@ -1818,7 +2051,7 @@ fn process_harvester(world: &mut World, handle: Handle) {
                 hs.timer = dump_rate;
             } else {
                 // Find the nearest reachable ore and drive to it.
-                match nearest_reachable_ore(world, cell, world.catalog.econ.long_scan_cells) {
+                match nearest_reachable_ore(world, cell, world.catalog.econ.long_scan_cells, loco) {
                     Some((dest, path)) => set_path(world, handle, dest, path),
                     None => {
                         hs.status = if hs.cargo > 0 { FindHome } else { Idle };
@@ -1848,7 +2081,7 @@ fn process_harvester(world: &mut World, handle: Handle) {
                 }
             }
         }
-        FindHome => match nearest_refinery(world, house, cell) {
+        FindHome => match nearest_refinery(world, house, cell, loco, handle) {
             Some((refinery, dock, path)) => {
                 hs.home = Some(refinery);
                 set_path(world, handle, dock, path);
@@ -1929,6 +2162,7 @@ fn nearest_reachable_ore(
     world: &World,
     from: CellCoord,
     max_cells: i32,
+    loco: Locomotor,
 ) -> Option<(CellCoord, Vec<CellCoord>)> {
     let mut candidates: Vec<(i32, CellCoord)> = Vec::new();
     for dy in -max_cells..=max_cells {
@@ -1942,7 +2176,7 @@ fn nearest_reachable_ore(
     }
     candidates.sort_by(|a, b| a.0.cmp(&b.0).then(cell_key(a.1).cmp(&cell_key(b.1))));
     for (_, c) in candidates.into_iter().take(16) {
-        if let Some(path) = find_path(&world.passable, from, c) {
+        if let Some(path) = find_path(&world.passable, from, c, loco) {
             return Some((c, path));
         }
     }
@@ -1956,6 +2190,8 @@ fn nearest_refinery(
     world: &World,
     house: u8,
     from: CellCoord,
+    loco: Locomotor,
+    except: Handle,
 ) -> Option<(Handle, CellCoord, Vec<CellCoord>)> {
     let mut refineries: Vec<(i32, Handle)> = world
         .buildings
@@ -1981,10 +2217,13 @@ fn nearest_refinery(
             }
         }
         for dock in docks {
-            if !world.passable.is_passable(dock) {
+            // Skip a dock a *different* vehicle already sits on, so two harvesters
+            // sharing a refinery pick distinct dock cells instead of one blocking
+            // the other under the one-vehicle-per-cell rule.
+            if !world.passable.is_passable(dock) || vehicle_in_cell(world, dock, Some(except)) {
                 continue;
             }
-            if let Some(path) = find_path(&world.passable, from, dock) {
+            if let Some(path) = find_path(&world.passable, from, dock, loco) {
                 return Some((rhandle, dock, path));
             }
         }
@@ -1999,56 +2238,156 @@ fn cell_key(c: CellCoord) -> i64 {
 
 /// Advance every moving unit along its path by up to its per-tick speed,
 /// rotating its facing toward the heading. Units are processed in slot order.
+///
+/// **Cell occupancy (M7.6).** A fresh [`UnitGrid`] is rebuilt from current
+/// positions (a non-hashed cache), then maintained through the pass so
+/// reservations hold within the tick: a vehicle may not step into a cell already
+/// holding another vehicle (one-vehicle-per-cell, `Can_Enter_Cell`), and
+/// infantry may not step into a cell whose five sub-cell spots are full. A
+/// blocked unit **waits** this tick and retries next tick — a documented
+/// simplification of the original's `drive.cpp` ask-the-blocker-to-scatter radio
+/// protocol (QUIRKS). On arrival an infantryman settles into the closest free
+/// sub-cell spot (`Closest_Free_Spot`), so a group ordered to one cell packs into
+/// distinct spots.
 fn move_units(world: &mut World) {
+    // Baseline vehicle-overlap count *before* moving. Movement must never
+    // increase it (the one-vehicle-per-cell invariant). We compare before/after
+    // rather than asserting zero so a harness that deliberately spawns stacked
+    // units (e.g. splash tests isolating armor at one blast distance) is
+    // tolerated — in a real game the baseline is zero, so this enforces exactly
+    // "no two vehicles on one cell" every tick.
+    let excess_before = vehicle_excess(world);
+
+    let (gw, gh) = (world.passable.width(), world.passable.height());
+    let mut grid = UnitGrid::new(gw, gh);
+    // Rebuild occupancy from current positions, in slot order.
+    for h in world.units.handles() {
+        if let Some(u) = world.units.get(h) {
+            if u.is_infantry() {
+                grid.claim_spot(u.cell(), u.sub_cell);
+            } else {
+                grid.claim_vehicle(u.cell(), h);
+            }
+        }
+    }
+
     // Units whose cell changed this tick, for shroud reveal after movement.
     let mut moved: Vec<(u8, CellCoord, u8)> = Vec::new();
     for handle in world.units.handles() {
-        let start_cell = match world.units.get(handle) {
-            Some(u) if !u.path.is_empty() => u.cell(),
+        let (start_cell, is_inf, start_spot, loco) = match world.units.get(handle) {
+            Some(u) if !u.path.is_empty() => (u.cell(), u.is_infantry(), u.sub_cell, u.locomotor),
             _ => continue,
         };
-        let Some(unit) = world.units.get_mut(handle) else {
-            continue;
-        };
-        if unit.path.is_empty() {
-            continue;
-        }
 
         // Rotate toward the next waypoint before translating.
-        let target = unit.path[0].center();
-        if let Some(desired) = Facing::toward(unit.coord, target) {
-            unit.facing = unit
-                .facing
-                .rotate_toward(desired, unit.stats.rot.wrapping_add(1));
-        }
-
-        // Consume this tick's movement budget, possibly across several short
-        // waypoints (robust even if a future unit is faster than one cell/tick).
-        let mut budget = unit.stats.max_speed;
-        while budget > 0 && !unit.path.is_empty() {
-            let target = unit.path[0].center();
-            let dx = (target.x.0 - unit.coord.x.0) as i64;
-            let dy = (target.y.0 - unit.coord.y.0) as i64;
-            let dist = isqrt(dx * dx + dy * dy) as i32;
-            if dist <= budget {
-                // Reached this waypoint exactly.
-                unit.coord = target;
-                budget -= dist.max(0);
-                unit.path.remove(0);
-                if unit.path.is_empty() {
-                    unit.dest = None;
-                }
-            } else {
-                // Advance a partial step along the straight line to the target.
-                let nx = unit.coord.x.0 + (dx * budget as i64 / dist as i64) as i32;
-                let ny = unit.coord.y.0 + (dy * budget as i64 / dist as i64) as i32;
-                unit.coord = WorldCoord::new(nx, ny);
-                budget = 0;
+        if let Some(u) = world.units.get_mut(handle) {
+            let target = u.path[0].center();
+            if let Some(desired) = Facing::toward(u.coord, target) {
+                u.facing = u.facing.rotate_toward(desired, u.stats.rot.wrapping_add(1));
             }
         }
 
-        // If the unit crossed into a new cell, note it for a shroud reveal.
+        // Compute the tentative advance, then validate the **actual landing cell**
+        // it lands in against occupancy (a vehicle for a vehicle mover, a full
+        // sub-cell for infantry). Checking the true landing cell — not just the
+        // path's next cell — covers a diagonal step that *corner-clips* a
+        // neighbour. On a block, re-route around occupied cells once
+        // (`find_path_avoiding`, the `drive.cpp` reaction to a moving block); if
+        // that still can't step, hold position this tick (a documented
+        // simplification of the ask-the-blocker-to-scatter radio protocol).
+        let is_blocked = |world: &World, coord: WorldCoord, path: &[CellCoord], grid: &UnitGrid| {
+            let budget = world
+                .units
+                .get(handle)
+                .map(|u| u.stats.max_speed)
+                .unwrap_or(0);
+            let (nc, _) = advance_along_path(coord, path, budget);
+            let land = nc.cell();
+            if land == start_cell {
+                (nc, false)
+            } else {
+                let terrain_block = !world.passable.is_passable_loco(land, loco);
+                let occ_block = if is_inf {
+                    !grid.has_free_spot(land)
+                } else {
+                    grid.vehicle_blocked_for(land, handle)
+                };
+                (nc, terrain_block || occ_block)
+            }
+        };
+
+        let (coord, path) = match world.units.get(handle) {
+            Some(u) => (u.coord, u.path.clone()),
+            None => continue,
+        };
+        let (mut new_coord, blocked) = is_blocked(world, coord, &path, &grid);
+        if blocked {
+            // Re-route around the occupied cells to our destination.
+            let mut rerouted = false;
+            if let Some(dest) = world.units.get(handle).and_then(|u| u.dest) {
+                if let Some(newpath) =
+                    find_path_avoiding(&world.passable, start_cell, dest, loco, &grid, handle)
+                {
+                    let (nc2, blocked2) = is_blocked(world, coord, &newpath, &grid);
+                    // Adopt the detour as long as it does not itself land on an
+                    // occupied cell. Even a partial in-cell step counts — it turns
+                    // the unit onto the detour heading and inches it off the
+                    // contested cell, which is what breaks a head-on swap.
+                    if !blocked2 {
+                        if let Some(u) = world.units.get_mut(handle) {
+                            u.path = newpath;
+                        }
+                        new_coord = nc2;
+                        rerouted = true;
+                    }
+                }
+            }
+            if !rerouted {
+                continue; // hold position this tick
+            }
+        }
+
+        let Some(unit) = world.units.get_mut(handle) else {
+            continue;
+        };
+        // Consume the waypoints the (final) advance fully reached.
+        let (applied_coord, consumed) =
+            advance_along_path(unit.coord, &unit.path, unit.stats.max_speed);
+        debug_assert_eq!(applied_coord, new_coord);
+        unit.coord = new_coord;
+        for _ in 0..consumed {
+            unit.path.remove(0);
+        }
+        if unit.path.is_empty() {
+            unit.dest = None;
+        }
+
         let end_cell = unit.cell();
+        let arrived = unit.path.is_empty();
+
+        // Maintain occupancy + assign infantry sub-cell spots.
+        if is_inf {
+            if end_cell != start_cell {
+                grid.release_spot(start_cell, start_spot);
+                let desired = spot_index(unit.coord);
+                let spot = grid
+                    .closest_free_spot(end_cell, desired)
+                    .unwrap_or(desired.min(SUBCELL_COUNT as u8 - 1));
+                unit.sub_cell = spot;
+                grid.claim_spot(end_cell, spot);
+                if arrived {
+                    unit.coord = end_cell.spot_center(spot);
+                }
+            } else if arrived {
+                // Settled within the same cell — snap onto its assigned spot.
+                unit.coord = end_cell.spot_center(unit.sub_cell);
+            }
+        } else if end_cell != start_cell {
+            grid.release_vehicle(start_cell, handle);
+            grid.claim_vehicle(end_cell, handle);
+        }
+
+        // If the unit crossed into a new cell, note it for a shroud reveal.
         if end_cell != start_cell && unit.sight > 0 {
             moved.push((unit.house, end_cell, unit.sight));
         }
@@ -2059,6 +2398,60 @@ fn move_units(world: &mut World) {
     for (house, cell, sight) in moved {
         world.shroud.reveal(house, cell, sight);
     }
+
+    // Invariant: movement never creates a vehicle-on-vehicle overlap.
+    debug_assert!(
+        vehicle_excess(world) <= excess_before,
+        "cell-occupancy invariant violated: movement put two vehicles on one cell"
+    );
+}
+
+/// Advance `coord` along the cell-centre waypoints of `path` by up to `budget`
+/// leptons, returning the new coordinate and how many waypoints were fully
+/// reached (consumed). A pure copy of the original in-place stepping loop — same
+/// `isqrt` straight-line metric, same partial-step formula, same `dist.max(0)`
+/// budget decrement — so non-colliding movement is byte-identical to pre-M7.6.
+fn advance_along_path(
+    coord: WorldCoord,
+    path: &[CellCoord],
+    mut budget: i32,
+) -> (WorldCoord, usize) {
+    let mut c = coord;
+    let mut consumed = 0usize;
+    while budget > 0 && consumed < path.len() {
+        let target = path[consumed].center();
+        let dx = (target.x.0 - c.x.0) as i64;
+        let dy = (target.y.0 - c.y.0) as i64;
+        let dist = isqrt(dx * dx + dy * dy) as i32;
+        if dist <= budget {
+            c = target;
+            budget -= dist.max(0);
+            consumed += 1;
+        } else {
+            let nx = c.x.0 + (dx * budget as i64 / dist as i64) as i32;
+            let ny = c.y.0 + (dy * budget as i64 / dist as i64) as i32;
+            c = WorldCoord::new(nx, ny);
+            budget = 0;
+        }
+    }
+    (c, consumed)
+}
+
+/// The number of "excess" vehicles sharing cells — `sum over cells of
+/// max(0, vehicles_in_cell - 1)`. Zero in a well-formed game; movement must
+/// never increase it (the one-vehicle-per-cell rule).
+fn vehicle_excess(world: &World) -> u32 {
+    let mut counts: std::collections::BTreeMap<i64, u32> = std::collections::BTreeMap::new();
+    for (_, u) in world.units.iter() {
+        if u.is_infantry() {
+            continue;
+        }
+        let c = u.cell();
+        *counts
+            .entry((c.y as i64) * 100_000 + c.x as i64)
+            .or_insert(0) += 1;
+    }
+    counts.values().map(|&n| n.saturating_sub(1)).sum()
 }
 
 #[cfg(test)]
@@ -2530,6 +2923,7 @@ mod m5_tests {
                       cy: bool,
                       refin: bool,
                       wf: bool| BuildingProto {
+            is_barracks: false,
             name: name.to_string(),
             foot_w: w,
             foot_h: h,
@@ -2547,6 +2941,8 @@ mod m5_tests {
         };
         let uproto =
             |name: &str, harv: bool, deploys: Option<u32>, cost: i32, prereq: Vec<u32>| UnitProto {
+                is_infantry: false,
+                locomotor: 1,
                 name: name.to_string(),
                 sprite_id: if harv { 1 } else { 0 },
                 max_health: 400,

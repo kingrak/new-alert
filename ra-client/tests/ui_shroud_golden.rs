@@ -298,12 +298,19 @@ fn real_skirmish_compose_game_map_sweep_with_shroud_no_panic() {
     // shows the explored terrain/ore under `draw_shroud`, which paints against
     // `player_house`'s own exploration only -- the same per-house isolation
     // `shroud_suite.rs` pins at the sim level, now visible at the pixel level.
+    //
+    // **Re-pinned for M7.6** (infantry + land-type passability): `load_skirmish`
+    // now builds the per-locomotor land-type passability grid (rock/cliff/river
+    // impassable) instead of the water-only M3 stand-in, so the two houses' MCVs
+    // start-position pathing and the shroud they reveal differ; the composed
+    // game-surface frames change accordingly. A rendering-only, coordinator-
+    // authorised re-pin (QUIRKS Q5/Q6). Re-derived deterministically (read once).
     let golden: [u64; 5] = [
-        0x31d5_f428_c2a5_bffb,
-        0x2a2b_c0f5_6079_e197,
-        0x64dd_0651_85b6_e68f,
-        0x2a2b_c0f5_6079_e197,
-        0x6860_7ad5_b332_ff2b,
+        0xbaf6_080b_886d_a255,
+        0x9ce6_eab5_3646_d3d9,
+        0x6eb0_114c_f78f_10e1,
+        0x9ce6_eab5_3646_d3d9,
+        0xbbfe_f8af_f7aa_f1a5,
     ];
     let got: Vec<u64> = frames.iter().map(|p| support::fnv1a(p)).collect();
     assert_eq!(

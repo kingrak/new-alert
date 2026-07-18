@@ -243,6 +243,14 @@ impl AiPlayer {
                 return Some(f);
             }
         }
+        // 3b) Barracks (cheap infantry factory) once the war factory is up.
+        if has_factory {
+            if let Some(bar) = self.role_building(cat, Role::Barracks) {
+                if !owns(bar) && self.buildable(world, hs, bar) {
+                    return Some(bar);
+                }
+            }
+        }
         // 4) Keep expanding: a second refinery, then a spare power plant.
         if let Some(r) = refinery_id {
             if self.count_owned(world, r) < 2 && self.buildable(world, hs, r) {
@@ -263,65 +271,88 @@ impl AiPlayer {
         let Some(hs) = world.house(self.house) else {
             return;
         };
-        if hs.unit_prod.is_some() || world.house_credits(self.house) <= 0 {
-            return;
-        }
         let cat = &world.catalog;
+
+        // --- Vehicle lane (war factory) ---
         let has_factory = self
             .role_building(cat, Role::WarFactory)
             .map(|f| hs.owns_building(f))
             .unwrap_or(false);
-        if !has_factory {
-            return;
-        }
-
-        // Replacement harvester first, if the refinery outnumbers harvesters
-        // (house.cpp:6075). Harvesters need no war factory here (they come from
-        // the refinery normally) but building one keeps the economy alive.
-        let refineries = self
-            .role_building(cat, Role::Refinery)
-            .map(|r| self.count_owned(world, r))
-            .unwrap_or(0);
-        let harvesters = world
-            .units
-            .iter()
-            .filter(|(_, u)| u.house == self.house && u.is_harvester)
-            .count() as i32;
-        if refineries > harvesters {
-            if let Some((id, _)) = cat.units.iter().enumerate().find(|(_, p)| p.is_harvester) {
-                if self.unit_buildable(world, hs, id as u32) {
+        if hs.unit_prod.is_none() && world.house_credits(self.house) > 0 && has_factory {
+            // Replacement harvester first, if the refinery outnumbers harvesters
+            // (house.cpp:6075).
+            let refineries = self
+                .role_building(cat, Role::Refinery)
+                .map(|r| self.count_owned(world, r))
+                .unwrap_or(0);
+            let harvesters = world
+                .units
+                .iter()
+                .filter(|(_, u)| u.house == self.house && u.is_harvester)
+                .count() as i32;
+            let mut issued = false;
+            if refineries > harvesters {
+                if let Some((id, _)) = cat.units.iter().enumerate().find(|(_, p)| p.is_harvester) {
+                    if self.unit_buildable(world, hs, id as u32) {
+                        out.push(Command::StartProduction {
+                            house: self.house,
+                            item: BuildItem::Unit(id as u32),
+                        });
+                        issued = true;
+                    }
+                }
+            }
+            if !issued {
+                // Weighted-random pick among buildable armed **vehicles**
+                // (house.cpp:6186; uniform weights). Infantry are excluded here —
+                // they build on the barracks strip below.
+                let eligible: Vec<u32> = cat
+                    .units
+                    .iter()
+                    .enumerate()
+                    .filter(|(id, p)| {
+                        p.weapon.is_some()
+                            && !p.is_harvester
+                            && !p.is_infantry
+                            && p.deploys_to.is_none()
+                            && self.unit_buildable(world, hs, *id as u32)
+                    })
+                    .map(|(id, _)| id as u32)
+                    .collect();
+                if !eligible.is_empty() {
+                    let pick = rng.range(0, eligible.len() as i32 - 1) as usize;
                     out.push(Command::StartProduction {
                         house: self.house,
-                        item: BuildItem::Unit(id as u32),
+                        item: BuildItem::Unit(eligible[pick]),
                     });
-                    return;
                 }
             }
         }
 
-        // Weighted-random pick among buildable armed vehicles (house.cpp:6186:
-        // each armed vehicle weight 20). We use uniform weights, so this reduces
-        // to a uniform random pick over the eligible set.
-        let eligible: Vec<u32> = cat
-            .units
-            .iter()
-            .enumerate()
-            .filter(|(id, p)| {
-                p.weapon.is_some()
-                    && !p.is_harvester
-                    && p.deploys_to.is_none()
-                    && self.unit_buildable(world, hs, *id as u32)
-            })
-            .map(|(id, _)| id as u32)
-            .collect();
-        if eligible.is_empty() {
-            return;
+        // --- Infantry lane (barracks) — cheap wave filler ---
+        let has_barracks = self
+            .role_building(cat, Role::Barracks)
+            .map(|b| hs.owns_building(b))
+            .unwrap_or(false);
+        if hs.infantry_prod.is_none() && world.house_credits(self.house) > 0 && has_barracks {
+            let eligible: Vec<u32> = cat
+                .units
+                .iter()
+                .enumerate()
+                .filter(|(id, p)| p.is_infantry && self.unit_buildable(world, hs, *id as u32))
+                .map(|(id, _)| id as u32)
+                .collect();
+            // RNG is drawn ONLY when infantry are actually producible, so catalogs
+            // with no infantry (every pre-M7.6 test) draw no extra RNG and keep
+            // their AI hash chains unchanged.
+            if !eligible.is_empty() {
+                let pick = rng.range(0, eligible.len() as i32 - 1) as usize;
+                out.push(Command::StartProduction {
+                    house: self.house,
+                    item: BuildItem::Unit(eligible[pick]),
+                });
+            }
         }
-        let pick = rng.range(0, eligible.len() as i32 - 1) as usize;
-        out.push(Command::StartProduction {
-            house: self.house,
-            item: BuildItem::Unit(eligible[pick]),
-        });
     }
 
     // ---- Attack waves (house.cpp:1042 team spawn + Greatest_Threat) ---------
@@ -491,6 +522,7 @@ impl AiPlayer {
                 Role::Power => b.power > 0 && !b.is_construction_yard,
                 Role::Refinery => b.is_refinery,
                 Role::WarFactory => b.is_war_factory,
+                Role::Barracks => b.is_barracks,
             })
             .map(|i| i as u32)
     }
@@ -502,4 +534,5 @@ enum Role {
     Power,
     Refinery,
     WarFactory,
+    Barracks,
 }

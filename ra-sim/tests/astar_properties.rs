@@ -11,7 +11,7 @@
 
 use proptest::prelude::*;
 
-use ra_sim::coords::CellCoord;
+use ra_sim::coords::{CellCoord, Locomotor};
 use ra_sim::path::{find_path, Passability};
 
 /// The 8 king-move neighbour offsets, independently listed here (not
@@ -103,7 +103,7 @@ proptest! {
     /// and the path ends exactly at `goal`.
     #[test]
     fn returned_path_is_valid((grid, start, goal) in grid_and_endpoints()) {
-        if let Some(path) = find_path(&grid, start, goal) {
+        if let Some(path) = find_path(&grid, start, goal, Locomotor::Track) {
             if start == goal {
                 // `start == goal` short-circuits to `Some(empty)` before any
                 // passability check (see `find_path`'s doc comment: "An
@@ -145,7 +145,7 @@ proptest! {
     /// doing so.
     #[test]
     fn reachability_matches_independent_bfs_oracle((grid, start, goal) in grid_and_endpoints()) {
-        let a_star_found = find_path(&grid, start, goal).is_some();
+        let a_star_found = find_path(&grid, start, goal, Locomotor::Track).is_some();
         let bfs_found = bfs_reachable(&grid, start, goal);
         prop_assert_eq!(a_star_found, bfs_found, "start={:?} goal={:?}", start, goal);
     }
@@ -157,8 +157,8 @@ proptest! {
     /// is no room for run-to-run variation.
     #[test]
     fn deterministic_across_repeated_calls((grid, start, goal) in grid_and_endpoints()) {
-        let a = find_path(&grid, start, goal);
-        let b = find_path(&grid, start, goal);
+        let a = find_path(&grid, start, goal, Locomotor::Track);
+        let b = find_path(&grid, start, goal, Locomotor::Track);
         prop_assert_eq!(a, b);
     }
 
@@ -190,7 +190,7 @@ proptest! {
         // short-circuit, so *any* off-grid endpoint yields `None` — including
         // the degenerate `start == goal` case (pinned separately below).
         if !on_grid(start) || !on_grid(goal) {
-            prop_assert_eq!(find_path(&grid, start, goal), None);
+            prop_assert_eq!(find_path(&grid, start, goal, Locomotor::Track), None);
         }
     }
 
@@ -206,7 +206,7 @@ proptest! {
         let n = (w * h) as usize;
         let grid = Passability::new(w, h, vec![true; n]);
         let c = CellCoord::new(x, y); // off-grid: x,y >= w,h by construction
-        prop_assert_eq!(find_path(&grid, c, c), None);
+        prop_assert_eq!(find_path(&grid, c, c, Locomotor::Track), None);
     }
 }
 
@@ -233,8 +233,8 @@ fn real_map_astar_is_deterministic() {
     );
     assert!(grid.is_passable(goal), "HARV spawn cell should be passable");
 
-    let a = find_path(&grid, start, goal);
-    let b = find_path(&grid, start, goal);
+    let a = find_path(&grid, start, goal, Locomotor::Track);
+    let b = find_path(&grid, start, goal, Locomotor::Track);
     assert_eq!(a, b, "A* over the real scg01ea grid is not deterministic");
     let path = a.expect("scg01ea JEEP and HARV starting cells should be mutually reachable");
     assert_eq!(path.last(), Some(&goal));

@@ -6,8 +6,23 @@
 
 use crate::arena::Handle;
 use crate::combat::{Target, WeaponProfile};
-use crate::coords::{CellCoord, Facing, WorldCoord};
+use crate::coords::{CellCoord, Facing, Locomotor, WorldCoord};
 use crate::hash::Fnv1a;
+
+/// Which broad kind of movable object this is (DESIGN.md §4.3 — a discriminant on
+/// the shared `Units` arena rather than a separate per-kind arena, so movement,
+/// combat, targeting, retaliation, bullets, and selection treat infantry as
+/// first-class without duplicating every system). The distinction the sim acts
+/// on is cell occupancy: a [`Vehicle`](UnitKind::Vehicle) owns a whole cell,
+/// while [`Infantry`](UnitKind::Infantry) occupy one of five sub-cell spots.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum UnitKind {
+    /// A whole-cell ground vehicle (tank, jeep, harvester, MCV).
+    #[default]
+    Vehicle,
+    /// A foot soldier occupying a sub-cell spot (E1/E2/E3).
+    Infantry,
+}
 
 /// The 5-state harvester mission FSM, ported from `UnitClass::Mission_Harvest`
 /// (`unit.cpp:2898`): scan for ore, drive to it, harvest until full, find a
@@ -144,6 +159,23 @@ pub struct Unit {
     /// Sight range in cells (`Sight=`, `techno.cpp:7062`), used to reveal the
     /// shroud around this unit as it moves. Capped at 10 like the original.
     pub sight: u8,
+
+    // --- Kind + occupancy (M7.6) ---
+    /// Whether this is a vehicle (whole-cell) or infantry (sub-cell spot). A
+    /// discriminant on the shared arena rather than a separate arena (§4.3), so
+    /// every existing system treats infantry as first-class.
+    pub kind: UnitKind,
+    /// Ground-movement locomotor (`SPEED_FOOT`/`TRACK`/`WHEEL`) — selects the
+    /// per-land passability column for pathfinding. Constant per unit type, so —
+    /// like `sight`/`armor` derivation — it is **not** hashed (its effect is
+    /// captured through the unit's `coord`, which is hashed).
+    pub locomotor: Locomotor,
+    /// The infantry sub-cell spot (0..[`crate::coords::SUBCELL_COUNT`]) this unit
+    /// currently occupies within its cell (center + 4 quadrants,
+    /// `StoppingCoordAbs`, `const.cpp:282`). Meaningful only when
+    /// `kind == Infantry`; 0 for vehicles. Hashed for infantry (it changes as
+    /// they repack), gated so vehicle-only worlds hash byte-identically.
+    pub sub_cell: u8,
 }
 
 impl Unit {
@@ -175,7 +207,31 @@ impl Unit {
             is_harvester: false,
             harvest: HarvestState::default(),
             sight: 0,
+            kind: UnitKind::Vehicle,
+            locomotor: Locomotor::Track,
+            sub_cell: 0,
         }
+    }
+
+    /// Set this unit's ground locomotor (from its type — tanks Track, jeep/harv
+    /// Wheel, infantry Foot). Called by the loader right after spawning.
+    pub fn set_locomotor(&mut self, locomotor: Locomotor) {
+        self.locomotor = locomotor;
+    }
+
+    /// Turn this unit into infantry occupying sub-cell spot `sub_cell`, with the
+    /// `Foot` locomotor and its coord snapped to that spot's centre. Called by the
+    /// loader / production right after spawning an E1/E2/E3.
+    pub fn make_infantry(&mut self, sub_cell: u8) {
+        self.kind = UnitKind::Infantry;
+        self.locomotor = Locomotor::Foot;
+        self.sub_cell = sub_cell;
+        self.coord = self.cell().spot_center(sub_cell);
+    }
+
+    /// Whether this unit is infantry (occupies a sub-cell spot).
+    pub fn is_infantry(&self) -> bool {
+        self.kind == UnitKind::Infantry
     }
 
     /// Set the unit's sight range in cells (from its type's `Sight=`, capped at
@@ -297,5 +353,16 @@ impl Unit {
         // `sight` is a constant derived from the unit type (it never changes), so
         // it is deliberately NOT folded into the hash — doing so would only churn
         // the M5 golden pins with no determinism benefit.
+
+        // Infantry sub-cell spot (M7.6). Folded ONLY for infantry, appending no
+        // bytes for vehicles — so a vehicle-only world (every M3/M4/M5/M6/M7
+        // golden) hashes byte-identically to before this milestone. `locomotor`
+        // and `kind` are constants derived from the unit type (like `sight`) and
+        // their movement effect is already captured through `coord`, so they are
+        // not hashed; `sub_cell` changes as infantry repack a cell, so it is.
+        if self.kind == UnitKind::Infantry {
+            h.write_u8(0x1F);
+            h.write_u8(self.sub_cell);
+        }
     }
 }

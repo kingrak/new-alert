@@ -77,6 +77,7 @@ fn catalog() -> Catalog {
                   cy: bool,
                   refin: bool,
                   wf: bool| BuildingProto {
+        is_barracks: false,
         name: name.to_string(),
         foot_w: w,
         foot_h: h,
@@ -94,6 +95,8 @@ fn catalog() -> Catalog {
     };
     let uproto =
         |sprite_id: u32, cost: i32, prereq: Vec<u32>, weapon: Option<WeaponProfile>| UnitProto {
+            is_infantry: false,
+            locomotor: 1,
             name: "UNIT".to_string(),
             sprite_id,
             max_health: 400,

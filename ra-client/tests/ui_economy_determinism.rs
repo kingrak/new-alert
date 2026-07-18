@@ -351,7 +351,7 @@ fn load_econ_from_bytes_growth_disabled(
         .unwrap_or(1);
 
     let conquer = main.open_nested("conquer.mix")?;
-    let content = build_content(&rules, &conquer)?;
+    let content = build_content(&rules, &conquer, None)?;
 
     let passable = ra_data::passability::build(&scenario);
     let grid = Passability::new(128, 128, passable);

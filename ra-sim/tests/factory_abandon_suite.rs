@@ -53,6 +53,7 @@ fn catalog() -> Catalog {
     let bproto =
         |name: &str, w: u8, h: u8, power: i32, cost: i32, prereq: Vec<u32>, cy: bool, wf: bool| {
             BuildingProto {
+                is_barracks: false,
                 name: name.to_string(),
                 foot_w: w,
                 foot_h: h,
@@ -77,6 +78,8 @@ fn catalog() -> Catalog {
             bproto("LAB", 1, 1, 0, 80, vec![B_POWR], false, false),
         ],
         units: vec![UnitProto {
+            is_infantry: false,
+            locomotor: 1,
             name: "TANK".to_string(),
             sprite_id: U_TANK_SPRITE,
             max_health: 400,

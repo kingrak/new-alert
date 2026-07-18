@@ -16,6 +16,7 @@
 pub mod buildings;
 pub mod combat;
 pub mod house;
+pub mod landtype;
 pub mod passability;
 pub mod rules;
 pub mod scenario;

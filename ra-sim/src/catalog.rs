@@ -89,6 +89,9 @@ pub struct BuildingProto {
     pub is_construction_yard: bool,
     /// This is a war factory (WEAP): produces vehicles.
     pub is_war_factory: bool,
+    /// This is a barracks (TENT/BARR): produces infantry (a separate strip from
+    /// the war factory, M7.6).
+    pub is_barracks: bool,
     /// The unit-proto index of the free harvester a refinery spawns (if
     /// `is_refinery`).
     pub free_harvester_unit: Option<u32>,
@@ -117,6 +120,13 @@ pub struct UnitProto {
     pub has_turret: bool,
     /// Whether this unit is a harvester (drives the harvest FSM).
     pub is_harvester: bool,
+    /// Whether this unit is infantry (occupies a sub-cell spot, built by the
+    /// barracks, M7.6). Vehicles are `false`.
+    pub is_infantry: bool,
+    /// Ground locomotor index (`SPEED_FOOT`=0/`TRACK`=1/`WHEEL`=2) for
+    /// per-land passability. Defaults to Track (0 would be Foot, so this is a
+    /// meaningful default only paired with `is_infantry`).
+    pub locomotor: u8,
     /// The building-proto index this unit deploys into (MCV → CONST), if any.
     pub deploys_to: Option<u32>,
     /// Build cost in credits (`Cost=`).

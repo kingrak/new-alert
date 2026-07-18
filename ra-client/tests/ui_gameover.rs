@@ -56,6 +56,7 @@ fn stats() -> MoveStats {
 fn catalog() -> Catalog {
     Catalog {
         buildings: vec![BuildingProto {
+            is_barracks: false,
             name: "HUT".to_string(),
             foot_w: 1,
             foot_h: 1,

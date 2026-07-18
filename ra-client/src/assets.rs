@@ -16,7 +16,6 @@ use ra_data::combat::{resolve_unit_combat, WeaponDef};
 use ra_data::house::{
     build_house_remaps, house_from_name, identity_remap, RemapTable, HOUSE_COUNT,
 };
-use ra_data::passability;
 use ra_data::rules::unit_stats;
 use ra_data::scenario::{parse_units, Scenario};
 use ra_data::templates;
@@ -35,8 +34,18 @@ use ra_sim::{
 use crate::appcore::AppCore;
 use crate::appcore::SoundEvent;
 use crate::compositor::Palette;
-use crate::terrain::{rasterize, TileSet};
-use crate::unit_render::UnitSprite;
+use crate::terrain::{build_passability_masks, rasterize, TileSet};
+use crate::unit_render::{InfantryAnim, UnitSprite};
+
+use ra_data::landtype::{LOCO_FOOT, LOCO_TRACK, LOCO_WHEEL};
+
+/// Build a per-locomotor [`Passability`] grid from a scenario's land types and
+/// the rules.ini land-cost sections (M7.6 real land-type passability). Replaces
+/// the M3 water-only `passability::build` at every game/scenario boot.
+fn make_passability(scenario: &Scenario, tiles: &TileSet, rules: &Ini) -> Passability {
+    let (foot, track, wheel) = build_passability_masks(scenario, tiles, rules);
+    Passability::per_locomotor(128, 128, foot, track, wheel)
+}
 
 /// Everything needed to render a scenario's terrain.
 pub struct LoadedTerrain {
@@ -221,8 +230,7 @@ pub fn load_game_from_bytes(
     let conquer = main.open_nested("conquer.mix")?;
 
     // --- Build the world and spawn units ---
-    let passable = passability::build(&scenario);
-    let grid = Passability::new(128, 128, passable);
+    let grid = make_passability(&scenario, &loaded.tiles, &rules);
     let mut world = World::new(grid, 0x1234_5678);
 
     let mut sprites: Vec<UnitSprite> = Vec::new();
@@ -371,8 +379,7 @@ pub fn load_battle_from_bytes(
     };
 
     let conquer = main.open_nested("conquer.mix")?;
-    let passable = passability::build(&scenario);
-    let grid = Passability::new(128, 128, passable);
+    let grid = make_passability(&scenario, &loaded.tiles, &rules);
     let mut world = World::new(grid, 0x1234_5678);
     let mut sprites: Vec<UnitSprite> = Vec::new();
 
@@ -505,6 +512,9 @@ pub struct GameContent {
     pub building_overlays: Vec<Option<UnitSprite>>,
     /// Sidebar buildable list, in display order.
     pub buildables: Vec<BuildItem>,
+    /// Per-unit-type infantry animation layout, indexed by unit `sprite_id`
+    /// (`None` for vehicles). Drives the Do-table frame selection in the client.
+    pub infantry_anim: Vec<Option<InfantryAnim>>,
 }
 
 /// Read the economy constants from rules.ini `[General]`/`[AI]` (defaults are
@@ -560,12 +570,16 @@ const B_FACT: u32 = 0;
 const B_POWR: u32 = 1;
 const B_PROC: u32 = 2;
 const B_WEAP: u32 = 3;
+const B_TENT: u32 = 4;
 /// Fixed unit-proto ids.
 const U_MCV: u32 = 0;
 const U_HARV: u32 = 1;
 const U_1TNK: u32 = 2;
 const U_2TNK: u32 = 3;
 const U_JEEP: u32 = 4;
+const U_E1: u32 = 5;
+const U_E2: u32 = 6;
+const U_E3: u32 = 7;
 
 /// Map a prerequisite short-name to its building type id (only the starter set
 /// is modelled; unknown prereqs — e.g. `fix` for the MCV — are dropped, which is
@@ -578,6 +592,7 @@ fn prereq_ids(names: &[String]) -> Vec<u32> {
             "powr" => Some(B_POWR),
             "proc" => Some(B_PROC),
             "weap" => Some(B_WEAP),
+            "tent" | "barr" => Some(B_TENT),
             _ => None,
         })
         .collect()
@@ -585,11 +600,25 @@ fn prereq_ids(names: &[String]) -> Vec<u32> {
 
 /// Decode a unit SHP from `conquer.mix` by short name.
 fn load_unit_sprite(conquer: &MixArchive, name: &str) -> Result<UnitSprite, Box<dyn Error>> {
+    load_unit_sprite_from(&[conquer], name)
+}
+
+/// Decode a unit SHP by short name from the first of `archives` that carries it.
+/// Vehicle/building art lives in `conquer.mix` (main.mix); infantry art lives in
+/// `lores.mix` (redalert.mix), so infantry loading passes both.
+fn load_unit_sprite_from(
+    archives: &[&MixArchive],
+    name: &str,
+) -> Result<UnitSprite, Box<dyn Error>> {
     let shp = format!("{}.shp", name.to_ascii_lowercase());
-    conquer
-        .get(&shp)
-        .and_then(|b| UnitSprite::from_shp_bytes(b).ok())
-        .ok_or_else(|| format!("sprite {shp} missing/undecodable").into())
+    for a in archives {
+        if let Some(bytes) = a.get(&shp) {
+            if let Ok(sprite) = UnitSprite::from_shp_bytes(bytes) {
+                return Ok(sprite);
+            }
+        }
+    }
+    Err(format!("sprite {shp} missing/undecodable").into())
 }
 
 /// Decode the M7 sound set to in-memory WAV, keyed by logical [`SoundEvent`].
@@ -715,19 +744,24 @@ fn install_cosmetic_art(
 
 /// Build the starter catalog (CONST/POWR/PROC/WEAP + MCV/HARV/1TNK/2TNK/JEEP)
 /// from rules.ini and the building/unit SHPs in `conquer.mix`.
-pub fn build_content(rules: &Ini, conquer: &MixArchive) -> Result<GameContent, Box<dyn Error>> {
+pub fn build_content(
+    rules: &Ini,
+    conquer: &MixArchive,
+    lores: Option<&MixArchive>,
+) -> Result<GameContent, Box<dyn Error>> {
     // --- Buildings (ids fixed by declaration order) ---
-    // (name, is_construction_yard, is_refinery, is_war_factory)
+    // (name, is_construction_yard, is_refinery, is_war_factory, is_barracks)
     let bspecs = [
-        ("FACT", true, false, false),
-        ("POWR", false, false, false),
-        ("PROC", false, true, false),
-        ("WEAP", false, false, true),
+        ("FACT", true, false, false, false),
+        ("POWR", false, false, false, false),
+        ("PROC", false, true, false, false),
+        ("WEAP", false, false, true, false),
+        ("TENT", false, false, false, true), // Allied barracks (infantry factory)
     ];
     let mut buildings = Vec::new();
     let mut building_sprites = Vec::new();
     let mut building_overlays = Vec::new();
-    for (id, (name, is_cy, is_ref, is_wf)) in bspecs.iter().enumerate() {
+    for (id, (name, is_cy, is_ref, is_wf, is_barr)) in bspecs.iter().enumerate() {
         let stats = building_stats(rules, name)
             .ok_or_else(|| format!("no building stats/footprint for {name}"))?;
         building_sprites.push(load_unit_sprite(conquer, name)?);
@@ -751,6 +785,7 @@ pub fn build_content(rules: &Ini, conquer: &MixArchive) -> Result<GameContent, B
             is_refinery: *is_ref,
             is_construction_yard: *is_cy,
             is_war_factory: *is_wf,
+            is_barracks: *is_barr,
             free_harvester_unit: if *is_ref { Some(U_HARV) } else { None },
             sight: stats.sight,
             sprite_id: id as u32,
@@ -758,20 +793,43 @@ pub fn build_content(rules: &Ini, conquer: &MixArchive) -> Result<GameContent, B
     }
 
     // --- Units (ids fixed by declaration order) ---
-    // (name, is_harvester, deploys_to)
-    let uspecs: [(&str, bool, Option<u32>); 5] = [
-        ("MCV", false, Some(B_FACT)),
-        ("HARV", true, None),
-        ("1TNK", false, None),
-        ("2TNK", false, None),
-        ("JEEP", false, None),
+    // (name, is_harvester, deploys_to, is_infantry, locomotor)
+    let uspecs: [(&str, bool, Option<u32>, bool, u8); 8] = [
+        ("MCV", false, Some(B_FACT), false, LOCO_TRACK as u8),
+        ("HARV", true, None, false, LOCO_TRACK as u8),
+        ("1TNK", false, None, false, LOCO_TRACK as u8),
+        ("2TNK", false, None, false, LOCO_TRACK as u8),
+        ("JEEP", false, None, false, LOCO_WHEEL as u8),
+        ("E1", false, None, true, LOCO_FOOT as u8),
+        ("E2", false, None, true, LOCO_FOOT as u8),
+        ("E3", false, None, true, LOCO_FOOT as u8),
     ];
     let mut units = Vec::new();
     let mut unit_sprites = Vec::new();
-    for (id, (name, is_harv, deploys_to)) in uspecs.iter().enumerate() {
+    let mut infantry_anim: Vec<Option<InfantryAnim>> = Vec::new();
+    // Vehicle art is in conquer.mix; infantry art in lores.mix (redalert.mix).
+    let inf_archives: Vec<&MixArchive> = match lores {
+        Some(l) => vec![conquer, l],
+        None => vec![conquer],
+    };
+    for (id, (name, is_harv, deploys_to, is_inf, loco)) in uspecs.iter().enumerate() {
         let ustats = unit_stats(rules, name).ok_or_else(|| format!("no unit stats for {name}"))?;
         let combat = resolve_unit_combat(rules, name);
-        unit_sprites.push(load_unit_sprite(conquer, name)?);
+        unit_sprites.push(if *is_inf {
+            // Infantry art (lores.mix) is optional: if it is absent the infantry
+            // still exist in the catalog (buildable, simulated) with no sprite —
+            // the renderer skips a frameless sprite, exactly as cosmetic art
+            // degrades elsewhere. Keeps headless/AI harnesses (no lores) working.
+            load_unit_sprite_from(&inf_archives, name)
+                .unwrap_or_else(|_| UnitSprite { frames: Vec::new() })
+        } else {
+            load_unit_sprite(conquer, name)?
+        });
+        infantry_anim.push(if *is_inf {
+            Some(InfantryAnim::for_name(name))
+        } else {
+            None
+        });
         let cost = rules.get_int(name, "Cost").unwrap_or(0) as i32;
         let prereq = rules
             .get(name, "Prerequisite")
@@ -796,6 +854,8 @@ pub fn build_content(rules: &Ini, conquer: &MixArchive) -> Result<GameContent, B
                 .and_then(|c| c.weapon.as_ref().map(weapon_to_profile)),
             has_turret: combat.as_ref().map(|c| c.has_turret).unwrap_or(false),
             is_harvester: *is_harv,
+            is_infantry: *is_inf,
+            locomotor: *loco,
             deploys_to: *deploys_to,
             cost,
             prereq: prereq_ids(&prereq),
@@ -808,16 +868,21 @@ pub fn build_content(rules: &Ini, conquer: &MixArchive) -> Result<GameContent, B
         units,
         econ: econ_rules(rules),
     };
-    // Sidebar order: structures then vehicles (construction yard + MCV excluded —
-    // the yard comes from deploy, the MCV needs a service depot we don't model).
+    // Sidebar order: structures then vehicles then infantry (construction yard +
+    // MCV excluded — the yard comes from deploy, the MCV needs a service depot we
+    // don't model).
     let buildables = vec![
         BuildItem::Building(B_POWR),
         BuildItem::Building(B_PROC),
         BuildItem::Building(B_WEAP),
+        BuildItem::Building(B_TENT),
         BuildItem::Unit(U_1TNK),
         BuildItem::Unit(U_2TNK),
         BuildItem::Unit(U_JEEP),
         BuildItem::Unit(U_HARV),
+        BuildItem::Unit(U_E1),
+        BuildItem::Unit(U_E2),
+        BuildItem::Unit(U_E3),
     ];
     Ok(GameContent {
         catalog,
@@ -825,6 +890,7 @@ pub fn build_content(rules: &Ini, conquer: &MixArchive) -> Result<GameContent, B
         building_sprites,
         building_overlays,
         buildables,
+        infantry_anim,
     })
 }
 
@@ -907,11 +973,11 @@ pub fn load_econ_from_bytes(
 
     // Catalog + sprites.
     let conquer = main.open_nested("conquer.mix")?;
-    let content = build_content(&rules, &conquer)?;
+    let lores = redalert.open_nested("lores.mix").ok();
+    let content = build_content(&rules, &conquer, lores.as_ref())?;
 
     // World: passability + houses + ore + catalog.
-    let passable = passability::build(&scenario);
-    let grid = Passability::new(128, 128, passable);
+    let grid = make_passability(&scenario, &loaded.tiles, &rules);
     let mut world = World::new(grid, 0x1234_5678);
     world.set_catalog(content.catalog.clone());
     world.init_houses(HOUSE_COUNT, starting_credits);
@@ -946,6 +1012,7 @@ pub fn load_econ_from_bytes(
     let mut core = AppCore::with_sim(raster, palette, world, content.unit_sprites, remaps);
     core.set_building_sprites(content.building_sprites);
     core.set_building_overlays(content.building_overlays);
+    core.set_infantry_anim(content.infantry_anim.clone());
     core.enable_sidebar(controlled, content.buildables.clone());
     // M7 cosmetic art (ore/gem tiles, explosion/buildup anims, cameos, radar) so
     // the econ view shows real ore fields thinning as they are harvested.
@@ -1057,10 +1124,10 @@ pub fn load_skirmish_from_bytes(
     let ai_house = if player_house == 2 { 0 } else { 2 };
 
     let conquer = main.open_nested("conquer.mix")?;
-    let content = build_content(&rules, &conquer)?;
+    let lores = redalert.open_nested("lores.mix").ok();
+    let content = build_content(&rules, &conquer, lores.as_ref())?;
 
-    let passable = passability::build(&scenario);
-    let grid = Passability::new(128, 128, passable);
+    let grid = make_passability(&scenario, &loaded.tiles, &rules);
     let mut world = World::new(grid, 0x1234_5678);
     world.set_catalog(content.catalog.clone());
     world.init_houses(HOUSE_COUNT, starting_credits);
@@ -1096,6 +1163,7 @@ pub fn load_skirmish_from_bytes(
     let mut core = AppCore::with_sim(raster, palette, world, content.unit_sprites, remaps);
     core.set_building_sprites(content.building_sprites);
     core.set_building_overlays(content.building_overlays);
+    core.set_infantry_anim(content.infantry_anim.clone());
     core.enable_sidebar(player_house, content.buildables.clone());
 
     // M7 cosmetic art: ore/gem tiles, explosion + buildup anims, cameos, radar.

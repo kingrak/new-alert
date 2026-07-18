@@ -17,6 +17,10 @@ pub enum ProdKind {
     Building,
     /// Vehicles (built by the war factory, spawned at its exit).
     Unit,
+    /// Infantry (built by the barracks, spawned at its exit) — a separate strip
+    /// from vehicles, exactly as the original builds infantry independently of
+    /// the war factory (`factory.cpp` per-`RTTI` factory queues).
+    Infantry,
 }
 
 /// What is being produced: a building type id or a unit-proto id (indices into
@@ -95,6 +99,8 @@ pub struct House {
     pub building_prod: Option<Production>,
     /// In-progress vehicle build.
     pub unit_prod: Option<Production>,
+    /// In-progress infantry build (the barracks strip, M7.6).
+    pub infantry_prod: Option<Production>,
     /// A completed building type id awaiting a [`crate::Command::PlaceBuilding`].
     pub ready_building: Option<u32>,
 }
@@ -109,6 +115,7 @@ impl House {
             building_counts: Vec::new(),
             building_prod: None,
             unit_prod: None,
+            infantry_prod: None,
             ready_building: None,
         }
     }
@@ -197,6 +204,14 @@ impl House {
                 h.write_u32(id);
             }
             None => h.write_u8(0),
+        }
+        // Infantry lane (M7.6). Folded ONLY when present, appending no bytes when
+        // absent — so every M5/M6/M7 economy golden (which never runs an infantry
+        // build) hashes byte-identically. Same inertness argument as the unit
+        // sub-cell field.
+        if let Some(p) = &self.infantry_prod {
+            h.write_u8(0x1F);
+            p.hash_into(h);
         }
     }
 }
