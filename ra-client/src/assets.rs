@@ -271,6 +271,7 @@ pub fn load_game_from_bytes(
             },
         );
         world.set_unit_max_health(handle, max_strength.clamp(1, u16::MAX as i32) as u16);
+        world.set_unit_sight(handle, stats.sight);
         // Combat stats (armor, primary weapon, turret) resolved from rules.ini.
         if let Some(combat) = resolve_unit_combat(&rules, &key) {
             world.set_unit_combat(
@@ -450,6 +451,7 @@ fn spawn_named(
         },
     );
     world.set_unit_max_health(handle, max_hp);
+    world.set_unit_sight(handle, stats.sight);
     let combat = resolve_unit_combat(rules, &key);
     let (weapon, armor) = match &combat {
         Some(c) => {
@@ -503,8 +505,35 @@ fn econ_rules(rules: &Ini) -> EconRules {
         ore_dump_rate: rules
             .get_int("General", "OreTruckRate")
             .unwrap_or(d.ore_dump_rate as i64) as u16,
+        refund_percent: rules
+            .get_int("General", "RefundPercent")
+            .unwrap_or(d.refund_percent as i64) as i32,
+        growth_rate: rules
+            .get_int("General", "GrowthRate")
+            .unwrap_or(d.growth_rate as i64)
+            .max(1) as i32,
         ..d
     }
+}
+
+/// Parse an RA INI boolean (`yes`/`no`/`true`/`1`), with a default.
+fn ini_bool(rules: &Ini, section: &str, key: &str, default: bool) -> bool {
+    match rules.get(section, key) {
+        Some(v) => matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "yes" | "true" | "1" | "on"
+        ),
+        None => default,
+    }
+}
+
+/// Whether ore growth/spread are enabled (`[General] OreGrows`/`OreSpreads`,
+/// default yes — `rules.cpp:441-442`). Returned as `(grows, spreads)`.
+fn ore_growth_flags(rules: &Ini) -> (bool, bool) {
+    (
+        ini_bool(rules, "General", "OreGrows", true),
+        ini_bool(rules, "General", "OreSpreads", true),
+    )
 }
 
 /// Fixed building type ids (order matters — the catalog is indexed by these).
@@ -574,6 +603,7 @@ pub fn build_content(rules: &Ini, conquer: &MixArchive) -> Result<GameContent, B
             is_construction_yard: *is_cy,
             is_war_factory: *is_wf,
             free_harvester_unit: if *is_ref { Some(U_HARV) } else { None },
+            sight: stats.sight,
             sprite_id: id as u32,
         });
     }
@@ -620,6 +650,7 @@ pub fn build_content(rules: &Ini, conquer: &MixArchive) -> Result<GameContent, B
             deploys_to: *deploys_to,
             cost,
             prereq: prereq_ids(&prereq),
+            sight: ustats.sight,
         });
     }
 
@@ -735,6 +766,11 @@ pub fn load_econ_from_bytes(
     world.set_catalog(content.catalog.clone());
     world.init_houses(HOUSE_COUNT, starting_credits);
     world.set_ore(OreField::from_overlay(128, 128, &scenario.overlay));
+    // Ore growth/spread is on whenever rules.ini enables it (default yes). This is
+    // the deferred M5 step; it legitimately consumes the sync RNG (see the
+    // ore-growth pin update in `ui_economy_determinism`).
+    let (grows, spreads) = ore_growth_flags(&rules);
+    world.set_ore_growth(grows, spreads);
 
     // Pick a base start on open ground near ore, within the playable rect.
     let near = CellCoord::new(
@@ -755,6 +791,7 @@ pub fn load_econ_from_bytes(
     );
     world.set_unit_max_health(mcv, mcv_proto.max_health);
     world.set_unit_combat(mcv, mcv_proto.armor, mcv_proto.weapon, mcv_proto.has_turret);
+    world.set_unit_sight(mcv, mcv_proto.sight);
 
     let mut core = AppCore::with_sim(raster, palette, world, content.unit_sprites, remaps);
     core.set_building_sprites(content.building_sprites);
@@ -768,6 +805,242 @@ pub fn load_econ_from_bytes(
         ore_cell,
         mcv_unit_id: U_MCV,
     })
+}
+
+// ===========================================================================
+// M6 skirmish: player house + 1 AI house, shroud, ore growth, win/lose.
+// ===========================================================================
+
+/// A fully wired M6 skirmish: player house vs one AI house, each starting with an
+/// MCV and starting credits, on a multiplayer map with the shroud enabled and
+/// ore growing. This is the "first playable" configuration `window` boots.
+pub struct SkirmishGame {
+    /// The ready-to-drive core (sidebar + shroud enabled, camera on the player).
+    pub core: AppCore,
+    /// The controlled player house index.
+    pub player_house: u8,
+    /// The player MCV's start cell (camera framing).
+    pub player_start: CellCoord,
+    /// The AI-controlled house index.
+    pub ai_house: u8,
+    /// The AI MCV's start cell.
+    pub ai_start: CellCoord,
+}
+
+/// Load an M6 skirmish from the archives under `dir`. `difficulty` tunes the AI.
+pub fn load_skirmish_from_dir(
+    dir: &Path,
+    scenario_name: &str,
+    starting_credits: i32,
+    difficulty: ra_sim::Difficulty,
+) -> Result<SkirmishGame, Box<dyn Error>> {
+    let main_bytes =
+        std::fs::read(dir.join("main.mix")).map_err(|e| format!("reading main.mix: {e}"))?;
+    let redalert_bytes = std::fs::read(dir.join("redalert.mix"))
+        .map_err(|e| format!("reading redalert.mix: {e}"))?;
+    load_skirmish_from_bytes(
+        &main_bytes,
+        &redalert_bytes,
+        scenario_name,
+        starting_credits,
+        difficulty,
+    )
+}
+
+/// Build the skirmish from in-memory archives: terrain/palette/remaps + the
+/// starter catalog + ore (growing), the shroud enabled, and two houses (the
+/// `[Basic] Player=` house vs an AI house) each seeded with an MCV at a
+/// multiplayer start waypoint.
+pub fn load_skirmish_from_bytes(
+    main_bytes: &[u8],
+    redalert_bytes: &[u8],
+    scenario_name: &str,
+    starting_credits: i32,
+    difficulty: ra_sim::Difficulty,
+) -> Result<SkirmishGame, Box<dyn Error>> {
+    let main = MixArchive::parse(main_bytes)?;
+    let redalert = MixArchive::parse(redalert_bytes)?;
+
+    let loaded = load_from_bytes(main_bytes, redalert_bytes, scenario_name)?;
+    let raster = rasterize(&loaded.scenario, &loaded.tiles);
+    let palette = loaded.palette;
+    let scenario = loaded.scenario;
+
+    let general = main.open_nested("general.mix")?;
+    let ini_bytes = general
+        .get(scenario_name)
+        .ok_or_else(|| format!("scenario '{scenario_name}' not found"))?;
+    let scen_ini = Ini::parse(&String::from_utf8_lossy(ini_bytes));
+
+    let local = redalert.open_nested("local.mix")?;
+    let rules = Ini::parse(&String::from_utf8_lossy(
+        local.get("rules.ini").ok_or("rules.ini not found")?,
+    ));
+    let remaps: Vec<RemapTable> = match local.get("palette.cps") {
+        Some(cps_bytes) => match Cps::parse(cps_bytes) {
+            Ok(cps) => build_house_remaps(&cps).to_vec(),
+            Err(_) => vec![identity_remap(); HOUSE_COUNT],
+        },
+        None => vec![identity_remap(); HOUSE_COUNT],
+    };
+
+    // Player house from [Basic] Player (default Greece=1); AI is a distinct
+    // house (USSR=2, or Spain=0 if the player already is USSR).
+    let player_house = scen_ini
+        .get("Basic", "Player")
+        .and_then(house_from_name)
+        .unwrap_or(1);
+    let ai_house = if player_house == 2 { 0 } else { 2 };
+
+    let conquer = main.open_nested("conquer.mix")?;
+    let content = build_content(&rules, &conquer)?;
+
+    let passable = passability::build(&scenario);
+    let grid = Passability::new(128, 128, passable);
+    let mut world = World::new(grid, 0x1234_5678);
+    world.set_catalog(content.catalog.clone());
+    world.init_houses(HOUSE_COUNT, starting_credits);
+    world.set_ore(OreField::from_overlay(128, 128, &scenario.overlay));
+    world.enable_shroud();
+    let (grows, spreads) = ore_growth_flags(&rules);
+    world.set_ore_growth(grows, spreads);
+    world.set_player_house(player_house);
+    world.set_ai(vec![ra_sim::AiPlayer::new(ai_house, difficulty)]);
+
+    // Two well-separated starts, preferring multiplayer waypoints.
+    let (player_start, ai_start) = pick_two_starts(&world, &scenario, &scen_ini);
+
+    // Spawn an MCV for each house at its start.
+    let mcv_proto = content.catalog.units[U_MCV as usize].clone();
+    let spawn_mcv = |world: &mut World, house: u8, cell: CellCoord| -> Handle {
+        let h = world.spawn_unit(
+            mcv_proto.sprite_id,
+            house,
+            cell,
+            Facing(0),
+            mcv_proto.max_health,
+            mcv_proto.stats,
+        );
+        world.set_unit_max_health(h, mcv_proto.max_health);
+        world.set_unit_combat(h, mcv_proto.armor, mcv_proto.weapon, mcv_proto.has_turret);
+        world.set_unit_sight(h, mcv_proto.sight);
+        h
+    };
+    spawn_mcv(&mut world, player_house, player_start);
+    spawn_mcv(&mut world, ai_house, ai_start);
+
+    let mut core = AppCore::with_sim(raster, palette, world, content.unit_sprites, remaps);
+    core.set_building_sprites(content.building_sprites);
+    core.enable_sidebar(player_house, content.buildables);
+
+    Ok(SkirmishGame {
+        core,
+        player_house,
+        player_start,
+        ai_house,
+        ai_start,
+    })
+}
+
+/// Choose two well-separated base starts **on the same landmass** — so a
+/// ground-only skirmish (no transports yet) can actually resolve. The player
+/// takes the first multiplayer `[Waypoints]` start (or the map centre); the AI
+/// takes the farthest base-buildable cell that is BFS-reachable from the player
+/// over passable terrain. Guaranteeing connectivity avoids the naval-map trap
+/// where one base sits on an unreachable island the assault can never finish.
+fn pick_two_starts(world: &World, scenario: &Scenario, scen_ini: &Ini) -> (CellCoord, CellCoord) {
+    let passable = world.passability();
+    let ore = &world.ore;
+
+    // Player start: waypoint 0 if present, else the playable-rect centre.
+    let player = scen_ini
+        .section_entries("Waypoints")
+        .and_then(|e| {
+            e.iter()
+                .filter_map(|(k, v)| Some((k.parse::<u32>().ok()?, v.parse::<u32>().ok()?)))
+                .filter(|(idx, _)| *idx < 8)
+                .min_by_key(|(idx, _)| *idx)
+                .map(|(_, cell)| CellCoord::from_index(cell))
+        })
+        .map(|near| find_base_start(passable, ore, near).0)
+        .unwrap_or_else(|| {
+            let c = CellCoord::new(
+                scenario.map_x as i32 + scenario.map_width as i32 / 2,
+                scenario.map_y as i32 + scenario.map_height as i32 / 2,
+            );
+            find_base_start(passable, ore, c).0
+        });
+
+    // BFS the connected passable component from the player start. The AI base is
+    // held to a *radius-4* open plain (a 9×9 clear) so it sits on simple,
+    // fully-reachable terrain — enough room for a real base whose production core
+    // a ground assault can actually reach and destroy, rather than a fringe cell
+    // wedged against water/cliffs that leaves an unfinishable remnant.
+    let open5 = |c: CellCoord| -> bool {
+        for dy in -4..=4 {
+            for dx in -4..=4 {
+                if !passable.is_passable(CellCoord::new(c.x + dx, c.y + dy)) {
+                    return false;
+                }
+            }
+        }
+        true
+    };
+    let near_ore = |c: CellCoord| -> bool {
+        for dy in -10..=10 {
+            for dx in -10..=10 {
+                if ore.has_ore(CellCoord::new(c.x + dx, c.y + dy)) {
+                    return true;
+                }
+            }
+        }
+        false
+    };
+    let (w, h) = (passable.width(), passable.height());
+    let idx = |c: CellCoord| (c.y * w + c.x) as usize;
+    let mut seen = vec![false; (w * h) as usize];
+    let mut queue = std::collections::VecDeque::new();
+    if passable.is_passable(player) {
+        seen[idx(player)] = true;
+        queue.push_back(player);
+    }
+    // Farthest connected base-buildable cell near ore (a viable AI economy), with
+    // a plain open-5×5 fallback if nothing reachable sits near ore.
+    let key = |c: CellCoord| -> i64 {
+        let dx = (c.x - player.x) as i64;
+        let dy = (c.y - player.y) as i64;
+        dx * dx + dy * dy
+    };
+    let mut best_ore: Option<CellCoord> = None;
+    let mut best_open: Option<CellCoord> = None;
+    while let Some(c) = queue.pop_front() {
+        if open5(c) {
+            if best_open.map(|b| key(c) > key(b)).unwrap_or(true) {
+                best_open = Some(c);
+            }
+            if near_ore(c) && best_ore.map(|b| key(c) > key(b)).unwrap_or(true) {
+                best_ore = Some(c);
+            }
+        }
+        for (dx, dy) in [(1, 0), (-1, 0), (0, 1), (0, -1)] {
+            let n = CellCoord::new(c.x + dx, c.y + dy);
+            if n.x < 0 || n.y < 0 || n.x >= w || n.y >= h {
+                continue;
+            }
+            if !seen[idx(n)] && passable.is_passable(n) {
+                seen[idx(n)] = true;
+                queue.push_back(n);
+            }
+        }
+    }
+
+    // The AI base is the farthest BFS-connected cell that is near ore (so the AI
+    // has a viable economy) — fully ground-reachable from the player by
+    // construction, with a bare open-cell fallback. We deliberately do *not* use
+    // a raw multiplayer waypoint: on naval maps those sit across water the AI
+    // then expands onto, leaving an unreachable remnant the assault can't finish.
+    let ai = best_ore.or(best_open).unwrap_or(player);
+    (player, ai)
 }
 
 /// Find a base start: a cell whose 5×5 neighbourhood is passable (room for the

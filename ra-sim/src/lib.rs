@@ -23,6 +23,7 @@
 //! - [`world`]  — [`World`], the command pipeline, and the fixed system order.
 #![deny(clippy::float_arithmetic)]
 
+pub mod ai;
 pub mod arena;
 pub mod building;
 pub mod bullet;
@@ -35,9 +36,11 @@ pub mod house;
 pub mod ore;
 pub mod path;
 pub mod rng;
+pub mod shroud;
 pub mod unit;
 pub mod world;
 
+pub use ai::{AiPlayer, Difficulty};
 pub use arena::{Arena, Handle};
 pub use building::Building;
 pub use bullet::Bullet;
@@ -48,5 +51,6 @@ pub use house::{BuildItem, House, ProdKind, Production};
 pub use ore::{OreCell, OreField};
 pub use path::Passability;
 pub use rng::RandomLcg;
+pub use shroud::Shroud;
 pub use unit::{HarvStatus, HarvestState, MoveStats, Unit};
-pub use world::{apply, Command, World};
+pub use world::{apply, Command, GameOver, World};

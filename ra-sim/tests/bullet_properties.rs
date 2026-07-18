@@ -7,8 +7,8 @@
 
 use proptest::prelude::*;
 
-use ra_sim::coords::{coord_move, isqrt, Facing, WorldCoord};
-use ra_sim::{Bullet, WarheadProfile};
+use ra_sim::coords::{coord_move, isqrt, CellCoord, Facing, WorldCoord};
+use ra_sim::{Bullet, Target, WarheadProfile};
 
 /// A minimal bullet for flight-only testing: damage/warhead/target are
 /// irrelevant to `advance`, so they're fixed placeholders.
@@ -16,7 +16,9 @@ fn make_bullet(pos: WorldCoord, impact: WorldCoord, speed: i32, instant: bool) -
     Bullet {
         pos,
         impact,
-        target: None,
+        // M6 changed Bullet::target from Option<Handle> to Target; a ground cell
+        // is the flight-only placeholder (advance() never reads the target).
+        target: Target::Cell(CellCoord::new(0, 0)),
         speed,
         facing: Facing(0),
         damage: 1,

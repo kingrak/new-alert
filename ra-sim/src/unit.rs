@@ -139,6 +139,11 @@ pub struct Unit {
     pub is_harvester: bool,
     /// Harvester working state (only meaningful when `is_harvester`).
     pub harvest: HarvestState,
+
+    // --- Shroud (M6) ---
+    /// Sight range in cells (`Sight=`, `techno.cpp:7062`), used to reveal the
+    /// shroud around this unit as it moves. Capped at 10 like the original.
+    pub sight: u8,
 }
 
 impl Unit {
@@ -169,7 +174,14 @@ impl Unit {
             arm: 0,
             is_harvester: false,
             harvest: HarvestState::default(),
+            sight: 0,
         }
+    }
+
+    /// Set the unit's sight range in cells (from its type's `Sight=`, capped at
+    /// 10 as the original does). Called by the loader right after spawning.
+    pub fn set_sight(&mut self, sight: u8) {
+        self.sight = sight.min(10);
     }
 
     /// Mark this unit as a harvester (drives the harvest FSM). Called by the
@@ -270,6 +282,11 @@ impl Unit {
                 h.write_i32(c.x);
                 h.write_i32(c.y);
             }
+            Some(Target::Building(handle)) => {
+                h.write_u8(3);
+                h.write_u32(handle.index);
+                h.write_u32(handle.gen);
+            }
         }
 
         // Harvester state.
@@ -277,5 +294,8 @@ impl Unit {
         if self.is_harvester {
             self.harvest.hash_into(h);
         }
+        // `sight` is a constant derived from the unit type (it never changes), so
+        // it is deliberately NOT folded into the hash — doing so would only churn
+        // the M5 golden pins with no determinism benefit.
     }
 }

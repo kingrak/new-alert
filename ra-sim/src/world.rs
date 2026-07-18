@@ -7,6 +7,7 @@
 //! FNV-1a hash (§4.2): the hash chain is the determinism backbone, asserted in
 //! replays and multiplayer alike.
 
+use crate::ai::AiPlayer;
 use crate::arena::{Arena, Handle};
 use crate::building::Building;
 use crate::bullet::Bullet;
@@ -18,6 +19,7 @@ use crate::house::{BuildItem, House, ProdKind, Production};
 use crate::ore::OreField;
 use crate::path::{find_path, Passability};
 use crate::rng::RandomLcg;
+use crate::shroud::Shroud;
 use crate::unit::{HarvStatus, MoveStats, Unit};
 
 /// A player order. Every command carries the **issuing house** explicitly
@@ -99,6 +101,15 @@ pub enum Command {
         /// Which lane to cancel.
         kind: ProdKind,
     },
+    /// Sell one of `house`'s own buildings, refunding `Rule.RefundPercent` of its
+    /// cost (default 50%, `techno.cpp:6417`) and clearing its footprint. Ignored
+    /// if the issuing house does not own the building or it is already gone.
+    Sell {
+        /// House issuing the order (must own `building`).
+        house: u8,
+        /// The building to sell.
+        building: Handle,
+    },
 }
 
 /// The complete simulation state. Fields are plain and serialisable; there are
@@ -119,11 +130,61 @@ pub struct World {
     pub catalog: Catalog,
     /// Map passability grid: static terrain + dynamic building occupancy.
     passable: Passability,
+    /// Per-house explored/shroud state (M6). Disabled until a skirmish enables it.
+    pub shroud: Shroud,
+    /// Ore growth/spread scheduler state (M6). `None` until growth is enabled.
+    ore_growth: Option<OreGrowth>,
+    /// Skirmish AI controllers, one per AI-controlled house (M6). Run in
+    /// house-index order each tick before player commands (see [`apply`]).
+    ai: Vec<AiPlayer>,
+    /// The tracked player house for win/lose, if this is a skirmish (M6).
+    player_house: Option<u8>,
+    /// Terminal game state once a house-elimination check resolves (M6).
+    game_over: GameOver,
     /// The sim RNG, seeded and owned here.
     rng: RandomLcg,
     /// The current tick number (advances once per [`World::tick`]).
     tick_count: u32,
 }
+
+/// Terminal outcome of a skirmish, from the player's point of view (M6, item 4).
+/// House elimination = **all buildings AND all units destroyed** (the classic
+/// multiplayer defeat check, `house.cpp:1290`: `!ActiveBScan && !UScan && …`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum GameOver {
+    /// The game is still in progress.
+    #[default]
+    Ongoing,
+    /// The tracked player house won (every enemy house eliminated).
+    Victory,
+    /// The tracked player house was eliminated.
+    Defeat,
+}
+
+/// Ore growth/spread scheduler state — a faithful port of the `MapClass::Logic`
+/// incremental scan (`map.cpp:1308-1432`). A persistent cursor sweeps the map a
+/// slice per tick, reservoir-sampling grow/spread candidates (drawing the sync
+/// RNG); one grow+spread wave fires each time the cursor wraps the whole map.
+#[derive(Clone, Debug, Default)]
+struct OreGrowth {
+    /// Whether ore density grows (`Rule.IsTGrowth` ← `[General] OreGrows`).
+    grows: bool,
+    /// Whether dense ore spreads to neighbours (`Rule.IsTSpread` ← `OreSpreads`).
+    spreads: bool,
+    /// The scan cursor (`TiberiumScan`), a linear cell index.
+    scan: i32,
+    /// Accumulated grow candidates this sweep (`TiberiumGrowth[]`, cap 64).
+    grow_list: Vec<CellCoord>,
+    /// Grow-eligible cells seen this sweep (`TiberiumGrowthExcess`).
+    grow_excess: i32,
+    /// Accumulated spread candidates this sweep (`TiberiumSpread[]`, cap 64).
+    spread_list: Vec<CellCoord>,
+    /// Spread-eligible cells seen this sweep (`TiberiumSpreadExcess`).
+    spread_excess: i32,
+}
+
+/// `TiberiumGrowth` / `TiberiumSpread` array capacity (`MAP_CELL_W / 2 = 64`).
+const TIB_LIST_CAP: usize = 64;
 
 impl World {
     /// Create a world over a passability grid, seeding the sim RNG. Houses, the
@@ -139,6 +200,11 @@ impl World {
             ore: OreField::empty(w, h),
             catalog: Catalog::new(),
             passable,
+            shroud: Shroud::new(w, h),
+            ore_growth: None,
+            ai: Vec::new(),
+            player_house: None,
+            game_over: GameOver::Ongoing,
             rng: RandomLcg::new(seed),
             tick_count: 0,
         }
@@ -157,6 +223,60 @@ impl World {
     /// Create `n` houses, each starting with `credits`.
     pub fn init_houses(&mut self, n: usize, credits: i32) {
         self.houses = (0..n).map(|_| House::new(credits)).collect();
+    }
+
+    /// Enable the per-house shroud (skirmish setup). Until this is called every
+    /// cell reads as explored, so movement/combat/economy worlds are unaffected.
+    pub fn enable_shroud(&mut self) {
+        self.shroud.enable();
+    }
+
+    /// Reveal the shroud disc around `cell` for `house` (public so the loader can
+    /// pre-reveal a scenario's starting positions).
+    pub fn reveal_shroud(&mut self, house: u8, cell: CellCoord, sight: u8) {
+        self.shroud.reveal(house, cell, sight);
+    }
+
+    /// Enable ore growth (`grows`) and/or spread (`spreads`) — the deferred M5
+    /// economy step (rules.ini `OreGrows`/`OreSpreads`). Off by default so
+    /// existing worlds draw no sim RNG; a skirmish turns it on, at which point
+    /// growth legitimately consumes the sync RNG (see [`run_ore_growth`]).
+    pub fn set_ore_growth(&mut self, grows: bool, spreads: bool) {
+        self.ore_growth = if grows || spreads {
+            Some(OreGrowth {
+                grows,
+                spreads,
+                ..Default::default()
+            })
+        } else {
+            None
+        };
+    }
+
+    /// Install the skirmish AI controllers (one per AI-controlled house). They
+    /// run inside the sim each tick, issuing the same [`Command`]s a player would.
+    pub fn set_ai(&mut self, ai: Vec<AiPlayer>) {
+        self.ai = ai;
+    }
+
+    /// Designate the tracked player house for win/lose resolution (skirmish).
+    pub fn set_player_house(&mut self, house: u8) {
+        self.player_house = Some(house);
+    }
+
+    /// The current terminal game state (`Ongoing` until a house is eliminated).
+    pub fn game_over(&self) -> GameOver {
+        self.game_over
+    }
+
+    /// Whether `house` is still alive — it owns at least one live building **or**
+    /// one live unit. Elimination is "all buildings AND all units destroyed"
+    /// (the classic MP defeat check, `house.cpp:1290`).
+    pub fn house_alive(&self, house: u8) -> bool {
+        self.buildings
+            .iter()
+            .any(|(_, b)| b.house == house && b.is_alive())
+            || self.units.iter().any(|(_, u)| u.house == house)
     }
 
     /// Read a house's credits (0 if the house index is out of range).
@@ -245,6 +365,20 @@ impl World {
         }
     }
 
+    /// Set a spawned unit's sight range in cells (from its type's `Sight=`), then
+    /// reveal the shroud around it for its owning house.
+    pub fn set_unit_sight(&mut self, unit: Handle, sight: u8) {
+        let revealed = if let Some(u) = self.units.get_mut(unit) {
+            u.set_sight(sight);
+            Some((u.house, u.cell(), u.sight))
+        } else {
+            None
+        };
+        if let Some((house, cell, sight)) = revealed {
+            self.shroud.reveal(house, cell, sight);
+        }
+    }
+
     /// Directly place building type `building_id` for `house` at footprint
     /// top-left `cell`, stamping occupancy and updating the house's power totals
     /// and building-type count. Used by the loader for scenario-provided
@@ -266,6 +400,9 @@ impl World {
             foot_h: proto.foot_h,
             health: proto.max_health,
             max_health: proto.max_health,
+            armor: proto.armor,
+            sight: proto.sight.min(10),
+            cost: proto.cost,
             power: proto.power,
             is_refinery: proto.is_refinery,
             is_construction_yard: proto.is_construction_yard,
@@ -290,6 +427,13 @@ impl World {
             }
             hs.adjust_building_count(building_id, 1);
         }
+        // Reveal the shroud around the new structure (building.cpp:1140).
+        let center = self
+            .buildings
+            .get(handle)
+            .map(|b| b.center_cell())
+            .unwrap_or(cell);
+        self.shroud.reveal(house, center, proto.sight.min(10));
         Some(handle)
     }
 
@@ -329,6 +473,34 @@ impl World {
             house.hash_into(&mut h);
         }
         self.ore.hash_into(&mut h);
+        // M6 state folds in ONLY when active, so a non-skirmish world's hash is
+        // byte-identical to M5 (the M3/M4 golden chains stay pinned unchanged).
+        self.shroud.hash_into(&mut h);
+        // Ore-growth scan cursor + candidate counts (drives future RNG draws).
+        if let Some(g) = &self.ore_growth {
+            h.write_u8(0xE0);
+            h.write_i32(g.scan);
+            h.write_i32(g.grow_excess);
+            h.write_i32(g.spread_excess);
+            h.write_u32(g.grow_list.len() as u32);
+            h.write_u32(g.spread_list.len() as u32);
+        }
+        // AI controller state (timers/decisions affect future commands).
+        if !self.ai.is_empty() {
+            h.write_u8(0xA1);
+            h.write_u32(self.ai.len() as u32);
+            for a in &self.ai {
+                a.hash_into(&mut h);
+            }
+        }
+        if let Some(p) = self.player_house {
+            h.write_u8(0x50);
+            h.write_u8(p);
+        }
+        if self.game_over != GameOver::Ongoing {
+            h.write_u8(0x60);
+            h.write_u8(self.game_over as u8);
+        }
         h.finish()
     }
 }
@@ -355,6 +527,10 @@ pub fn apply(world: &mut World, tick: u32, commands: &[Command]) {
         "commands applied to the wrong tick (replay/order bug)"
     );
 
+    // System 0: skirmish AI — each AI house issues Commands like a player would
+    // (§3.10), applied before the incoming player/net commands.
+    run_ai(world);
+
     // System 1: commands. Applied in the given (canonical) order.
     for &cmd in commands {
         apply_command(world, cmd);
@@ -375,7 +551,198 @@ pub fn apply(world: &mut World, tick: u32, commands: &[Command]) {
     // System 6: bullets (flight + detonation + damage + death).
     run_bullets(world);
 
+    // System 7: ore growth/spread (draws sync RNG when enabled) — deferred M5 item.
+    run_ore_growth(world);
+
+    // System 8: house-elimination / win-lose resolution.
+    update_game_over(world);
+
     world.tick_count = world.tick_count.wrapping_add(1);
+}
+
+/// System 0: run each installed skirmish AI in house-index order, applying the
+/// commands it issues. The AI reads a shared borrow of `world` and draws from a
+/// **copy** of the sim RNG (it is `Copy`), which is written back afterwards — so
+/// the AI's `Random_Pick`-equivalent draws advance the same seed the rest of the
+/// sim uses, in a fixed order, without a borrow conflict.
+fn run_ai(world: &mut World) {
+    if world.ai.is_empty() {
+        return;
+    }
+    let mut ai = std::mem::take(&mut world.ai);
+    let mut rng = world.rng;
+    let mut cmds: Vec<Command> = Vec::new();
+    for a in &mut ai {
+        a.step(world, &mut rng, &mut cmds);
+    }
+    world.rng = rng;
+    world.ai = ai;
+    for cmd in cmds {
+        apply_command(world, cmd);
+    }
+}
+
+/// System 8: resolve win/lose for a skirmish. A house is eliminated once it owns
+/// no live buildings **and** no live units (`house.cpp:1290`, the classic MP
+/// defeat). Only runs when a player house has been designated
+/// ([`World::set_player_house`]). Player eliminated → Defeat; every AI house
+/// eliminated → Victory. First terminal state sticks.
+fn update_game_over(world: &mut World) {
+    if world.game_over != GameOver::Ongoing {
+        return;
+    }
+    let Some(player) = world.player_house else {
+        return;
+    };
+    if !world.house_alive(player) {
+        world.game_over = GameOver::Defeat;
+        return;
+    }
+    // Victory once every AI-controlled house has been eliminated.
+    if !world.ai.is_empty() && world.ai.iter().all(|a| !world.house_alive(a.house)) {
+        world.game_over = GameOver::Victory;
+    }
+}
+
+/// System 7: ore growth/spread — the deferred M5 economy step (`MapClass::Logic`,
+/// `map.cpp:1308-1432`). A persistent cursor sweeps the map a slice per tick,
+/// reservoir-sampling grow- and spread-eligible cells (drawing the sync RNG at
+/// each eligible cell, `map.cpp:1367,1385`); each time the cursor wraps the whole
+/// map, one grow+spread wave fires (density++ on grow cells, and spread cells
+/// germinate fresh ore on a random-facing neighbour, `cell.cpp:3150,3176`).
+///
+/// **This legitimately consumes the sync RNG** — the M5 "economy draws no RNG"
+/// pin is updated for exactly this reason (see the ore module docs). Off unless a
+/// skirmish enabled it via [`World::set_ore_growth`], so non-skirmish worlds are
+/// unaffected.
+fn run_ore_growth(world: &mut World) {
+    let Some(mut g) = world.ore_growth.take() else {
+        return;
+    };
+    if !g.grows && !g.spreads {
+        world.ore_growth = Some(g);
+        return;
+    }
+    let mut rng = world.rng;
+
+    let w = world.ore.width();
+    let h = world.ore.height();
+    let total = w * h;
+    if total <= 0 {
+        world.rng = rng;
+        world.ore_growth = Some(g);
+        return;
+    }
+    let growth_rate = world.catalog.econ.growth_rate.max(1);
+    let ticks_per_minute = world.catalog.econ.ticks_per_minute.max(1);
+    // Cells scanned this tick: MAP_CELL_TOTAL / (GrowthRate · TICKS_PER_MINUTE),
+    // floored at 1 (map.cpp:1340).
+    let subcount = (total / (growth_rate * ticks_per_minute)).max(1);
+
+    for _ in 0..subcount {
+        if g.scan >= total {
+            break;
+        }
+        let cell = CellCoord::new(g.scan % w, g.scan / w);
+        g.scan += 1;
+
+        if g.grows && world.ore.can_grow(cell) {
+            reservoir_record(&mut rng, &mut g.grow_list, &mut g.grow_excess, cell);
+        }
+        if g.spreads && world.ore.can_spread(cell) {
+            reservoir_record(&mut rng, &mut g.spread_list, &mut g.spread_excess, cell);
+        }
+    }
+
+    // Wave fires once the cursor has swept the whole map (map.cpp:1406).
+    if g.scan >= total {
+        g.scan = 0;
+        let grow_cells = std::mem::take(&mut g.grow_list);
+        let spread_cells = std::mem::take(&mut g.spread_list);
+        for c in grow_cells {
+            world.ore.grow(c);
+        }
+        for c in spread_cells {
+            spread_one(world, &mut rng, c);
+        }
+        g.grow_excess = 0;
+        g.spread_excess = 0;
+    }
+
+    world.rng = rng;
+    world.ore_growth = Some(g);
+}
+
+/// Reservoir-sample `cell` into a capped candidate list, drawing the sync RNG
+/// exactly as `MapClass::Logic` does (`map.cpp:1367-1371`): a gate draw of
+/// `Random_Pick(0, excess)` compared to the current count, then (when the list is
+/// full) a replacement-slot draw. `excess` is incremented after the gate.
+fn reservoir_record(
+    rng: &mut RandomLcg,
+    list: &mut Vec<CellCoord>,
+    excess: &mut i32,
+    cell: CellCoord,
+) {
+    let gate = rng.range(0, *excess);
+    if gate <= list.len() as i32 {
+        if list.len() < TIB_LIST_CAP {
+            list.push(cell);
+        } else {
+            let slot = rng.range(0, TIB_LIST_CAP as i32 - 1) as usize;
+            list[slot] = cell;
+        }
+    }
+    *excess += 1;
+}
+
+/// Spread one dense ore cell to a neighbour (`CellClass::Spread_Tiberium`,
+/// `cell.cpp:3176`): pick a random start facing, scan the eight neighbours from
+/// there, and germinate the first empty, buildable one. The facing arithmetic is
+/// deliberately **not** wrapped mod 8 (matching the original `index + offset`,
+/// which yields out-of-range facings that are simply skipped).
+fn spread_one(world: &mut World, rng: &mut RandomLcg, cell: CellCoord) {
+    let offset = rng.range(0, 7); // Random_Pick(FACING_N, FACING_NW)
+    for index in 0..8i32 {
+        let facing = index + offset; // not wrapped — mirrors the original
+        let Some((dx, dy)) = facing_delta(facing) else {
+            continue;
+        };
+        let c = CellCoord::new(cell.x + dx, cell.y + dy);
+        if germinate_ok(world, c) {
+            world.ore.germinate(c);
+            // Random_Pick(OVERLAY_GOLD1, OVERLAY_GOLD4) — we only model "gold",
+            // but draw to keep the sync-RNG consumption faithful (cell.cpp:3187).
+            let _ = rng.range(0, 3);
+            return;
+        }
+    }
+}
+
+/// Whether an empty cell may germinate new ore (`Can_Tiberium_Germinate`,
+/// `cell.cpp:3209`, simplified): on-map, no ore already, buildable ground, and
+/// not covered by a building footprint.
+fn germinate_ok(world: &World, cell: CellCoord) -> bool {
+    cell.on_map()
+        && !world.ore.has_ore(cell)
+        && world.passable.is_static_passable(cell)
+        && !world.passable.is_occupied(cell)
+}
+
+/// The (dx, dy) offset for an RA `FacingType` (N=0, NE=1, E=2, SE=3, S=4, SW=5,
+/// W=6, NW=7). Facings ≥ 8 (from the unwrapped `index + offset`) have no
+/// neighbour and return `None`, matching `Adjacent_Cell` returning NULL.
+fn facing_delta(facing: i32) -> Option<(i32, i32)> {
+    match facing {
+        0 => Some((0, -1)),
+        1 => Some((1, -1)),
+        2 => Some((1, 0)),
+        3 => Some((1, 1)),
+        4 => Some((0, 1)),
+        5 => Some((-1, 1)),
+        6 => Some((-1, 0)),
+        7 => Some((-1, -1)),
+        _ => None,
+    }
 }
 
 /// Validate and enact a single command.
@@ -425,10 +792,10 @@ fn apply_command(world: &mut World, cmd: Command) {
             if !ok {
                 return;
             }
-            if let Target::Unit(t) = target {
-                if t == unit || !world.units.contains(t) {
-                    return;
-                }
+            match target {
+                Target::Unit(t) if t == unit || !world.units.contains(t) => return,
+                Target::Building(t) if !world.buildings.contains(t) => return,
+                _ => {}
             }
             if let Some(u) = world.units.get_mut(unit) {
                 u.target = Some(target);
@@ -446,6 +813,7 @@ fn apply_command(world: &mut World, cmd: Command) {
             cell,
         } => apply_place_building(world, house, building, cell),
         Command::CancelProduction { house, kind } => apply_cancel_production(world, house, kind),
+        Command::Sell { house, building } => apply_sell(world, house, building),
     }
 }
 
@@ -528,14 +896,25 @@ fn apply_start_production(world: &mut World, house: u8, item: BuildItem) {
         return;
     }
 
-    let total_ticks = world.catalog.time_to_build(cost);
+    // Build time = base (Cost·TICKS_PER_MINUTE/1000) × the discrete low-power
+    // multiplier, **snapshotted here at production START** (techno.cpp:6819 +
+    // factory.cpp:432 — the original bakes it into the factory Rate once and
+    // never recomputes it while the build runs). This replaces M5's per-tick
+    // continuous throttle (which slowed at ≤½ power); the multiplier is now the
+    // original's exact ×4/×2.5/×1.5 snapshot.
+    let base_ticks = world.catalog.time_to_build(cost);
+    let (scale_n, scale_d) = world
+        .houses
+        .get(house as usize)
+        .map(|h| h.build_time_scale())
+        .unwrap_or((1, 1));
+    let total_ticks = ((base_ticks as i64 * scale_n as i64 / scale_d as i64).max(1)) as i32;
     let prod = Production {
         item,
         cost,
         total_ticks,
         progress: 0,
         spent: 0,
-        power_accum: 0,
         done: false,
     };
     if let Some(hs) = world.houses.get_mut(house as usize) {
@@ -620,6 +999,53 @@ fn refund_credits(world: &mut World, house: u8, amount: i32) {
     if let Some(hs) = world.houses.get_mut(house as usize) {
         hs.credits += amount;
     }
+}
+
+/// Sell a building the issuing house owns: refund `RefundPercent` of its cost
+/// (default 50%, a flat fraction independent of current health,
+/// `techno.cpp:6417`) and clear its footprint. Own-building placement/sell is a
+/// player action; the AI never sells (it rebuilds).
+fn apply_sell(world: &mut World, house: u8, building: Handle) {
+    let (owner, cost) = match world.buildings.get(building) {
+        Some(b) if b.is_alive() => (b.house, b.cost),
+        _ => return,
+    };
+    if owner != house {
+        return;
+    }
+    let refund = (cost as i64 * world.catalog.econ.refund_percent as i64 / 100) as i32;
+    remove_building(world, building);
+    refund_credits(world, house, refund);
+}
+
+/// Remove a building from the world: clear its footprint occupancy (mirroring
+/// `MapClass::Pick_Up` → `CellClass::Occupy_Up`, `map.cpp:1056`), reverse the
+/// owning house's power totals and building-type count, then drop it from the
+/// arena. Used by combat death (`run_bullets`) and [`Command::Sell`].
+///
+/// **Deviation.** The original starts an 8-tick explosion countdown before
+/// removal (`building.cpp:1343`) and drops debris/survivors (`Drop_Debris`); we
+/// remove immediately. Death animations and rubble are a documented M7 seam.
+fn remove_building(world: &mut World, handle: Handle) {
+    let Some(b) = world.buildings.get(handle) else {
+        return;
+    };
+    let house = b.house;
+    let power = b.power;
+    let type_id = b.type_id;
+    let cells: Vec<CellCoord> = b.footprint().collect();
+    for c in cells {
+        world.passable.set_occupied(c, false);
+    }
+    if let Some(hs) = world.houses.get_mut(house as usize) {
+        if power >= 0 {
+            hs.power_output -= power;
+        } else {
+            hs.power_drain -= -power;
+        }
+        hs.adjust_building_count(type_id, -1);
+    }
+    world.buildings.remove(handle);
 }
 
 /// Whether building `building_id`'s footprint at top-left `cell` is a legal
@@ -710,6 +1136,7 @@ fn spawn_free_harvester(
     world.set_unit_max_health(handle, proto.max_health);
     world.set_unit_combat(handle, proto.armor, proto.weapon, proto.has_turret);
     world.set_unit_harvester(handle, proto.is_harvester);
+    world.set_unit_sight(handle, proto.sight);
 }
 
 /// Combat system: for each unit (in slot order) decrement its rearm timer,
@@ -743,14 +1170,24 @@ fn run_combat(world: &mut World) {
             None => continue,
         };
 
-        // Resolve the target's current aim point; drop stale/dead unit targets.
+        // Resolve the target's current aim point; drop stale/dead targets.
+        let drop_target = |world: &mut World| {
+            if let Some(u) = world.units.get_mut(handle) {
+                u.target = None;
+            }
+        };
         let target_coord = match target {
             Target::Unit(t) => match world.units.get(t) {
                 Some(tu) if tu.is_alive() => tu.coord,
                 _ => {
-                    if let Some(u) = world.units.get_mut(handle) {
-                        u.target = None;
-                    }
+                    drop_target(world);
+                    continue;
+                }
+            },
+            Target::Building(t) => match world.buildings.get(t) {
+                Some(tb) if tb.is_alive() => tb.center_cell().center(),
+                _ => {
+                    drop_target(world);
                     continue;
                 }
             },
@@ -777,8 +1214,18 @@ fn run_combat(world: &mut World) {
         let in_range = dist <= weapon.range;
 
         if !in_range {
-            // Approach: path toward the target's cell if we aren't already.
-            let goal = target_coord.cell();
+            // Approach: path toward the target. For a *building* the target cell
+            // sits inside an impassable footprint, so path to the nearest passable
+            // footprint-adjacent cell instead (else `find_path` to the occupied
+            // centre returns `None` and the attacker never closes in).
+            let goal = match target {
+                Target::Building(t) => world
+                    .buildings
+                    .get(t)
+                    .and_then(|b| nearest_adjacent_passable(&world.passable, b, coord.cell()))
+                    .unwrap_or_else(|| target_coord.cell()),
+                _ => target_coord.cell(),
+            };
             let need_path = world
                 .units
                 .get(handle)
@@ -814,6 +1261,35 @@ fn run_combat(world: &mut World) {
             }
         }
     }
+}
+
+/// The passable cell in a building's one-cell footprint ring that is nearest to
+/// `from` — an approach/attack target for a ground unit that cannot enter the
+/// (impassable) footprint itself. `None` if the whole ring is blocked.
+fn nearest_adjacent_passable(
+    passable: &Passability,
+    building: &Building,
+    from: CellCoord,
+) -> Option<CellCoord> {
+    let (tl, w, h) = (
+        building.cell,
+        building.foot_w as i32,
+        building.foot_h as i32,
+    );
+    let mut best: Option<(i32, CellCoord)> = None;
+    for y in (tl.y - 1)..=(tl.y + h) {
+        for x in (tl.x - 1)..=(tl.x + w) {
+            let c = CellCoord::new(x, y);
+            if !building.adjacent(c) || !passable.is_passable(c) {
+                continue;
+            }
+            let d = (c.x - from.x).abs() + (c.y - from.y).abs();
+            if best.map(|(bd, _)| d < bd).unwrap_or(true) {
+                best = Some((d, c));
+            }
+        }
+    }
+    best.map(|(_, c)| c)
 }
 
 /// Spawn one projectile from `shooter` at `target`. Computes the impact point,
@@ -854,15 +1330,10 @@ fn fire(
         target_coord
     };
 
-    let target_handle = match target {
-        Target::Unit(t) => Some(t),
-        Target::Cell(_) => None,
-    };
-
     let bullet = Bullet {
         pos: if weapon.instant { impact } else { muzzle },
         impact,
-        target: target_handle,
+        target,
         speed: weapon.proj_speed,
         facing: dir,
         damage: weapon.damage,
@@ -885,7 +1356,8 @@ fn fire(
 /// deliberate later-milestone TODO — the removal point is the single seam they
 /// will hook.
 fn run_bullets(world: &mut World) {
-    let mut dead: Vec<Handle> = Vec::new();
+    let mut dead_units: Vec<Handle> = Vec::new();
+    let mut dead_buildings: Vec<Handle> = Vec::new();
     for handle in world.bullets.handles() {
         let detonated = match world.bullets.get_mut(handle) {
             Some(b) => b.advance(),
@@ -894,37 +1366,68 @@ fn run_bullets(world: &mut World) {
         if !detonated {
             continue;
         }
-        // Detonate: pull the bullet out and apply its damage.
+        // Detonate: pull the bullet out and apply its damage. Buildings take
+        // damage through the same `modify_damage` path as units (buildings share
+        // the object damage math, `object.cpp:1661`; `Armor=` selects the column).
         if let Some(b) = world.bullets.remove(handle) {
-            if let Some(t) = b.target {
-                if let Some(tu) = world.units.get(t) {
-                    if tu.is_alive() {
-                        let distance = leptons_distance(b.impact, tu.coord);
-                        let dmg = modify_damage(
-                            b.damage,
-                            &b.warhead,
-                            tu.armor,
-                            distance,
-                            b.min_damage,
-                            b.max_damage,
-                        );
-                        if let Some(tu) = world.units.get_mut(t) {
-                            tu.health = tu.health.saturating_sub(dmg.max(0) as u16);
-                            if tu.health == 0 && !dead.contains(&t) {
-                                dead.push(t);
+            match b.target {
+                Target::Unit(t) => {
+                    if let Some(tu) = world.units.get(t) {
+                        if tu.is_alive() {
+                            let distance = leptons_distance(b.impact, tu.coord);
+                            let dmg = modify_damage(
+                                b.damage,
+                                &b.warhead,
+                                tu.armor,
+                                distance,
+                                b.min_damage,
+                                b.max_damage,
+                            );
+                            if let Some(tu) = world.units.get_mut(t) {
+                                tu.health = tu.health.saturating_sub(dmg.max(0) as u16);
+                                if tu.health == 0 && !dead_units.contains(&t) {
+                                    dead_units.push(t);
+                                }
                             }
                         }
                     }
                 }
+                Target::Building(t) => {
+                    if let Some(tb) = world.buildings.get(t) {
+                        if tb.is_alive() {
+                            let distance = leptons_distance(b.impact, tb.center_cell().center());
+                            let dmg = modify_damage(
+                                b.damage,
+                                &b.warhead,
+                                tb.armor,
+                                distance,
+                                b.min_damage,
+                                b.max_damage,
+                            );
+                            if let Some(tb) = world.buildings.get_mut(t) {
+                                tb.health = tb.health.saturating_sub(dmg.max(0) as u16);
+                                if tb.health == 0 && !dead_buildings.contains(&t) {
+                                    dead_buildings.push(t);
+                                }
+                            }
+                        }
+                    }
+                }
+                // Force-fire at an empty cell detonates harmlessly. Area/splash
+                // damage to bystanders is a documented M7 TODO.
+                Target::Cell(_) => {}
             }
-            // Force-fire at an empty cell (no unit target) detonates harmlessly.
-            // Area/splash damage to bystanders is a documented M7 TODO.
         }
     }
     // Remove the dead (their handles go stale; attackers drop the target next
-    // tick via the stale-handle check in `run_combat`).
-    for h in dead {
+    // tick via the stale-handle check in `run_combat`). A destroyed building must
+    // also free its footprint occupancy and reverse the house's power/count
+    // bookkeeping — that all lives in `remove_building`.
+    for h in dead_units {
         world.units.remove(h);
+    }
+    for h in dead_buildings {
+        remove_building(world, h);
     }
 }
 
@@ -965,23 +1468,9 @@ fn advance_production(world: &mut World, house_idx: usize, kind: ProdKind) {
         return;
     }
 
-    // --- Low-power throttle (documented deviation, see module notes) ---
-    // RA proper does not slow *production* under low power; it slows superweapon
-    // reload by `Inverse(Saturate(Power_Fraction(),1))` floored at 1/2
-    // (`building.cpp:4438-4441`). The task asks for low-power to slow
-    // production, so we apply that same ratio here: at full power one progress
-    // tick per game tick; at ≤50% power, one every two ticks.
-    let (mut pn, pd) = world.houses[house_idx].power_fraction();
-    if pd > 0 && pn * 2 < pd {
-        pn = (pd + 1) / 2; // floor the fraction at 1/2
-    }
-    p.power_accum += pn;
-    if p.power_accum < pd {
-        // Throttled: no progress this tick. Put the lane back unchanged.
-        store_production(world, house_idx, kind, prod);
-        return;
-    }
-    p.power_accum -= pd;
+    // Low power no longer throttles per tick: the ×4/×2.5/×1.5 slowdown is baked
+    // into `total_ticks` once at production start (see `apply_start_production`),
+    // exactly as the original snapshots the factory Rate in `FactoryClass::Start`.
 
     // --- Installment payment (faithful to factory.cpp:203-227) ---
     let target_spent =
@@ -1091,6 +1580,7 @@ fn spawn_produced_unit(world: &mut World, unit_id: u32, house: u8, cell: CellCoo
     world.set_unit_max_health(handle, proto.max_health);
     world.set_unit_combat(handle, proto.armor, proto.weapon, proto.has_turret);
     world.set_unit_harvester(handle, proto.is_harvester);
+    world.set_unit_sight(handle, proto.sight);
 }
 
 // ===========================================================================
@@ -1330,7 +1820,13 @@ fn cell_key(c: CellCoord) -> i64 {
 /// Advance every moving unit along its path by up to its per-tick speed,
 /// rotating its facing toward the heading. Units are processed in slot order.
 fn move_units(world: &mut World) {
+    // Units whose cell changed this tick, for shroud reveal after movement.
+    let mut moved: Vec<(u8, CellCoord, u8)> = Vec::new();
     for handle in world.units.handles() {
+        let start_cell = match world.units.get(handle) {
+            Some(u) if !u.path.is_empty() => u.cell(),
+            _ => continue,
+        };
         let Some(unit) = world.units.get_mut(handle) else {
             continue;
         };
@@ -1370,6 +1866,18 @@ fn move_units(world: &mut World) {
                 budget = 0;
             }
         }
+
+        // If the unit crossed into a new cell, note it for a shroud reveal.
+        let end_cell = unit.cell();
+        if end_cell != start_cell && unit.sight > 0 {
+            moved.push((unit.house, end_cell, unit.sight));
+        }
+    }
+
+    // Reveal the shroud around every unit that changed cell (incremental Look,
+    // techno.cpp:6577). Done after the movement pass so the borrow is clear.
+    for (house, cell, sight) in moved {
+        world.shroud.reveal(house, cell, sight);
     }
 }
 
@@ -1756,6 +2264,7 @@ mod m5_tests {
             is_construction_yard: cy,
             is_war_factory: wf,
             free_harvester_unit: if refin { Some(U_HARV) } else { None },
+            sight: 4,
             sprite_id: 0,
         };
         let uproto =
@@ -1771,6 +2280,7 @@ mod m5_tests {
                 deploys_to: deploys,
                 cost,
                 prereq,
+                sight: 2,
             };
         Catalog {
             buildings: vec![
@@ -1911,41 +2421,96 @@ mod m5_tests {
 
     #[test]
     fn economy_script_is_deterministic() {
+        // Runs a deploy → build-POWR → place-POWR script and asserts BOTH that it
+        // is deterministic AND that every step actually took effect (the M5
+        // version only compared hash chains, so it would have passed even if the
+        // deploy/production/placement had all silently no-op'd identically —
+        // ra-tester flagged that as a weak smoke test; strengthened here).
+        // Adjacent to the construction yard (top-left 29,29 after deploying the
+        // MCV at 30,30) so the proximity rule accepts it — the M5 test used
+        // (33,29), which is NOT adjacent, so its placement silently no-op'd and
+        // the hash-only comparison passed anyway. That is the weakness fixed here.
+        let placed_cell = CellCoord::new(32, 29);
         let script = |w: &mut World| -> Vec<u64> {
             let mcv = w.spawn_unit(0, 1, CellCoord::new(30, 30), Facing(0), 400, stats());
             let mut hs = vec![w.tick(&[Command::Deploy {
                 unit: mcv,
                 house: 1,
             }])];
+            // The MCV must have become a construction yard.
+            assert!(!w.units.contains(mcv), "MCV was not consumed by deploy");
+            assert!(
+                w.buildings
+                    .iter()
+                    .any(|(_, b)| b.house == 1 && b.is_construction_yard),
+                "deploy did not create a construction yard"
+            );
             hs.push(w.tick(&[Command::StartProduction {
                 house: 1,
                 item: BuildItem::Building(B_POWR),
             }]));
+            assert!(
+                w.house(1).unwrap().building_prod.is_some(),
+                "StartProduction(POWR) was rejected"
+            );
+            let mut placed = false;
             for _ in 0..200 {
                 // Place POWR as soon as it is ready (deterministic tick).
                 if w.house(1).unwrap().ready_building == Some(B_POWR) {
+                    let before = w.buildings.len();
                     hs.push(w.tick(&[Command::PlaceBuilding {
                         house: 1,
                         building: B_POWR,
-                        cell: CellCoord::new(33, 29),
+                        cell: placed_cell,
                     }]));
+                    // The placement must actually have added the building.
+                    assert_eq!(
+                        w.buildings.len(),
+                        before + 1,
+                        "PlaceBuilding did not add a building"
+                    );
+                    placed = true;
                 } else {
                     hs.push(w.tick(&[]));
                 }
             }
+            assert!(placed, "POWR never completed / was never placed");
             hs
         };
         let mut a = econ_world(1000);
         let mut b = econ_world(1000);
         assert_eq!(script(&mut a), script(&mut b));
         assert_eq!(a.state_hash(), b.state_hash());
+
+        // Concrete end-state assertions (identical for both runs): the house owns
+        // a POWR standing on the placement cell, its power output is live, and the
+        // footprint is occupied.
+        let hs = a.house(1).unwrap();
+        assert!(
+            hs.owns_building(B_POWR),
+            "house does not own the placed POWR"
+        );
+        assert_eq!(hs.power_output, 100, "placed POWR's power is not accounted");
+        assert!(
+            a.buildings
+                .iter()
+                .any(|(_, b)| b.house == 1 && b.type_id == B_POWR && b.cell == placed_cell),
+            "no POWR building stands at the placement cell"
+        );
+        assert!(
+            !a.passability().is_passable(placed_cell),
+            "placed POWR did not stamp footprint occupancy"
+        );
     }
 
     #[test]
     fn low_power_throttles_production_but_still_completes() {
         // A house whose only building is a refinery (drain 30, no power source):
-        // Power_Fraction < 1, so production runs at the floored 1/2 rate but still
-        // finishes. Compare its build time against a full-power house.
+        // Power_Fraction == 0, so `build_time_scale` snapshots the ×4 multiplier
+        // at production start (techno.cpp:6819) — production runs at a quarter
+        // speed but still finishes. Compare its build time against a full-power
+        // house. (M6 replaced M5's continuous ≤½-power throttle with the
+        // original's discrete ×4/×2.5/×1.5 snapshot; this bound updated to match.)
         let build_ticks = |low_power: bool| -> i32 {
             let mut w = econ_world(1000);
             // Give both a construction yard so POWR is buildable.
@@ -1975,10 +2540,11 @@ mod m5_tests {
             low > full,
             "low power ({low} ticks) should be slower than full power ({full} ticks)"
         );
-        // Floored at 1/2 power => at most ~2x slower (plus a small rounding slack).
+        // Zero power => ×4 build-time multiplier (techno.cpp:6819), snapshotted at
+        // start; allow a small slack for the ±1-tick loop/rounding boundaries.
         assert!(
-            low <= full * 2 + 4,
-            "low-power throttle exceeded the 1/2 floor"
+            (full * 4 - 4..=full * 4 + 4).contains(&low),
+            "zero-power build should take ~4× as long (full={full}, low={low})"
         );
     }
 
@@ -2729,5 +3295,175 @@ mod m5_tests {
             live_hashes, replay_hashes,
             "command-log replay must reproduce the live run's hash chain exactly"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // M6 coder smoke tests: building destruction, sell, win/lose, ore growth.
+    // (Minimal "does it run + stays deterministic" checks; full fidelity
+    // coverage is ra-tester's domain.)
+    // -----------------------------------------------------------------
+
+    /// A generous hitscan weapon that damages any armor (for fast building kills).
+    fn any_weapon() -> crate::combat::WeaponProfile {
+        crate::combat::WeaponProfile {
+            damage: 30,
+            rof: 10,
+            range: 2000,
+            proj_speed: 255,
+            proj_rot: 0,
+            invisible: true,
+            instant: true,
+            warhead: crate::combat::WarheadProfile {
+                spread: 3,
+                verses: [65536; 5],
+            },
+            warhead_ap: false,
+            arcing: false,
+            ballistic_scatter: 256,
+            homing_scatter: 512,
+            min_damage: 1,
+            max_damage: 1000,
+        }
+    }
+
+    #[test]
+    fn building_destroyed_clears_occupancy_power_and_count() {
+        let mut w = econ_world(1000);
+        let bh = w.spawn_building(B_POWR, 1, CellCoord::new(40, 40)).unwrap();
+        assert_eq!(w.house(1).unwrap().power_output, 100);
+        assert!(!w.passability().is_passable(CellCoord::new(40, 40)));
+        // Weaken it so a couple of shots finish it.
+        w.buildings.get_mut(bh).unwrap().health = 20;
+
+        let atk = w.spawn_unit(0, 2, CellCoord::new(43, 40), Facing(0), 400, stats());
+        w.set_unit_combat(atk, 0, Some(any_weapon()), true);
+        w.tick(&[Command::Attack {
+            unit: atk,
+            target: Target::Building(bh),
+            house: 2,
+        }]);
+        for _ in 0..400 {
+            if !w.buildings.contains(bh) {
+                break;
+            }
+            w.tick(&[]);
+        }
+        assert!(!w.buildings.contains(bh), "building was not destroyed");
+        assert!(
+            w.passability().is_passable(CellCoord::new(40, 40)),
+            "destroyed building did not free its footprint occupancy"
+        );
+        assert_eq!(
+            w.house(1).unwrap().power_output,
+            0,
+            "destroyed building's power was not reversed"
+        );
+        assert!(
+            !w.house(1).unwrap().owns_building(B_POWR),
+            "destroyed building's type count was not decremented"
+        );
+    }
+
+    #[test]
+    fn sell_refunds_fraction_and_frees_footprint() {
+        let mut w = econ_world(1000);
+        let bh = w.spawn_building(B_POWR, 1, CellCoord::new(40, 40)).unwrap();
+        let before = w.house_credits(1);
+        w.tick(&[Command::Sell {
+            house: 1,
+            building: bh,
+        }]);
+        assert!(!w.buildings.contains(bh), "sold building not removed");
+        assert!(
+            w.passability().is_passable(CellCoord::new(40, 40)),
+            "sold building did not free its footprint"
+        );
+        // POWR cost 30 × RefundPercent 50% = 15 credits refunded.
+        assert_eq!(w.house_credits(1), before + 15);
+        assert_eq!(w.house(1).unwrap().power_output, 0);
+
+        // Selling a building you do not own is rejected.
+        let bh2 = w.spawn_building(B_POWR, 1, CellCoord::new(50, 50)).unwrap();
+        w.tick(&[Command::Sell {
+            house: 2,
+            building: bh2,
+        }]);
+        assert!(
+            w.buildings.contains(bh2),
+            "a non-owner must not be able to sell a building"
+        );
+    }
+
+    #[test]
+    fn house_elimination_yields_victory_and_defeat() {
+        use crate::ai::{AiPlayer, Difficulty};
+
+        // Victory: the player (house 1) is alive; the sole AI (house 2) owns
+        // nothing (no buildings, no units) → eliminated.
+        let mut w = econ_world(1000);
+        w.spawn_building(B_FACT, 1, CellCoord::new(40, 40)).unwrap();
+        w.set_player_house(1);
+        w.set_ai(vec![AiPlayer::new(2, Difficulty::Normal)]);
+        assert_eq!(w.game_over(), GameOver::Ongoing);
+        w.tick(&[]);
+        assert_eq!(
+            w.game_over(),
+            GameOver::Victory,
+            "all AI houses eliminated should be a player Victory"
+        );
+
+        // Defeat: the player (house 1) owns nothing; the AI (house 2) is alive.
+        let mut w = econ_world(1000);
+        w.spawn_building(B_FACT, 2, CellCoord::new(40, 40)).unwrap();
+        w.set_player_house(1);
+        w.set_ai(vec![AiPlayer::new(2, Difficulty::Normal)]);
+        w.tick(&[]);
+        assert_eq!(
+            w.game_over(),
+            GameOver::Defeat,
+            "the player owning no buildings and no units should be a Defeat"
+        );
+    }
+
+    #[test]
+    fn ore_growth_draws_sim_rng_and_replays_identically() {
+        let make = || -> World {
+            let mut w = econ_world(1000);
+            let total = 128 * 128;
+            let mut ov = vec![0xFFu8; total];
+            for y in 30..40 {
+                for x in 30..40 {
+                    ov[y * 128 + x] = OVERLAY_GOLD_FIRST;
+                }
+            }
+            w.set_ore(OreField::from_overlay(128, 128, &ov));
+            w.set_ore_growth(true, true);
+            w
+        };
+        let mut a = make();
+        let seed0 = a.rng_seed();
+        let bails0 = a.ore.total_bails();
+        // ~3 full map sweeps at the default GrowthRate=2 (subcount≈9 cells/tick).
+        for _ in 0..2500 {
+            a.tick(&[]);
+        }
+        assert_ne!(
+            a.rng_seed(),
+            seed0,
+            "ore growth/spread must consume the sync RNG (the updated M5 pin)"
+        );
+        assert_ne!(
+            a.ore.total_bails(),
+            bails0,
+            "ore should have grown and/or spread"
+        );
+
+        // Same seed twice → identical outcome (determinism preserved).
+        let mut b = make();
+        for _ in 0..2500 {
+            b.tick(&[]);
+        }
+        assert_eq!(a.state_hash(), b.state_hash());
+        assert_eq!(a.rng_seed(), b.rng_seed());
     }
 }

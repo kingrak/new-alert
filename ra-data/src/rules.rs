@@ -23,6 +23,9 @@ pub struct UnitStats {
     pub rot: u8,
     /// `Strength=` (max health) — carried so scenario health percentages resolve.
     pub strength: i32,
+    /// `Sight=` range in cells (`techno.cpp:7062`) — how far this unit reveals the
+    /// shroud (M6). Defaults to 2 (the embedded `udata.cpp` default) when absent.
+    pub sight: u8,
 }
 
 impl UnitStats {
@@ -42,10 +45,12 @@ pub fn unit_stats(ini: &Ini, name: &str) -> Option<UnitStats> {
     let speed = ini.get_int(name, "Speed")? as i32;
     let rot = ini.get_int(name, "ROT").unwrap_or(0).clamp(0, 255) as u8;
     let strength = ini.get_int(name, "Strength").unwrap_or(0) as i32;
+    let sight = ini.get_int(name, "Sight").unwrap_or(2).clamp(0, 10) as u8;
     Some(UnitStats {
         speed,
         rot,
         strength,
+        sight,
     })
 }
 

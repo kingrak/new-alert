@@ -34,6 +34,14 @@ pub struct EconRules {
     /// Short ore-scan radius in cells (`TiberiumShortScan/CELL`, rules.cpp:266 =
     /// 0x0600 leptons = 6 cells).
     pub short_scan_cells: i32,
+    /// Sell refund as a percentage of build cost (`RefundPercent`, rules.cpp:258,
+    /// default 50%). The refund is a flat fraction of cost, independent of the
+    /// building's current health (`techno.cpp:6417`).
+    pub refund_percent: i32,
+    /// Ore growth/spread map-sweep period in minutes (`GrowthRate`, rules.cpp:198,
+    /// default 2). One grow+spread wave fires per full 128×128 sweep, so the scan
+    /// processes `MAP_CELL_TOTAL / (growth_rate · TICKS_PER_MINUTE)` cells/tick.
+    pub growth_rate: i32,
 }
 
 impl Default for EconRules {
@@ -47,6 +55,8 @@ impl Default for EconRules {
             step_count: 54,
             long_scan_cells: 32,
             short_scan_cells: 6,
+            refund_percent: 50,
+            growth_rate: 2,
         }
     }
 }
@@ -82,6 +92,8 @@ pub struct BuildingProto {
     /// The unit-proto index of the free harvester a refinery spawns (if
     /// `is_refinery`).
     pub free_harvester_unit: Option<u32>,
+    /// Sight range in cells (`Sight=`) — reveals the shroud on placement (M6).
+    pub sight: u8,
     /// Client sprite index for this building (opaque to the sim).
     pub sprite_id: u32,
 }
@@ -111,6 +123,8 @@ pub struct UnitProto {
     pub cost: i32,
     /// Prerequisite building type ids the house must own to build it.
     pub prereq: Vec<u32>,
+    /// Sight range in cells (`Sight=`) — reveals the shroud as the unit moves (M6).
+    pub sight: u8,
 }
 
 /// The immutable catalog handed to [`crate::World`] at construction.

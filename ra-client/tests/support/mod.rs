@@ -380,6 +380,7 @@ fn econ_catalog() -> ra_sim::Catalog {
         is_construction_yard: cy,
         is_war_factory: wf,
         free_harvester_unit: if refin { Some(ECON_U_HARV) } else { None },
+        sight: 4,
         sprite_id: 0,
     };
     let uproto =
@@ -398,6 +399,7 @@ fn econ_catalog() -> ra_sim::Catalog {
             deploys_to: deploys,
             cost,
             prereq,
+            sight: 2,
         };
     ra_sim::Catalog {
         buildings: vec![

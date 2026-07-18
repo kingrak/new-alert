@@ -38,14 +38,15 @@ pub struct Production {
     pub item: BuildItem,
     /// Full cost in credits.
     pub cost: i32,
-    /// Total build time in ticks (`Time_To_Build`).
+    /// Total build time in ticks (`Time_To_Build`), **including the low-power
+    /// multiplier snapshotted at production start** (see `crate::world`). The
+    /// original bakes this into the factory Rate once in `FactoryClass::Start`
+    /// (`factory.cpp:432-442`) and never recomputes it mid-build.
     pub total_ticks: i32,
     /// Progress in ticks so far (0..=`total_ticks`).
     pub progress: i32,
     /// Credits already spent (installments paid).
     pub spent: i32,
-    /// Low-power throttle accumulator (see `crate::world` production system).
-    pub power_accum: i32,
     /// Completed and awaiting placement (buildings) / spawn (units).
     pub done: bool,
 }
@@ -74,7 +75,6 @@ impl Production {
         h.write_i32(self.total_ticks);
         h.write_i32(self.progress);
         h.write_i32(self.spent);
-        h.write_i32(self.power_accum);
         h.write_u8(self.done as u8);
     }
 }
@@ -146,6 +146,27 @@ impl House {
     /// Whether the house is low on power (output below drain).
     pub fn low_power(&self) -> bool {
         self.power_drain > 0 && self.power_output < self.power_drain
+    }
+
+    /// The discrete low-power build-time multiplier as an integer ratio
+    /// `(num, den)`, to be snapshotted **once at production start** (not
+    /// recomputed per tick). Port of the `Time_To_Build` power branch
+    /// (`techno.cpp:6819-6831`): `power == 0 → ×4`, `< 1/2 → ×2.5`, `< 1 → ×1.5`,
+    /// else `×1`, where `power` is [`House::power_fraction`] (`house.cpp:4423`),
+    /// i.e. `min(1, output/drain)` (and `1` when `drain == 0`). Faithful to the
+    /// original, which bakes this factor into the factory Rate in
+    /// `FactoryClass::Start` and never revisits it mid-build (`factory.cpp:432`).
+    pub fn build_time_scale(&self) -> (i32, i32) {
+        let (pn, pd) = self.power_fraction();
+        if pn >= pd {
+            (1, 1) // full power (also the drain == 0 case, where power_fraction is (1,1))
+        } else if pn == 0 {
+            (4, 1)
+        } else if pn * 2 < pd {
+            (5, 2)
+        } else {
+            (3, 2)
+        }
     }
 
     pub(crate) fn hash_into(&self, h: &mut Fnv1a) {

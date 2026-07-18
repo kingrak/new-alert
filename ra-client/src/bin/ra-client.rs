@@ -71,9 +71,10 @@ fn run(args: &[String]) -> Result<(), BoxErr> {
         "sim" => cmd_sim(args),
         "battle" => cmd_battle(args),
         "econ" => cmd_econ(args),
+        "skirmish" => cmd_skirmish(args),
         _ => {
             eprintln!(
-                "usage:\n  ra-client dump   [--assets DIR] [--scenario NAME] [--out PATH.png] [--rect CX CY CW CH] [--playable]\n  ra-client window [--assets DIR] [--scenario NAME] [--smoke-seconds N]\n  ra-client sim    [--assets DIR] [--scenario NAME] [--out-dir DIR]\n  ra-client battle [--assets DIR] [--scenario NAME] [--out-dir DIR]\n  ra-client econ   [--assets DIR] [--scenario NAME] [--out-dir DIR] [--credits N]"
+                "usage:\n  ra-client dump     [--assets DIR] [--scenario NAME] [--out PATH.png] [--rect CX CY CW CH] [--playable]\n  ra-client window   [--assets DIR] [--scenario NAME] [--smoke-seconds N]\n  ra-client sim      [--assets DIR] [--scenario NAME] [--out-dir DIR]\n  ra-client battle   [--assets DIR] [--scenario NAME] [--out-dir DIR]\n  ra-client econ     [--assets DIR] [--scenario NAME] [--out-dir DIR] [--credits N]\n  ra-client skirmish [--assets DIR] [--scenario NAME] [--out-dir DIR] [--credits N] [--difficulty easy|normal|hard] [--ticks N]"
             );
             Err("unknown or missing subcommand".into())
         }
@@ -198,9 +199,9 @@ fn cmd_window(mut args: Vec<String>) -> Result<(), BoxErr> {
         .transpose()
         .map_err(|_| "--credits needs an integer")?
         .unwrap_or(8000);
-    // Prefer the M5 economy view (terrain + ore + build sidebar + a starter MCV
-    // to deploy). Fall back to terrain+units, then terrain-only, if the
-    // ore/rules/unit archives can't be resolved for the chosen scenario.
+    // M6 FIRST PLAYABLE: boot a skirmish (player + 1 AI, shroud, ore growth,
+    // win/lose) on a multiplayer map. Fall back to the M5 econ view, then
+    // terrain+units, then terrain-only, if archives can't be resolved.
     let assets_flag = args
         .iter()
         .position(|a| a == "--assets")
@@ -209,45 +210,69 @@ fn cmd_window(mut args: Vec<String>) -> Result<(), BoxErr> {
         .iter()
         .position(|a| a == "--scenario")
         .and_then(|i| args.get(i + 1).cloned())
-        .unwrap_or_else(|| "scg05eb.ini".to_string());
-    let econ = platform::resolve_assets_dir(assets_flag.as_deref())
+        .unwrap_or_else(|| "scm01ea.ini".to_string());
+    let skirmish = platform::resolve_assets_dir(assets_flag.as_deref())
         .ok_or_else(|| BoxErr::from("no assets dir"))
-        .and_then(|dir| assets::load_econ_from_dir(&dir, &scenario, credits));
+        .and_then(|dir| {
+            assets::load_skirmish_from_dir(&dir, &scenario, credits, ra_sim::Difficulty::Normal)
+        });
 
-    let core = match econ {
+    let core = match skirmish {
         Ok(g) => {
             eprintln!(
-                "econ game: controlled house {}, MCV at ({},{}) — press D to deploy, click the sidebar to build",
-                g.controlled, g.start_cell.x, g.start_cell.y
+                "skirmish: player house {} at ({},{}) vs AI house {} at ({},{}) — \
+                 press D to deploy the MCV, click the sidebar to build, right-click to order",
+                g.player_house,
+                g.player_start.x,
+                g.player_start.y,
+                g.ai_house,
+                g.ai_start.x,
+                g.ai_start.y
             );
             let mut core = g.core;
             core.set_camera(
-                (g.start_cell.x * CELL as i32) as f32 - 430.0,
-                (g.start_cell.y * CELL as i32) as f32 - 360.0,
+                (g.player_start.x * CELL as i32) as f32 - 430.0,
+                (g.player_start.y * CELL as i32) as f32 - 360.0,
             );
             core
         }
         Err(e) => {
-            eprintln!("note: economy view unavailable ({e}); trying terrain+units");
-            match load_game(&mut args) {
+            eprintln!("note: skirmish unavailable ({e}); trying the econ view");
+            match platform::resolve_assets_dir(assets_flag.as_deref())
+                .ok_or_else(|| BoxErr::from("no assets dir"))
+                .and_then(|dir| assets::load_econ_from_dir(&dir, "scg05eb.ini", credits))
+            {
                 Ok(g) => {
-                    report_spawns(&g);
-                    let start = center_camera_start(&g);
                     let mut core = g.core;
-                    core.set_camera(start.0, start.1);
+                    core.set_camera(
+                        (g.start_cell.x * CELL as i32) as f32 - 430.0,
+                        (g.start_cell.y * CELL as i32) as f32 - 360.0,
+                    );
                     core
                 }
                 Err(e2) => {
-                    eprintln!("note: falling back to terrain-only view ({e2})");
-                    let loaded = load(&mut args)?;
-                    describe(&loaded);
-                    let start = (
-                        (loaded.scenario.map_x as f32) * CELL as f32,
-                        (loaded.scenario.map_y as f32) * CELL as f32,
-                    );
-                    let mut core = loaded.into_appcore();
-                    core.set_camera(start.0, start.1);
-                    core
+                    eprintln!("note: econ view unavailable ({e2}); trying terrain+units");
+                    match load_game(&mut args) {
+                        Ok(g) => {
+                            report_spawns(&g);
+                            let start = center_camera_start(&g);
+                            let mut core = g.core;
+                            core.set_camera(start.0, start.1);
+                            core
+                        }
+                        Err(e2) => {
+                            eprintln!("note: falling back to terrain-only view ({e2})");
+                            let loaded = load(&mut args)?;
+                            describe(&loaded);
+                            let start = (
+                                (loaded.scenario.map_x as f32) * CELL as f32,
+                                (loaded.scenario.map_y as f32) * CELL as f32,
+                            );
+                            let mut core = loaded.into_appcore();
+                            core.set_camera(start.0, start.1);
+                            core
+                        }
+                    }
                 }
             }
         }
@@ -1067,4 +1092,416 @@ fn dump(core: &AppCore, out_dir: &str, name: &str) -> Result<(), BoxErr> {
     std::fs::write(&path, &bytes)?;
     eprintln!("wrote {path} ({}x{} px)", f.width, f.height);
     Ok(())
+}
+
+// ===========================================================================
+// M6 skirmish verification: player scripted build+attack vs a live AI, headless.
+// ===========================================================================
+
+/// The `skirmish` subcommand (M6 FIRST-PLAYABLE verification): boot a player-vs-AI
+/// skirmish, script the player's economy + assault through the `AppCore` seam
+/// while the AI plays inside the sim, run several thousand ticks headless, dump a
+/// PNG timeline (early base / AI base discovered under shroud / battle /
+/// victory-or-defeat overlay), report the outcome and that the AI actually built
+/// a base + attacked (with tick numbers), and prove determinism by replaying the
+/// identical script and comparing per-tick sim-hash chains.
+fn cmd_skirmish(mut args: Vec<String>) -> Result<(), BoxErr> {
+    let out_dir = take_flag(&mut args, "--out-dir").unwrap_or_else(|| ".".to_string());
+    let credits: i32 = take_flag(&mut args, "--credits")
+        .map(|s| s.parse())
+        .transpose()
+        .map_err(|_| "--credits needs an integer")?
+        .unwrap_or(8000);
+    let ticks: u32 = take_flag(&mut args, "--ticks")
+        .map(|s| s.parse())
+        .transpose()
+        .map_err(|_| "--ticks needs an integer")?
+        .unwrap_or(9000);
+    let difficulty = match take_flag(&mut args, "--difficulty").as_deref() {
+        Some("easy") => ra_sim::Difficulty::Easy,
+        Some("hard") => ra_sim::Difficulty::Hard,
+        _ => ra_sim::Difficulty::Normal,
+    };
+    let assets_flag = take_flag(&mut args, "--assets");
+    let scenario = take_flag(&mut args, "--scenario").unwrap_or_else(|| "scm01ea.ini".to_string());
+    let dir = platform::resolve_assets_dir(assets_flag.as_deref())
+        .ok_or("could not find an assets directory (try --assets DIR or RA_ASSETS_DIR)")?;
+    eprintln!(
+        "assets: {}  scenario: {scenario}  difficulty: {difficulty:?}",
+        dir.display()
+    );
+
+    let g1 = assets::load_skirmish_from_dir(&dir, &scenario, credits, difficulty)?;
+    let g2 = assets::load_skirmish_from_dir(&dir, &scenario, credits, difficulty)?;
+    eprintln!(
+        "player house {} at ({},{})  vs  AI house {} at ({},{})",
+        g1.player_house,
+        g1.player_start.x,
+        g1.player_start.y,
+        g1.ai_house,
+        g1.ai_start.x,
+        g1.ai_start.y
+    );
+
+    let (report, hashes1) = drive_skirmish(g1, &out_dir, true, ticks)?;
+    let (_r2, hashes2) = drive_skirmish(g2, &out_dir, false, ticks)?;
+    eprintln!("--- skirmish ---\n{report}");
+
+    if hashes1 == hashes2 {
+        eprintln!(
+            "DETERMINISM OK: identical {}-tick hash chains across two runs (final {:#018x})",
+            hashes1.len(),
+            hashes1.last().copied().unwrap_or(0)
+        );
+        Ok(())
+    } else {
+        let first = hashes1
+            .iter()
+            .zip(&hashes2)
+            .position(|(a, b)| a != b)
+            .unwrap_or(hashes1.len());
+        Err(format!("determinism FAILED: skirmish hash chains diverge at tick {first}").into())
+    }
+}
+
+/// Nearest live enemy (AI) building to a cell, prioritising its **production
+/// core** (construction yard → war factory → refinery → anything) so the assault
+/// knocks out the AI's ability to rebuild before mopping up. Ties broken by
+/// distance. Returns the building's centre cell to right-click.
+fn nearest_ai_building(core: &AppCore, ai_house: u8, from: CellCoord) -> Option<CellCoord> {
+    let role_rank = |b: &ra_sim::Building| -> i64 {
+        if b.is_construction_yard {
+            0
+        } else if b.is_war_factory {
+            1
+        } else if b.is_refinery {
+            2
+        } else {
+            3
+        }
+    };
+    let mut best: Option<(i64, i64, CellCoord)> = None; // (role, dist, cell)
+    for (_, b) in core.world().buildings.iter() {
+        if b.house == ai_house && b.is_alive() {
+            let c = b.center_cell();
+            let d = (c.x - from.x) as i64 * (c.x - from.x) as i64
+                + (c.y - from.y) as i64 * (c.y - from.y) as i64;
+            let rank = role_rank(b);
+            if best.map(|(br, bd, _)| (rank, d) < (br, bd)).unwrap_or(true) {
+                best = Some((rank, d, c));
+            }
+        }
+    }
+    best.map(|(_, _, c)| c)
+}
+
+/// Nearest live enemy (AI) unit cell to a cell, if any.
+fn nearest_ai_unit(core: &AppCore, ai_house: u8, from: CellCoord) -> Option<CellCoord> {
+    let mut best: Option<(i64, CellCoord)> = None;
+    for (_, u) in core.world().units.iter() {
+        if u.house == ai_house {
+            let c = u.cell();
+            let d = (c.x - from.x) as i64 * (c.x - from.x) as i64
+                + (c.y - from.y) as i64 * (c.y - from.y) as i64;
+            if best.map(|(bd, _)| d < bd).unwrap_or(true) {
+                best = Some((d, c));
+            }
+        }
+    }
+    best.map(|(_, c)| c)
+}
+
+/// Drive one skirmish end to end; returns a text report and the per-tick hash
+/// chain. The player economy is scripted through the sidebar seam; the assault
+/// selects the player's tanks and right-clicks the (scouted) AI base.
+fn drive_skirmish(
+    game: assets::SkirmishGame,
+    out_dir: &str,
+    write_png: bool,
+    max_ticks: u32,
+) -> Result<(String, Vec<u64>), BoxErr> {
+    use ra_sim::GameOver;
+    let assets::SkirmishGame {
+        mut core,
+        player_house,
+        player_start,
+        ai_house,
+        ai_start,
+    } = game;
+    let mut hashes: Vec<u64> = Vec::new();
+    let mut report = String::new();
+
+    let (vw, vh) = (1000u32, 720u32);
+    core.handle(InputEvent::Resize {
+        width: vw,
+        height: vh,
+    });
+    let recenter = |core: &mut AppCore, cell: CellCoord| {
+        let tw = core.tactical_width();
+        core.set_camera(
+            (cell.x * CELL as i32) as f32 - tw as f32 / 2.0,
+            (cell.y * CELL as i32) as f32 - vh as f32 / 2.0,
+        );
+    };
+    recenter(&mut core, player_start);
+
+    // 1) Deploy the player MCV.
+    let (mx, my) = cell_to_screen(&core, player_start);
+    core.handle(InputEvent::MouseDown {
+        button: MouseButton::Left,
+        x: mx,
+        y: my,
+    });
+    core.handle(InputEvent::MouseUp {
+        button: MouseButton::Left,
+        x: mx,
+        y: my,
+    });
+    core.handle(InputEvent::KeyDown(Key::Deploy));
+    core.handle(InputEvent::KeyUp(Key::Deploy));
+    core.handle(InputEvent::MouseLeft);
+    econ_step(&mut core, &mut hashes, 3);
+    let has_cy = core
+        .world()
+        .buildings
+        .iter()
+        .any(|(_, b)| b.house == player_house && b.is_construction_yard);
+    report.push_str(&format!(
+        "player deployed MCV -> construction yard: {has_cy}\n"
+    ));
+    // Connectivity probe: can a ground unit path from the player start to open
+    // ground beside the AI base? (The AI start cell itself is under its
+    // construction yard, so probe a passable neighbour.)
+    let probe = (1..6)
+        .flat_map(|r| {
+            [(r, 0), (0, r), (-r, 0), (0, -r), (r, r), (-r, -r)]
+                .into_iter()
+                .map(move |(dx, dy)| CellCoord::new(ai_start.x + dx, ai_start.y + dy))
+        })
+        .find(|&c| core.world().passability().is_passable(c));
+    let connected = probe
+        .and_then(|c| ra_sim::path::find_path(core.world().passability(), player_start, c))
+        .is_some();
+    report.push_str(&format!(
+        "land route player<->AI area: {connected} (ground-reachable)\n"
+    ));
+
+    // 2) Player economy: POWR, PROC, WEAP.
+    for name in ["POWR", "PROC", "WEAP"] {
+        match build_structure(&mut core, &mut hashes, player_house, name) {
+            Ok(cell) => {
+                report.push_str(&format!("player built {name} at ({},{})\n", cell.x, cell.y))
+            }
+            Err(e) => report.push_str(&format!("player {name}: {e}\n")),
+        }
+    }
+
+    // 3) Kick off the first tank, then dump the early-base frame.
+    if let Some(t) = sidebar_named(&core, "2TNK") {
+        if t.buildable {
+            core.start_production(t.item);
+        }
+    }
+    econ_step(&mut core, &mut hashes, 200);
+    if write_png {
+        recenter(&mut core, player_start);
+        dump(&core, out_dir, "skirmish_1_early_base")?;
+    }
+
+    // 4) Continuous produce-and-assault: keep pumping 2TNKs (reinvesting
+    // harvested credits) and, every ~90 ticks, throw the whole armed force at the
+    // nearest AI structure — advancing across the map, revealing the shroud, and
+    // grinding down the AI base. Observe the AI's own base-building + attacks.
+    let mut ai_base_tick: Option<u32> = None; // AI placed a 2nd building
+    let mut ai_attack_tick: Option<u32> = None; // an AI unit issued an attack
+    let mut revealed_dump = false;
+    let mut battle_dump = false;
+    let mut peak_tanks = 0usize;
+    let mut reissue_in = 0u32;
+    // Stall tracking: if the AI building count stops dropping, the remnant is
+    // either behind its own base or roaming units — hunt AI *units* instead so
+    // the army finishes the job rather than fixating on an unreachable structure.
+    let mut last_ai_buildings = usize::MAX;
+    let mut stall = 0u32;
+    // Send one early scout wave to reveal the AI base, then muster the main force.
+    let mut scouted = false;
+
+    while core.world().tick_count() < max_ticks && core.game_over() == GameOver::Ongoing {
+        // Keep the war factory busy whenever the lane is free and we can afford it.
+        if let Some(t) = sidebar_named(&core, "2TNK") {
+            if t.buildable {
+                core.start_production(t.item);
+            }
+        }
+
+        // Re-order the whole armed force at the AI every ~90 ticks.
+        if reissue_in == 0 {
+            reissue_in = 90;
+            let ai_bcount = core
+                .world()
+                .buildings
+                .iter()
+                .filter(|(_, b)| b.house == ai_house)
+                .count();
+            if ai_bcount < last_ai_buildings {
+                stall = 0;
+            } else {
+                stall += 1;
+            }
+            last_ai_buildings = ai_bcount;
+            let force: Vec<_> = core
+                .world()
+                .units
+                .handles()
+                .into_iter()
+                .filter(|&h| {
+                    core.world()
+                        .units
+                        .get(h)
+                        .map(|u| u.house == player_house && u.weapon.is_some() && !u.is_harvester)
+                        .unwrap_or(false)
+                })
+                .collect();
+            peak_tanks = peak_tanks.max(force.len());
+            // Muster a concentrated column before assaulting: feeding tanks in
+            // one at a time just trades them into the AI's base defences. Wait
+            // until we have a real fist, then commit (and keep committing).
+            const MUSTER: usize = 12;
+            // Commit once the main column is mustered — but always send the very
+            // first wave forward to scout (reveal the AI base under the shroud).
+            let committed = peak_tanks >= MUSTER || !scouted;
+            if !force.is_empty() && committed {
+                scouted = true;
+                // Aim at the AI structure/unit nearest the leading tank. When
+                // building destruction stalls, hunt AI units first.
+                let anchor = core
+                    .world()
+                    .units
+                    .get(force[0])
+                    .map(|u| u.cell())
+                    .unwrap_or(player_start);
+                let hunt_units = stall >= 4;
+                let target = if hunt_units {
+                    nearest_ai_unit(&core, ai_house, anchor)
+                        .or_else(|| nearest_ai_building(&core, ai_house, anchor))
+                } else {
+                    nearest_ai_building(&core, ai_house, anchor)
+                        .or_else(|| nearest_ai_unit(&core, ai_house, anchor))
+                };
+                if let Some(target) = target {
+                    core.select_units(&force);
+                    recenter(&mut core, target);
+                    let (tx, ty) = cell_to_screen(&core, target);
+                    core.handle(InputEvent::MouseDown {
+                        button: MouseButton::Right,
+                        x: tx,
+                        y: ty,
+                    });
+                    core.handle(InputEvent::MouseLeft);
+                    core.drain_commands();
+                }
+            }
+        }
+        econ_step(&mut core, &mut hashes, 1);
+        reissue_in -= 1;
+
+        let t = core.world().tick_count();
+        // AI milestones.
+        if ai_base_tick.is_none() {
+            let n = core
+                .world()
+                .buildings
+                .iter()
+                .filter(|(_, b)| b.house == ai_house)
+                .count();
+            if n >= 2 {
+                ai_base_tick = Some(t);
+            }
+        }
+        if ai_attack_tick.is_none() {
+            let attacking = core
+                .world()
+                .units
+                .iter()
+                .any(|(_, u)| u.house == ai_house && u.weapon.is_some() && u.has_target());
+            if attacking {
+                ai_attack_tick = Some(t);
+            }
+        }
+        // PNG: AI base discovered — once the player has explored the cell of ANY
+        // AI building (a scout tank pierced the shroud around the enemy base).
+        if write_png && !revealed_dump {
+            let revealed = core.world().buildings.iter().find_map(|(_, b)| {
+                let c = b.center_cell();
+                (b.house == ai_house && core.world().shroud.is_explored(player_house, c))
+                    .then_some(c)
+            });
+            if let Some(bcell) = revealed {
+                recenter(&mut core, bcell);
+                dump(&core, out_dir, "skirmish_2_ai_base_revealed")?;
+                revealed_dump = true;
+            }
+        }
+        // PNG: a battle frame once bullets are flying.
+        if write_png && !battle_dump && !core.world().bullets.is_empty() {
+            // Frame the fight (near the first bullet).
+            let cell = core
+                .world()
+                .bullets
+                .iter()
+                .next()
+                .map(|(_, b)| b.pos.cell());
+            if let Some(cell) = cell {
+                recenter(&mut core, cell);
+            }
+            dump(&core, out_dir, "skirmish_3_battle")?;
+            battle_dump = true;
+        }
+    }
+    report.push_str(&format!("player peak armed force: {peak_tanks} tank(s)\n"));
+
+    let outcome = core.game_over();
+    if write_png {
+        // Frame the losing/winning base for the result shot.
+        let focus = nearest_ai_building(&core, ai_house, player_start).unwrap_or(player_start);
+        recenter(&mut core, focus);
+        dump(&core, out_dir, "skirmish_4_result")?;
+    }
+
+    let final_tick = core.world().tick_count();
+    let ai_buildings = core
+        .world()
+        .buildings
+        .iter()
+        .filter(|(_, b)| b.house == ai_house)
+        .count();
+    let player_buildings = core
+        .world()
+        .buildings
+        .iter()
+        .filter(|(_, b)| b.house == player_house)
+        .count();
+    let ai_units = core
+        .world()
+        .units
+        .iter()
+        .filter(|(_, u)| u.house == ai_house)
+        .count();
+    let player_units = core
+        .world()
+        .units
+        .iter()
+        .filter(|(_, u)| u.house == player_house)
+        .count();
+    report.push_str(&format!(
+        "AI built a base (2nd building) at tick: {:?}\n\
+         AI first issued an attack at tick: {:?}\n\
+         final tick {final_tick}: outcome {:?}\n\
+         player: {player_buildings} building(s), {player_units} unit(s)  |  \
+         AI: {ai_buildings} building(s), {ai_units} unit(s)\n\
+         AI start ({},{})",
+        ai_base_tick, ai_attack_tick, outcome, ai_start.x, ai_start.y
+    ));
+
+    Ok((report, hashes))
 }

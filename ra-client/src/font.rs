@@ -104,6 +104,47 @@ pub fn text_width(text: &str) -> i32 {
     text.len() as i32 * ADVANCE
 }
 
+/// Draw a left-aligned string at (x, y) magnified by an integer `scale` (each
+/// glyph pixel becomes a `scale`×`scale` block) — for the big VICTORY/DEFEAT
+/// banner. Clipped. Returns the x just past the text.
+pub fn draw_text_scaled(
+    dst: &mut RgbaImage,
+    x: i32,
+    y: i32,
+    text: &str,
+    rgb: [u8; 3],
+    scale: i32,
+) -> i32 {
+    let scale = scale.max(1);
+    let mut cx = x;
+    for &b in text.as_bytes() {
+        let rows = glyph(b);
+        for (ry, bits) in rows.iter().enumerate() {
+            for gx in 0..GLYPH_W {
+                if bits & (1 << (GLYPH_W - 1 - gx)) == 0 {
+                    continue;
+                }
+                for sy in 0..scale {
+                    for sx in 0..scale {
+                        let px = cx + gx * scale + sx;
+                        let py = y + ry as i32 * scale + sy;
+                        if px >= 0 && py >= 0 && (px as u32) < dst.width && (py as u32) < dst.height
+                        {
+                            let di = ((py as u32 * dst.width + px as u32) * 4) as usize;
+                            dst.pixels[di] = rgb[0];
+                            dst.pixels[di + 1] = rgb[1];
+                            dst.pixels[di + 2] = rgb[2];
+                            dst.pixels[di + 3] = 255;
+                        }
+                    }
+                }
+            }
+        }
+        cx += ADVANCE * scale;
+    }
+    cx
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

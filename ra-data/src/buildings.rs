@@ -39,6 +39,9 @@ pub struct BuildingStats {
     pub tech_level: i32,
     /// Prerequisite building short-names (lowercased), from `Prerequisite=`.
     pub prereq: Vec<String>,
+    /// `Sight=` range in cells — how far the structure reveals the shroud on
+    /// placement (M6). Defaults to 4 when absent.
+    pub sight: u8,
 }
 
 /// The code-defined footprint (width, height) in cells for a building short
@@ -89,6 +92,7 @@ pub fn building_stats(rules: &Ini, name: &str) -> Option<BuildingStats> {
         .get(name, "Prerequisite")
         .map(parse_prereq)
         .unwrap_or_default();
+    let sight = rules.get_int(name, "Sight").unwrap_or(4).clamp(0, 10) as u8;
 
     Some(BuildingStats {
         foot_w,
@@ -99,6 +103,7 @@ pub fn building_stats(rules: &Ini, name: &str) -> Option<BuildingStats> {
         cost,
         tech_level,
         prereq,
+        sight,
     })
 }
 

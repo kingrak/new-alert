@@ -180,6 +180,42 @@ impl OreField {
         self.cells.iter().map(|c| c.bails as u64).sum()
     }
 
+    /// Whether `cell` may grow denser (M6, `CellClass::Can_Tiberium_Grow`,
+    /// `cell.cpp:3075`): gold ore below the density cap. Density is `bails - 1`,
+    /// so the `OverlayData < 11` gate is `bails <= 11` (density ≤ 10).
+    pub fn can_grow(&self, cell: CellCoord) -> bool {
+        let c = self.at(cell);
+        c.bails > 0 && !c.gem && c.bails <= 11
+    }
+
+    /// Increase `cell`'s density by one level (`CellClass::Grow_Tiberium`,
+    /// `cell.cpp:3150`), capped at density 11 (12 bails). No-op if ineligible.
+    pub fn grow(&mut self, cell: CellCoord) {
+        if self.can_grow(cell) {
+            if let Some(i) = self.index(cell) {
+                self.cells[i].bails += 1;
+            }
+        }
+    }
+
+    /// Whether `cell` is dense enough to spread (`Can_Tiberium_Spread`,
+    /// `cell.cpp:3114`): gold with `OverlayData > 6`, i.e. `bails >= 8`.
+    pub fn can_spread(&self, cell: CellCoord) -> bool {
+        let c = self.at(cell);
+        c.bails > 0 && !c.gem && c.bails >= 8
+    }
+
+    /// Germinate fresh gold ore at an empty `cell` (`Spread_Tiberium`,
+    /// `cell.cpp:3187`: a new `OVERLAY_GOLD*` at `OverlayData = 0` → 1 bail).
+    pub fn germinate(&mut self, cell: CellCoord) {
+        if let Some(i) = self.index(cell) {
+            self.cells[i] = OreCell {
+                bails: 1,
+                gem: false,
+            };
+        }
+    }
+
     /// Fold the ore field into the world hash: only non-empty cells, in
     /// row-major (fixed) order, so a divergent harvest is caught.
     pub(crate) fn hash_into(&self, h: &mut Fnv1a) {

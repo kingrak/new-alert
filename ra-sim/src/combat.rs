@@ -29,6 +29,10 @@ pub const PIXEL_LEPTON_W: i32 = 10;
 pub enum Target {
     /// An enemy unit, addressed by generational handle (goes stale on death).
     Unit(Handle),
+    /// An enemy building, addressed by generational handle (M6). Damage flows
+    /// through the same `modify_damage` path as units (buildings share the
+    /// object damage math, `object.cpp:1661`).
+    Building(Handle),
     /// A ground cell (force-fire). Always "in range" of being aimed at.
     Cell(CellCoord),
 }

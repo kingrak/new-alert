@@ -26,6 +26,14 @@ pub struct Building {
     pub health: u16,
     /// Max strength.
     pub max_health: u16,
+    /// Armor class index (`Armor=`, `techno.cpp:7059`). Selects the column of an
+    /// attacker's warhead `Verses` matrix — buildings take damage through the
+    /// same `modify_damage` path as units (`object.cpp:1661`).
+    pub armor: u8,
+    /// Sight range in cells (`Sight=`) — reveals the shroud on placement (M6).
+    pub sight: u8,
+    /// Build cost in credits (`Cost=`) — for the sell refund (M6).
+    pub cost: i32,
     /// Net power (positive output, negative drain) — mirrored into the owning
     /// house's power totals when placed/removed.
     pub power: i32,
@@ -93,5 +101,7 @@ impl Building {
         h.write_u16(self.health);
         h.write_u16(self.max_health);
         h.write_i32(self.power);
+        // `armor`, `sight`, and `cost` are constants derived from `type_id` (which
+        // is already hashed above), so they are not folded again.
     }
 }

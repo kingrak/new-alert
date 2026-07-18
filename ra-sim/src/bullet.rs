@@ -6,8 +6,7 @@
 //! [`crate::combat::modify_damage`] to the target. Death anims and craters are a
 //! deliberate M7 seam (see [`crate::world`]).
 
-use crate::arena::Handle;
-use crate::combat::WarheadProfile;
+use crate::combat::{Target, WarheadProfile};
 use crate::coords::{Facing, WorldCoord};
 use crate::hash::Fnv1a;
 
@@ -19,9 +18,10 @@ pub struct Bullet {
     pub pos: WorldCoord,
     /// Pre-computed impact point (already scattered if the shot was inaccurate).
     pub impact: WorldCoord,
-    /// The intended target unit, if any (a force-fire ground shot has `None`).
-    /// Damage is applied to this unit if it is still live at detonation.
-    pub target: Option<Handle>,
+    /// What the shot is aimed at: a live unit, a live building, or a ground cell
+    /// (force-fire). Damage is applied to the entity target if it is still live
+    /// at detonation; a `Cell` target detonates harmlessly (M6 seam).
+    pub target: Target,
     /// Straight-flight speed in leptons per tick.
     pub speed: i32,
     /// Direction of travel (for the client's tracer/sprite; sim uses `impact`).
@@ -75,12 +75,21 @@ impl Bullet {
         h.write_i32(self.impact.x.0);
         h.write_i32(self.impact.y.0);
         match self.target {
-            Some(handle) => {
+            Target::Unit(handle) => {
                 h.write_u8(1);
                 h.write_u32(handle.index);
                 h.write_u32(handle.gen);
             }
-            None => h.write_u8(0),
+            Target::Building(handle) => {
+                h.write_u8(2);
+                h.write_u32(handle.index);
+                h.write_u32(handle.gen);
+            }
+            Target::Cell(c) => {
+                h.write_u8(3);
+                h.write_i32(c.x);
+                h.write_i32(c.y);
+            }
         }
         h.write_i32(self.speed);
         h.write_u8(self.facing.0);

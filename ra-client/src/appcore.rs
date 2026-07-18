@@ -16,7 +16,7 @@ use std::collections::BTreeMap;
 use ra_data::house::{identity_remap, RemapTable};
 use ra_formats::tmpl::ICON_WIDTH;
 use ra_sim::coords::{CellCoord, Facing, WorldCoord, LEPTONS_PER_CELL};
-use ra_sim::{BuildItem, Handle, Passability, ProdKind, Target, World};
+use ra_sim::{BuildItem, GameOver, Handle, Passability, ProdKind, Target, World};
 
 use crate::compositor::{viewport_rgba, IndexedImage, Palette, RgbaImage};
 use crate::font;
@@ -244,6 +244,18 @@ impl AppCore {
         self.player_house
     }
 
+    /// The current terminal game state (Ongoing / Victory / Defeat), surfaced for
+    /// the overlay, the shell, and tests.
+    pub fn game_over(&self) -> GameOver {
+        self.world.game_over()
+    }
+
+    /// Whether the UI still accepts player orders — false once the game is over
+    /// (§4.9 M6: "stops accepting orders").
+    fn accepting_orders(&self) -> bool {
+        self.world.game_over() == GameOver::Ongoing
+    }
+
     /// The controlled house's spendable credits (0 if none / no house).
     pub fn credits(&self) -> i32 {
         self.player_house
@@ -373,6 +385,24 @@ impl AppCore {
     /// the seam so drives can assert same-seed-twice equality.
     pub fn sim_hash(&self) -> u64 {
         self.world.state_hash()
+    }
+
+    /// Directly set the selection to `handles` (only those the player may
+    /// command are kept). A deterministic selection seam for the verification
+    /// harness / tests — equivalent to a box-select but independent of the
+    /// camera position.
+    pub fn select_units(&mut self, handles: &[Handle]) {
+        self.selected = handles
+            .iter()
+            .copied()
+            .filter(|&h| {
+                self.world
+                    .units
+                    .get(h)
+                    .map(|u| self.selectable(u.house))
+                    .unwrap_or(false)
+            })
+            .collect();
     }
 
     /// The handles of currently-selected units (ascending slot order).
@@ -616,6 +646,8 @@ impl AppCore {
         // Units draw over terrain/buildings; anything spilling into the sidebar
         // strip is overpainted by `draw_sidebar` below.
         self.draw_units(&mut frame, cam);
+        // Shroud: paint unexplored cells black, hiding whatever sits under them.
+        self.draw_shroud(&mut frame, cam);
         self.draw_placement_preview(&mut frame, cam, tw);
         if let Some(d) = &self.drag {
             draw_rect_outline(
@@ -623,7 +655,65 @@ impl AppCore {
             );
         }
         self.draw_sidebar(&mut frame);
+        self.draw_game_over(&mut frame);
         frame
+    }
+
+    /// Paint a solid-black overlay over cells the player house has not explored
+    /// (M6 shroud). No-op when the shroud is disabled (non-skirmish worlds), so
+    /// terrain/econ views are unchanged. Only the tactical strip is shrouded.
+    fn draw_shroud(&self, frame: &mut RgbaImage, cam: Rect) {
+        if !self.world.shroud.is_enabled() {
+            return;
+        }
+        let house = self.player_house.unwrap_or(0);
+        let tw = self.tactical_width() as i32;
+        let cx0 = (cam.x.div_euclid(CELL_PIXELS as i64)) as i32 - 1;
+        let cy0 = (cam.y.div_euclid(CELL_PIXELS as i64)) as i32 - 1;
+        let cx1 = cx0 + (tw / CELL_PIXELS) + 3;
+        let cy1 = cy0 + (self.viewport_h as i32 / CELL_PIXELS) + 3;
+        for cy in cy0..cy1 {
+            for cx in cx0..cx1 {
+                let c = CellCoord::new(cx, cy);
+                if self.world.shroud.is_explored(house, c) {
+                    continue;
+                }
+                let px = (cx * CELL_PIXELS) as i64 - cam.x;
+                let py = (cy * CELL_PIXELS) as i64 - cam.y;
+                // Clip the black fill to the tactical strip (leave the sidebar).
+                let x0 = (px as i32).max(0);
+                let x1 = ((px + CELL_PIXELS as i64) as i32).min(tw);
+                let y0 = (py as i32).max(0);
+                let y1 = ((py + CELL_PIXELS as i64) as i32).min(self.viewport_h as i32);
+                if x1 > x0 && y1 > y0 {
+                    fill_rect(frame, x0, y0, x1 - 1, y1 - 1, [0, 0, 0]);
+                }
+            }
+        }
+    }
+
+    /// Draw the centred VICTORY / DEFEAT banner once the skirmish resolves.
+    fn draw_game_over(&self, frame: &mut RgbaImage) {
+        let (text, rgb) = match self.world.game_over() {
+            GameOver::Ongoing => return,
+            GameOver::Victory => ("VICTORY", [120, 240, 120]),
+            GameOver::Defeat => ("DEFEAT", [240, 90, 90]),
+        };
+        let scale = 6;
+        let tw = font::text_width(text) * scale;
+        let th = font::GLYPH_H * scale;
+        let cx = (self.tactical_width() as i32 - tw) / 2;
+        let cy = (self.viewport_h as i32 - th) / 2;
+        // Dim backing band for legibility.
+        fill_rect(
+            frame,
+            0,
+            cy - 12,
+            self.tactical_width() as i32 - 1,
+            cy + th + 12,
+            [12, 12, 16],
+        );
+        font::draw_text_scaled(frame, cx, cy, text, rgb, scale);
     }
 
     /// Interpolated render coordinate of a unit this frame.
@@ -792,7 +882,7 @@ impl AppCore {
     /// deferred — the task's simplification). Emits `Command::Attack` or
     /// `Command::Move` through the deterministic pipeline.
     fn issue_order(&mut self, x: i32, y: i32) {
-        if self.selected.is_empty() {
+        if self.selected.is_empty() || !self.accepting_orders() {
             return;
         }
         let (mx, my) = self.viewport_to_map(x, y);
@@ -819,8 +909,15 @@ impl AppCore {
                 .filter(|u| u.house != player_house)
                 .map(|_| h)
         });
+        // An enemy building under the cursor is an attack target too (M6). Own
+        // buildings are ignored here — a sell mode over own buildings is deferred
+        // (noted): the sim already has `Command::Sell`, but no UI affordance yet.
+        let enemy_target = enemy.map(Target::Unit).or_else(|| {
+            self.enemy_building_at_map(mx, my, player_house)
+                .map(Target::Building)
+        });
 
-        if let Some(target) = enemy {
+        if let Some(target) = enemy_target {
             for (unit, house) in orders {
                 // Only armed units get an attack order; unarmed selected units
                 // are simply left idle (the sim also rejects unarmed attackers).
@@ -835,7 +932,7 @@ impl AppCore {
                 }
                 let cmd = Command::Attack {
                     unit,
-                    target: Target::Unit(target),
+                    target,
                     house,
                 };
                 self.pending.push(cmd);
@@ -871,6 +968,20 @@ impl AppCore {
         best.map(|(_, h)| h)
     }
 
+    /// The enemy building whose footprint covers a map-pixel point, if any (for
+    /// the enemy-building attack click). Own buildings return `None`.
+    fn enemy_building_at_map(&self, mx: i64, my: i64, player_house: u8) -> Option<Handle> {
+        let cell = CellCoord::new(
+            (mx.div_euclid(CELL_PIXELS as i64)) as i32,
+            (my.div_euclid(CELL_PIXELS as i64)) as i32,
+        );
+        self.world
+            .buildings
+            .iter()
+            .find(|(_, b)| b.house != player_house && b.is_alive() && b.covers(cell))
+            .map(|(h, _)| h)
+    }
+
     // ---- Build UI actions (public so tests / the verification drive them) ----
 
     /// Queue a command into the loopback pipeline and record it as emitted.
@@ -881,6 +992,9 @@ impl AppCore {
 
     /// Deploy the currently-selected MCV (if any) into a construction yard.
     pub fn deploy_selected(&mut self) {
+        if !self.accepting_orders() {
+            return;
+        }
         let Some(house) = self.player_house.or(Some(0)) else {
             return;
         };
@@ -950,6 +1064,9 @@ impl AppCore {
     /// Emits `PlaceBuilding` only when the spot is valid, so an errant click
     /// keeps placement mode active for a retry.
     fn place_at(&mut self, x: i32, y: i32) {
+        if !self.accepting_orders() {
+            return;
+        }
         let (Some(building), Some(house)) = (self.placing, self.player_house) else {
             return;
         };
@@ -1002,6 +1119,9 @@ impl AppCore {
     /// Handle a left-click inside the sidebar strip: ready buildings enter
     /// placement mode, buildable rows start production.
     fn sidebar_click(&mut self, x: i32, y: i32) {
+        if !self.accepting_orders() {
+            return;
+        }
         let Some(idx) = self.sidebar_row_at(x, y) else {
             return;
         };
