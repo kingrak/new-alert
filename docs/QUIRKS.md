@@ -838,3 +838,125 @@ to the LZ → `EVAC_CIVILIAN` → `win`/Victory), asserts same-script-twice hash
 equality, and dumps start/briefing/victory PNGs. The menu campaign flow (Campaign
 button → 14-mission Allied list → briefing text → play → Victory advances / Defeat
 retries) is covered asset-free by `ui_campaign_flow.rs`.
+
+---
+
+## Q18 — Per-unit mission layer + APC transport (M7.5-B)
+
+**Milestone:** M7.5-B (playtest-driven: "enemy units don't fight actively even on
+Hard; APC soldiers don't get off and fight; units must react to being attacked").
+
+### P0 — per-unit missions (the INI `[UNITS]`/`[INFANTRY]` order, now executed)
+
+Until now the scenario mission string (final field: `Guard`, `Area Guard`, `Hunt`,
+`Sleep`, `Sticky`, `Harvest`) was parsed but dropped — placed units only *retaliated*
+when hit and never proactively engaged. Guards therefore "stood and watched". We now
+carry a [`Unit::mission`](../ra-sim/src/unit.rs) ([`Mission`] enum) and act on it.
+
+**Guard** (`FootClass::Mission_Guard`, `foot.cpp:594` → `Target_Something_Nearby(THREAT_RANGE)`,
+`techno.cpp:5912`; scan range from `Threat_Range`, `techno.cpp:5194`). A Guard unit
+idle at its post auto-acquires the nearest enemy within **weapon range** and engages
+through the existing combat path. **Leash:** the acquired target is dropped the moment
+it leaves weapon range (`In_Range` → `Assign_Target(TARGET_NONE)`) — plain Guard *never
+chases*. Implemented as `maybe_acquire_guard_target` (acquire) + a leash branch in
+`run_combat`'s out-of-range path.
+
+**Area Guard** (`FootClass::Mission_Guard_Area`, `foot.cpp:1001`): acquires within
+**twice** weapon range of the guard post (`THREAT_AREA`, centred on the post /
+`ArchiveTarget`), chases the target, but races back to the post once it strays more than
+weapon range from it (`Distance(ArchiveTarget) > Threat_Range(1)/2`, `foot.cpp:1057`).
+The post is the spawn cell; it is stored on [`Unit::guard_post`].
+
+**Hunt** (`FootClass::Mission_Hunt`, `foot.cpp:670`): seek the nearest enemy anywhere.
+Reuses the existing `hunt` auto-hunt path (`maybe_acquire_hunt_target`), which now also
+fires for `Mission::Hunt` — so `ALL_HUNT`, attack-teams, and an INI `Hunt` order all
+share one implementation.
+
+**Sleep / Sticky** (`MissionClass::Mission_Sleep`, `mission.cpp:93` — the handler never
+touches TarCom): fully inert. Never auto-acquire **and never retaliate** (`assign_retaliation`
+early-returns for these two). This is the conservative reading — an ambusher on Sticky
+stays hidden until scripted. *Deviation:* the original's `Take_Damage` snaps a
+`IsNoThreat` mission out via `Enter_Idle_Mode` and *then* lets it retaliate
+(`foot.cpp:1172`); we keep it passive instead (the `NoThreat`/`Zombie` MissionControl
+flags live in a data INI we don't parse, and "held-still means held-still" is the more
+useful campaign behaviour). Documented rather than half-modelled.
+
+**Default mission.** `Unit::new` defaults to `Mission::Guard`, matching the original's
+`Enter_Idle_Mode` (`unit.cpp:1343`, `order = MISSION_GUARD`). Harvesters keep the harvest
+FSM regardless of INI order.
+
+**Scope of proactive acquisition — campaign only (deliberate, documented).** The
+*proactive* guard scan (`maybe_acquire_guard_target`) and the base-under-attack alert fire
+**only in campaign worlds** (`World::campaign.is_some()`). A pure **skirmish** world keeps
+the M7 *retaliate-only* behaviour (a unit fights back when hit, but does not fire first).
+Reason: the playtest complaint is campaign-specific ("enemy units don't fight actively"),
+and enabling proactive guard in skirmish strengthens defence enough that the *tuned*
+AI-vs-AI balance no longer reaches a decisive outcome within the decisiveness suite's
+45-sim-minute budget (`scg05ea` regressed from ~11 min to a >45-min stall). Campaign-scoping
+delivers the fix exactly where it is wanted **and** leaves every skirmish/synthetic world
+byte- and behaviour-identical (zero golden churn — the strict "skirmish goldens must not
+move" constraint is met outright, not by re-pinning). This is a divergence from the
+original (which guards produced units in skirmish too); it is the coordinator-sanctioned
+"if default-Guard changes skirmish behaviour, coordinate" branch, resolved by *scoping*
+rather than re-pinning. **Revisit** when a dedicated skirmish-AI milestone can retune the
+attack cadence/force size to stay decisive with active defenders.
+
+**Player orders vs. guard.** A player `Move`/`Attack` sets the target directly and clears
+[`Unit::guard_target`], so it always *chases* (never leashed); when the order finishes the
+unit reverts to acquiring under its standing mission (the `Enter_Idle_Mode` return to
+Guard). Retaliation likewise sets `guard_target=false` (chases its attacker), preserving
+the exact M7 retaliation behaviour. Only *auto-acquired* guard targets are leashed.
+
+**Base-under-attack alert.** When a live enemy shot lands, `alert_nearby_guards` wakes any
+idle friendly Guard/Area-Guard unit within [`GUARD_ALERT_CELLS`] (4) to target the
+attacker — even one outside that unit's own acquire/sight range — so a guarded base fights
+back as a whole. This stands in for the original's house/team alert propagation
+(`FootClass::Take_Damage → Team->Took_Damage`, `foot.cpp:1157`); alerted responders chase
+(not leashed). *Deviation:* proximity broadcast rather than the full team/house alert graph.
+
+**Hash / golden discipline.** `mission` is folded into the unit hash **only when
+non-default** (≠ Guard); `guard_post`/`guard_target`/`cargo`/`board_target`/`unload_at`
+only when set/non-empty/true. So a default-guard vehicle-only world with no transport
+activity appends **no** new bytes and its byte layout is unchanged. Combined with the
+campaign-scoping above, **every pre-M7.5-B skirmish/synthetic golden is byte-identical** —
+verified by the full suite staying green with no re-pins. `type_id`/`sight`/`locomotor`/
+`capacity` remain unhashed type constants (their effect flows through hashed state).
+
+### P1 — transports / passengers (closes Q8's APC deferral)
+
+`Passengers=` (rules.ini) → [`UnitProto::passengers`] → [`Unit::capacity`]; loaded riders
+live on [`Unit::cargo`] (`Vec<Passenger>` snapshots) while off the map. New commands:
+- **`Command::Load { passenger, transport, house }`** — an infantryman boards an adjacent
+  own transport with spare capacity immediately, else walks to it (`board_target`) and
+  boards on arrival (`run_transports`, tick system 5.5). Mirrors `MISSION_ENTER`, simplified
+  (no radio handshake).
+- **`Command::Unload { transport, house }`** — disgorges every passenger to a free adjacent
+  spot (`free_unload_cell`, respecting the Q5.3 no-co-occupancy rule), resuming each
+  passenger's mission; a passenger with no free spot stays aboard.
+
+**Passengers die with the transport.** No explicit kill path is needed: a destroyed
+transport is removed from the arena, and its `cargo` vector is dropped with it — the
+passengers are gone. This matches the original (cargo is deleted when the carrier dies,
+`DriveClass`/`FootClass` limbo cleanup). *Deviation:* the original ejects survivors on some
+deaths; we always lose them (simpler, documented).
+
+**Teamtype `LOAD`/`UNLOAD`** (`TMISSION_LOAD`=14 / `TMISSION_UNLOAD`=8, `teamtype.h:54,60`):
+a scripted team carrying a transport + foot members with a `LOAD` mission boards the foot
+members at spawn; an `UNLOAD` mission flags the transport's [`Unit::unload_at`] = objective,
+so it disgorges on arrival and the riders (given `Hunt` for an attack team) attack. So a
+campaign `[TeamTypes]` assault (APC + squad → move → unload → attack) runs end-to-end.
+
+**UI (AppCore).** Select infantry + right-click an own APC → `Load`; select a loaded APC +
+Deploy key → `Unload`. Cursor/indicator minimal (no bespoke load cursor yet).
+
+**Hash.** `cargo`/`board_target`/`unload_at` folded only when non-empty/Some; a world with
+no transport activity is byte-identical.
+
+### Cuts (documented)
+
+- **P2 (campaign enemy activation) — deferred.** Difficulty selection on the campaign
+  briefing screen, `Autocreate`/`TACTION_AUTOCREATE` team formation, and `[Base]` +
+  `BEGIN_PRODUCTION` enemy rebuild are **not** in M7.5-B. The M7.9/7.10 handicap machinery
+  (Q15/Q16) and team machinery exist to build on; the campaign flow currently starts enemies
+  scripted-only. `BEGIN_PRODUCTION`/`AUTOCREATE` `TActionType` codes remain inert (as before).
+- **P3 (mission-timer HUD, terrain SHP render) — deferred** (unchanged from Q17.4).

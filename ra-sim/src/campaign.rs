@@ -78,6 +78,10 @@ pub mod tmission {
     pub const MOVECELL: i32 = 4;
     pub const GUARD: i32 = 5;
     pub const LOOP: i32 = 6;
+    /// Unload the transport at the team's current location (`TMISSION_UNLOAD`).
+    pub const UNLOAD: i32 = 8;
+    /// Load the team's foot members onto its transport member (`TMISSION_LOAD`).
+    pub const LOAD: i32 = 14;
     pub const PATROL: i32 = 16;
 }
 
@@ -173,6 +177,8 @@ pub struct SpawnProto {
     pub is_harvester: bool,
     /// Evacuable civilian VIP (Einstein/…).
     pub is_civ_evac: bool,
+    /// Passenger capacity (`Passengers=`) — non-zero for a transport (APC).
+    pub passengers: u8,
 }
 
 /// One `class:count` entry of a team (`TeamTypeClass::Members`).

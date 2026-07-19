@@ -25,7 +25,7 @@ use crate::ore::OreField;
 use crate::path::{find_path, find_path_avoiding, Passability};
 use crate::rng::RandomLcg;
 use crate::shroud::Shroud;
-use crate::unit::{HarvStatus, MoveStats, Unit};
+use crate::unit::{HarvStatus, Mission, MoveStats, Passenger, Unit};
 
 /// A player order. Every command carries the **issuing house** explicitly
 /// (§4.6): ownership is validated by the sim, never inferred from a connection,
@@ -125,6 +125,26 @@ pub enum Command {
         house: u8,
         /// The building to toggle repair on.
         building: Handle,
+    },
+    /// Order an infantry `passenger` to board `transport` (an own transport with
+    /// spare `Passengers=` capacity). If already adjacent it boards immediately;
+    /// otherwise it walks to the transport and boards on arrival (M7.5-B P1).
+    /// Ignored unless `house` owns both and there is room.
+    Load {
+        /// The infantry to load.
+        passenger: Handle,
+        /// The transport to board.
+        transport: Handle,
+        /// House issuing the order (must own both).
+        house: u8,
+    },
+    /// Order `transport` to unload all its passengers to free adjacent spots
+    /// (`Mission_Unload`). Ignored unless `house` owns it and it carries cargo.
+    Unload {
+        /// The transport to unload.
+        transport: Handle,
+        /// House issuing the order (must own `transport`).
+        house: u8,
     },
 }
 
@@ -502,6 +522,25 @@ impl World {
         }
     }
 
+    /// Set a spawned unit's standing [`Mission`] (from its scenario INI order).
+    /// Area-Guard units record their spawn cell as the guard post they leash to.
+    pub fn set_unit_mission(&mut self, unit: Handle, mission: crate::unit::Mission) {
+        if let Some(u) = self.units.get_mut(unit) {
+            u.mission = mission;
+            if mission == crate::unit::Mission::AreaGuard {
+                u.guard_post = Some(u.cell());
+            }
+        }
+    }
+
+    /// Set a spawned unit's passenger capacity (`Passengers=`), making it a
+    /// transport (e.g. APC). 0 leaves it a normal unit.
+    pub fn set_unit_capacity(&mut self, unit: Handle, capacity: u8) {
+        if let Some(u) = self.units.get_mut(unit) {
+            u.capacity = capacity;
+        }
+    }
+
     /// Set a spawned unit's sight range in cells (from its type's `Sight=`), then
     /// reveal the shroud around it for its owning house.
     pub fn set_unit_sight(&mut self, unit: Handle, sight: u8) {
@@ -729,6 +768,10 @@ pub fn apply(world: &mut World, tick: u32, commands: &[Command]) {
 
     // System 5: movement.
     move_units(world);
+
+    // System 5.5: transports — a passenger walking to board a transport boards it
+    // once it arrives adjacent (M7.5-B P1).
+    run_transports(world);
 
     // System 6: bullets (flight + detonation + damage + death).
     run_bullets(world);
@@ -1354,8 +1397,48 @@ fn spawn_team(world: &mut World, camp: &mut Campaign, team_idx: i32, spawn: bool
     }
 
     // Issue the movement order (attack-move if hunt).
+    // Scripted transport missions (`TMISSION_LOAD`/`TMISSION_UNLOAD`): if the team
+    // carries both a transport and foot members and its script says LOAD, the foot
+    // members board the transport (they spawn adjacent, so it is immediate); an
+    // UNLOAD later in the list flags the transport to disgorge at its objective.
+    let has_load = tt
+        .missions
+        .iter()
+        .any(|m| m.code == campaign::tmission::LOAD);
+    let has_unload = tt
+        .missions
+        .iter()
+        .any(|m| m.code == campaign::tmission::UNLOAD);
+    let transport = members
+        .iter()
+        .copied()
+        .find(|&h| world.units.get(h).map(|u| u.capacity > 0).unwrap_or(false));
+    if has_load {
+        if let Some(t) = transport {
+            let riders: Vec<Handle> = members
+                .iter()
+                .copied()
+                .filter(|&h| h != t && world.units.get(h).map(|u| u.is_infantry()).unwrap_or(false))
+                .collect();
+            for r in riders {
+                // Riders resume the team's stance on unload (Hunt for an attack
+                // team, else Guard).
+                if let Some(u) = world.units.get_mut(r) {
+                    if hunt {
+                        u.mission = Mission::Hunt;
+                    }
+                }
+                apply_load(world, r, t, house);
+            }
+        }
+    }
+
+    // Movement: order the on-map members (loaded riders are gone) to the objective.
     if let Some(target) = move_target {
-        for h in members {
+        for &h in &members {
+            if world.units.get(h).is_none() {
+                continue; // a boarded rider — no longer on the map
+            }
             apply_command(
                 world,
                 Command::Move {
@@ -1364,6 +1447,14 @@ fn spawn_team(world: &mut World, camp: &mut Campaign, team_idx: i32, spawn: bool
                     house,
                 },
             );
+        }
+        // A LOAD+UNLOAD assault drops its cargo at the destination.
+        if has_unload {
+            if let Some(t) = transport {
+                if let Some(u) = world.units.get_mut(t) {
+                    u.unload_at = Some(target);
+                }
+            }
         }
     }
 }
@@ -1389,6 +1480,7 @@ fn spawn_from_proto(
     world.set_unit_combat(h, proto.armor, proto.weapon, proto.has_turret);
     world.set_unit_secondary(h, proto.secondary);
     world.set_unit_harvester(h, proto.is_harvester);
+    world.set_unit_capacity(h, proto.passengers);
     if let Some(u) = world.units.get_mut(h) {
         if proto.is_infantry {
             u.make_infantry(spot);
@@ -1585,8 +1677,9 @@ fn apply_command(world: &mut World, cmd: Command) {
                     u.path = path;
                     u.dest = Some(goal);
                     u.target = None; // a move order overrides an attack
-                                     // A manual move interrupts harvesting; the FSM resumes
-                                     // (state `Idle` → `Looking`) once the unit arrives.
+                    u.guard_target = false; // player order, not a leashed guard acquire
+                                            // A manual move interrupts harvesting; the FSM resumes
+                                            // (state `Idle` → `Looking`) once the unit arrives.
                     if u.is_harvester {
                         u.harvest.status = HarvStatus::Idle;
                     }
@@ -1599,6 +1692,7 @@ fn apply_command(world: &mut World, cmd: Command) {
                     u.path.clear();
                     u.dest = None;
                     u.target = None;
+                    u.guard_target = false;
                 }
             }
         }
@@ -1629,8 +1723,9 @@ fn apply_command(world: &mut World, cmd: Command) {
             }
             if let Some(u) = world.units.get_mut(unit) {
                 u.target = Some(target);
-                // Clear a stale movement destination; approach is driven by the
-                // combat system toward the target, not a prior move order.
+                u.guard_target = false; // explicit player order — chase, never leash
+                                        // Clear a stale movement destination; approach is driven by the
+                                        // combat system toward the target, not a prior move order.
                 u.dest = None;
                 u.path.clear();
             }
@@ -1645,6 +1740,256 @@ fn apply_command(world: &mut World, cmd: Command) {
         Command::CancelProduction { house, kind } => apply_cancel_production(world, house, kind),
         Command::Sell { house, building } => apply_sell(world, house, building),
         Command::Repair { house, building } => apply_repair(world, house, building),
+        Command::Load {
+            passenger,
+            transport,
+            house,
+        } => apply_load(world, passenger, transport, house),
+        Command::Unload { transport, house } => apply_unload(world, transport, house),
+    }
+}
+
+/// Whether two cells are within one cell of each other (Chebyshev ≤ 1), i.e. the
+/// passenger stands on or beside the transport's cell.
+fn cells_adjacent(a: CellCoord, b: CellCoord) -> bool {
+    (a.x - b.x).abs() <= 1 && (a.y - b.y).abs() <= 1
+}
+
+/// System 5.5: complete pending `Load` orders. A unit with a `board_target` that
+/// has reached its transport (adjacent) boards it; if the transport vanished or
+/// filled up, the intent is dropped. Processed in slot order (deterministic).
+fn run_transports(world: &mut World) {
+    // Scripted auto-unload: a transport with a set drop-off point that has arrived
+    // (path empty, within a cell of the target) disgorges its cargo there.
+    let arrivers: Vec<(Handle, u8)> = world
+        .units
+        .iter()
+        .filter(|(_, u)| {
+            u.unload_at.is_some() && u.is_alive() && !u.cargo.is_empty() && u.path.is_empty()
+        })
+        .filter(|(_, u)| {
+            u.unload_at
+                .map(|c| cells_adjacent(u.cell(), c) || u.cell() == c)
+                .unwrap_or(false)
+        })
+        .map(|(h, u)| (h, u.house))
+        .collect();
+    for (h, house) in arrivers {
+        apply_unload(world, h, house);
+        if let Some(u) = world.units.get_mut(h) {
+            if u.cargo.is_empty() {
+                u.unload_at = None;
+            }
+        }
+    }
+
+    let pending: Vec<Handle> = world
+        .units
+        .iter()
+        .filter(|(_, u)| u.board_target.is_some() && u.is_alive())
+        .map(|(h, _)| h)
+        .collect();
+    for h in pending {
+        let (target, p_cell) = match world.units.get(h) {
+            Some(u) => (u.board_target, u.cell()),
+            None => continue,
+        };
+        let Some(t) = target else { continue };
+        // Transport still valid and has room?
+        let ok = world
+            .units
+            .get(t)
+            .map(|tr| tr.is_alive() && tr.capacity > 0 && (tr.cargo.len() as u8) < tr.capacity)
+            .unwrap_or(false);
+        if !ok {
+            if let Some(u) = world.units.get_mut(h) {
+                u.board_target = None;
+            }
+            continue;
+        }
+        let t_cell = world.units.get(t).map(|tr| tr.cell()).unwrap_or(p_cell);
+        if cells_adjacent(p_cell, t_cell) {
+            board_passenger(world, h, t);
+        } else if world
+            .units
+            .get(h)
+            .map(|u| u.path.is_empty())
+            .unwrap_or(false)
+        {
+            // Arrived where we could but not adjacent (transport moved) — re-path.
+            let loco = world
+                .units
+                .get(h)
+                .map(|u| u.locomotor)
+                .unwrap_or(Locomotor::Foot);
+            if let Some(path) = find_path(&world.passable, p_cell, t_cell, loco) {
+                if let Some(u) = world.units.get_mut(h) {
+                    u.path = path;
+                    u.dest = Some(t_cell);
+                }
+            } else if let Some(u) = world.units.get_mut(h) {
+                // Give up if unreachable.
+                u.board_target = None;
+            }
+        }
+    }
+}
+
+/// `Command::Load`: an infantry boards an adjacent own transport, or walks to it
+/// and boards on arrival (`run_transports`). Validates ownership, that the target
+/// is a transport with spare capacity, and that the passenger is infantry.
+fn apply_load(world: &mut World, passenger: Handle, transport: Handle, house: u8) {
+    // Validate transport: own, alive, a transport, with room.
+    let (t_cell, room) = match world.units.get(transport) {
+        Some(t) if t.house == house && t.is_alive() && t.capacity > 0 => {
+            (t.cell(), (t.cargo.len() as u8) < t.capacity)
+        }
+        _ => return,
+    };
+    if !room {
+        return;
+    }
+    // Validate passenger: own, alive, infantry, not itself the transport.
+    let (p_cell, p_loco) = match world.units.get(passenger) {
+        Some(p)
+            if p.house == house && p.is_alive() && p.is_infantry() && passenger != transport =>
+        {
+            (p.cell(), p.locomotor)
+        }
+        _ => return,
+    };
+    if cells_adjacent(p_cell, t_cell) {
+        board_passenger(world, passenger, transport);
+        return;
+    }
+    // Walk to the transport, remembering the intent so `run_transports` boards it
+    // once adjacent.
+    if let Some(path) = find_path(&world.passable, p_cell, t_cell, p_loco) {
+        if let Some(p) = world.units.get_mut(passenger) {
+            p.path = path;
+            p.dest = Some(t_cell);
+            p.target = None;
+            p.guard_target = false;
+            p.board_target = Some(transport);
+        }
+    } else if let Some(p) = world.units.get_mut(passenger) {
+        // Can't path all the way (transport cell is occupied by the vehicle) —
+        // still record the intent; `run_transports` boards on adjacency.
+        p.board_target = Some(transport);
+    }
+}
+
+/// Remove `passenger` from the map and stow it as cargo on `transport`.
+fn board_passenger(world: &mut World, passenger: Handle, transport: Handle) {
+    let snapshot = match world.units.get(passenger) {
+        Some(p) => Passenger {
+            type_id: p.type_id,
+            house: p.house,
+            health: p.health,
+            max_health: p.max_health,
+            stats: p.stats,
+            armor: p.armor,
+            weapon: p.weapon,
+            secondary: p.secondary,
+            has_turret: p.has_turret,
+            sight: p.sight,
+            is_infantry: p.is_infantry(),
+            mission: p.mission,
+        },
+        None => return,
+    };
+    // Only stow if there is still room (guards a race between two Load orders).
+    let ok = world
+        .units
+        .get(transport)
+        .map(|t| (t.cargo.len() as u8) < t.capacity)
+        .unwrap_or(false);
+    if !ok {
+        return;
+    }
+    if let Some(t) = world.units.get_mut(transport) {
+        t.cargo.push(snapshot);
+    }
+    world.units.remove(passenger);
+}
+
+/// `Command::Unload`: a transport disgorges every passenger onto a free adjacent
+/// spot, resuming each passenger's mission. Passengers with no free spot stay
+/// aboard.
+fn apply_unload(world: &mut World, transport: Handle, house: u8) {
+    let (t_cell, mut cargo) = match world.units.get_mut(transport) {
+        Some(t) if t.house == house && t.is_alive() && !t.cargo.is_empty() => {
+            (t.cell(), std::mem::take(&mut t.cargo))
+        }
+        _ => return,
+    };
+    let mut leftover: Vec<Passenger> = Vec::new();
+    for p in cargo.drain(..) {
+        match free_unload_cell(world, t_cell, p.is_infantry) {
+            Some((cell, spot)) => materialise_passenger(world, &p, cell, spot),
+            None => leftover.push(p),
+        }
+    }
+    if let Some(t) = world.units.get_mut(transport) {
+        t.cargo = leftover;
+    }
+}
+
+/// Find a free cell (and infantry sub-cell spot) adjacent to `from` for an
+/// unloaded passenger: passable, and — for infantry — with a free sub-cell spot;
+/// for a vehicle, not already holding a vehicle. Spiral out one ring.
+fn free_unload_cell(world: &World, from: CellCoord, is_infantry: bool) -> Option<(CellCoord, u8)> {
+    let loco = if is_infantry {
+        Locomotor::Foot
+    } else {
+        Locomotor::Wheel
+    };
+    for (dx, dy) in [
+        (0, -1),
+        (1, 0),
+        (0, 1),
+        (-1, 0),
+        (-1, -1),
+        (1, -1),
+        (1, 1),
+        (-1, 1),
+        (0, 0),
+    ] {
+        let c = CellCoord::new(from.x + dx, from.y + dy);
+        if !world.passable.is_passable_loco(c, loco) {
+            continue;
+        }
+        if is_infantry {
+            // Free sub-cell spot, and no vehicle sharing the cell (Q5.3).
+            if !vehicle_in_cell(world, c, None) {
+                let bits = infantry_spot_bits(world, c, None);
+                if let Some(spot) = crate::occupancy::closest_free_spot_bits(bits, 0) {
+                    return Some((c, spot));
+                }
+            }
+        } else if !vehicle_in_cell(world, c, None) && infantry_spot_bits(world, c, None) & 0x1F == 0
+        {
+            return Some((c, 0));
+        }
+    }
+    None
+}
+
+/// Re-materialise an unloaded passenger as a live unit at `cell`/`spot`.
+fn materialise_passenger(world: &mut World, p: &Passenger, cell: CellCoord, spot: u8) {
+    let h = world.spawn_unit(p.type_id, p.house, cell, Facing(0), p.health, p.stats);
+    world.set_unit_max_health(h, p.max_health);
+    world.set_unit_sight(h, p.sight);
+    world.set_unit_combat(h, p.armor, p.weapon, p.has_turret);
+    world.set_unit_secondary(h, p.secondary);
+    if let Some(u) = world.units.get_mut(h) {
+        if p.is_infantry {
+            u.make_infantry(spot);
+        }
+        u.mission = p.mission;
+        if p.mission == Mission::AreaGuard {
+            u.guard_post = Some(cell);
+        }
     }
 }
 
@@ -2252,9 +2597,14 @@ fn run_combat(world: &mut World) {
         // unarmored targets (`combat.cpp:83`).
         maybe_acquire_heal_target(world, handle);
 
+        // Guard / Area-Guard auto-acquire (`Target_Something_Nearby`, M7.5-B): a
+        // unit standing at its post acquires an enemy that enters its engagement
+        // envelope. This is what makes scenario "Guard" units actually fight.
+        maybe_acquire_guard_target(world, handle);
+
         // Campaign auto-hunt (`MISSION_HUNT`): a hunting unit with no target and no
         // path acquires the nearest enemy anywhere on the map and attacks it. Set
-        // by `TACTION_ALL_HUNT` and campaign attack-teams (M7.5).
+        // by `TACTION_ALL_HUNT`, campaign attack-teams, or an INI `Hunt` mission.
         maybe_acquire_hunt_target(world, handle);
 
         // Snapshot what we need without holding a borrow across the RNG draw.
@@ -2281,6 +2631,7 @@ fn run_combat(world: &mut World) {
         let drop_target = |world: &mut World| {
             if let Some(u) = world.units.get_mut(handle) {
                 u.target = None;
+                u.guard_target = false;
             }
         };
         let (target_coord, target_armor) = match target {
@@ -2329,6 +2680,54 @@ fn run_combat(world: &mut World) {
         let in_range = dist <= weapon.range;
 
         if !in_range {
+            // --- Guard leash (M7.5-B) ---
+            // An auto-acquired guard target that has left the engagement envelope
+            // is dropped rather than chased. Plain Guard never chases at all;
+            // Area Guard chases but races home once it strays more than weapon
+            // range from its post (`foot.cpp:1057`). Player Move/Attack orders,
+            // retaliation, hunt, and base-alert targets carry `guard_target=false`
+            // and always chase (fall through).
+            let leash = world
+                .units
+                .get(handle)
+                .filter(|u| u.guard_target)
+                .map(|u| (u.mission, u.guard_post));
+            if let Some((mission, post)) = leash {
+                match mission {
+                    Mission::Guard => {
+                        // `Target_Something_Nearby(THREAT_RANGE)` drops an
+                        // out-of-range target (`In_Range` → `Assign_Target(NONE)`).
+                        if let Some(u) = world.units.get_mut(handle) {
+                            u.target = None;
+                            u.guard_target = false;
+                        }
+                        continue;
+                    }
+                    Mission::AreaGuard => {
+                        let home = post.unwrap_or_else(|| coord.cell());
+                        let strayed = leptons_distance(coord, home.center()) > weapon.range;
+                        if strayed {
+                            let loco = world
+                                .units
+                                .get(handle)
+                                .map(|u| u.locomotor)
+                                .unwrap_or(Locomotor::Track);
+                            let path = find_path(&world.passable, coord.cell(), home, loco);
+                            if let Some(u) = world.units.get_mut(handle) {
+                                u.target = None;
+                                u.guard_target = false;
+                                if let Some(p) = path {
+                                    u.path = p;
+                                    u.dest = Some(home);
+                                }
+                            }
+                            continue;
+                        }
+                        // else fall through and chase within the leash.
+                    }
+                    _ => {}
+                }
+            }
             // Approach: path toward the target. For a *building* the target cell
             // sits inside an impassable footprint, so path to the nearest passable
             // footprint-adjacent cell instead (else `find_path` to the occupied
@@ -2918,6 +3317,124 @@ fn acquire_nearest_enemy(
     .map(|(_, h)| Target::Unit(h))
 }
 
+/// Acquire radius bound for Area-Guard (`Threat_Range(1)` is `Bound(..,0,0x0A00)`,
+/// `techno.cpp:5231` — ten cells).
+const AREA_GUARD_MAX_RANGE: i32 = 0x0A00;
+
+/// Guard-mission auto-acquisition (`TechnoClass::Target_Something_Nearby`,
+/// `techno.cpp:5912`; scan range from `Threat_Range`, `techno.cpp:5194`). A live,
+/// armed Guard/Area-Guard unit sitting idle at its post (no target, no path)
+/// targets the nearest enemy within its acquire radius:
+/// - **Guard** (`THREAT_RANGE`, `foot.cpp:609`): weapon range, centred on itself.
+/// - **Area Guard** (`THREAT_AREA`, `foot.cpp:1067`): twice weapon range, centred
+///   on the guard post (`ArchiveTarget`).
+///
+/// The acquired target is flagged [`Unit::guard_target`] so [`run_combat`] applies
+/// the leash (plain Guard never chases; Area Guard chases but races home when it
+/// strays more than weapon range from its post).
+fn maybe_acquire_guard_target(world: &mut World, handle: Handle) {
+    // Proactive guard acquisition (and the base-alert below) is scoped to
+    // **campaign** worlds. This is the M7.5-B fix for the playtest complaint
+    // ("enemy units don't fight actively"): scenario-placed Guard/Area-Guard units
+    // now engage. A pure **skirmish** world (`campaign == None`) deliberately keeps
+    // the M7 retaliate-only behaviour — enabling proactive guard there strengthens
+    // defence so much that the tuned AI-vs-AI balance no longer reaches a decisive
+    // outcome within its budget, and every skirmish/synthetic golden would move.
+    // A documented, coordinator-sanctioned scoping (QUIRKS Q18): campaign is where
+    // the complaint lives, and this keeps skirmish byte- and behaviour-identical.
+    if world.campaign.is_none() {
+        return;
+    }
+    let (mission, house, coord, post, range) = match world.units.get(handle) {
+        Some(u) => {
+            let range = match u.weapon {
+                Some(w) => w.range,
+                None => return,
+            };
+            if !u.mission.is_guarding() || !u.is_alive() || u.target.is_some() || !u.path.is_empty()
+            {
+                return;
+            }
+            (u.mission, u.house, u.coord, u.guard_post, range)
+        }
+        None => return,
+    };
+    let (center, radius) = match mission {
+        Mission::AreaGuard => (
+            post.map(|c| c.center()).unwrap_or(coord),
+            range.saturating_mul(2).min(AREA_GUARD_MAX_RANGE),
+        ),
+        // Guard (and any other guarding mission): THREAT_RANGE = weapon range.
+        _ => (coord, range),
+    };
+    let mut best: Option<(i32, Handle)> = None;
+    for (h, u) in world.units.iter() {
+        if !u.is_alive() || world.are_allies(house, u.house) {
+            continue;
+        }
+        let d = leptons_distance(center, u.coord);
+        if d <= radius && best.map(|(bd, _)| d < bd).unwrap_or(true) {
+            best = Some((d, h));
+        }
+    }
+    if let Some((_, h)) = best {
+        if let Some(u) = world.units.get_mut(handle) {
+            u.target = Some(Target::Unit(h));
+            u.guard_target = true;
+        }
+    }
+}
+
+/// Wake idle friendly guards near an enemy's shot to acquire the attacker — the
+/// "base under attack" propagation (`FootClass::Take_Damage → Team->Took_Damage`,
+/// `foot.cpp:1157`; the house/team alert), simplified to a proximity broadcast.
+/// Any live, armed Guard/Area-Guard unit that is an enemy of `source_house`,
+/// currently idle, and within [`GUARD_ALERT_CELLS`] of `impact_cell` targets the
+/// attacker — so a base fights a raider as a whole, and a guard whose sight is
+/// shrouded still turns to a hostile within its weapon range.
+///
+/// The alerted target **is** flagged `guard_target`, so the responder is leashed
+/// like any guard acquisition: it engages the attacker if within weapon range but
+/// does not abandon its post to chase across the map. (A no-leash version let one
+/// raider drag a whole base's defenders on an endless cross-map chase, so neither
+/// AI could concentrate force to a decision — the scg05ea AI-vs-AI stall.)
+fn alert_nearby_guards(
+    world: &mut World,
+    impact_cell: CellCoord,
+    source_house: u8,
+    source: Handle,
+) {
+    let handles: Vec<Handle> = world
+        .units
+        .iter()
+        .filter(|(_, u)| {
+            u.is_alive()
+                && u.mission.is_guarding()
+                && u.weapon.is_some()
+                && u.target.is_none()
+                && u.path.is_empty()
+                && !world.are_allies(u.house, source_house)
+                && {
+                    let c = u.cell();
+                    (c.x - impact_cell.x).abs() <= GUARD_ALERT_CELLS
+                        && (c.y - impact_cell.y).abs() <= GUARD_ALERT_CELLS
+                }
+        })
+        .map(|(h, _)| h)
+        .collect();
+    for h in handles {
+        if let Some(u) = world.units.get_mut(h) {
+            u.target = Some(Target::Unit(source));
+            u.guard_target = true;
+        }
+    }
+}
+
+/// Radius (in cells) within which an enemy shot wakes friendly guards to the
+/// attacker (base-under-attack alert). Not from a single reference constant —
+/// stands in for the house/team alert propagation with a modest local radius.
+const GUARD_ALERT_CELLS: i32 = 4;
+
 /// Auto-hunt acquisition: if `handle` is a live, armed, hunting unit with no
 /// target and no path, target the nearest enemy unit (else the nearest enemy
 /// building) anywhere on the map. Alliance-aware via [`World::are_allies`].
@@ -2927,7 +3444,10 @@ fn maybe_acquire_hunt_target(world: &mut World, handle: Handle) {
             u.house,
             u.coord,
             u.weapon.is_some(),
-            u.hunt && u.is_alive() && u.target.is_none() && u.path.is_empty(),
+            (u.hunt || u.mission == Mission::Hunt)
+                && u.is_alive()
+                && u.target.is_none()
+                && u.path.is_empty(),
         ),
         None => return,
     };
@@ -3259,6 +3779,17 @@ fn explosion_damage(
             }
         }
     }
+
+    // --- Base-under-attack alert (M7.5-B) ---
+    // A live enemy shot landing here wakes nearby idle friendly guards to the
+    // attacker, so a guarded base fights back as a whole even when the shooter is
+    // out of an individual guard's sight/acquire range. Campaign-scoped, for the
+    // same reason as `maybe_acquire_guard_target` (skirmish keeps M7 behaviour).
+    if world.campaign.is_some() {
+        if let Some(sh) = source_house {
+            alert_nearby_guards(world, impact_cell, sh, source);
+        }
+    }
 }
 
 /// Scale positive `dmg` by `house`'s armor handicap (M7.9 P2a). A neutral house
@@ -3291,6 +3822,12 @@ fn house_armor_scaled(world: &World, house: u8, dmg: i32) -> i32 {
 ///   we require only that the unit is armed and the source is a live enemy.
 fn assign_retaliation(unit: &mut Unit, source: Handle) {
     if unit.weapon.is_none() || unit.target.is_some() || !unit.path.is_empty() {
+        return;
+    }
+    // Sleep/Sticky are "no-threat" missions: their handlers never touch TarCom
+    // (`MissionClass::Mission_Sleep`, `mission.cpp:93`), so they neither
+    // auto-acquire nor return fire. A held-still ambusher stays hidden.
+    if matches!(unit.mission, Mission::Sleep | Mission::Sticky) {
         return;
     }
     unit.target = Some(Target::Unit(source));
@@ -4942,6 +5479,7 @@ mod m5_tests {
                 cost,
                 prereq,
                 sight: 2,
+                passengers: 0,
             };
         Catalog {
             buildings: vec![

@@ -122,6 +122,7 @@ fn catalog() -> Catalog {
             cost: 400, // U_TANK — drives the FIX repair-cost formula
             prereq: vec![],
             sight: 2,
+            passengers: 0,
         }],
         econ: EconRules::default(),
     }

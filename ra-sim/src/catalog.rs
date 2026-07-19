@@ -211,6 +211,10 @@ pub struct UnitProto {
     pub prereq: Vec<u32>,
     /// Sight range in cells (`Sight=`) — reveals the shroud as the unit moves (M6).
     pub sight: u8,
+    /// Passenger capacity (`Passengers=`, `udata.cpp`). Non-zero makes this a
+    /// transport (APC); 0 for everything else. Drives the Load/Unload commands
+    /// (M7.5-B P1).
+    pub passengers: u8,
 }
 
 /// The immutable catalog handed to [`crate::World`] at construction.

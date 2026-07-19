@@ -683,6 +683,10 @@ fn apply_op_with_mixed_units(core: &mut AppCore, op: MonkeyOp, index: usize) {
             Command::Stop { unit, house } => (unit, house),
             Command::Attack { unit, house, .. } => (unit, house),
             Command::Deploy { unit, house } => (unit, house),
+            Command::Load {
+                passenger, house, ..
+            } => (passenger, house),
+            Command::Unload { transport, house } => (transport, house),
             Command::StartProduction { .. }
             | Command::PlaceBuilding { .. }
             | Command::CancelProduction { .. }

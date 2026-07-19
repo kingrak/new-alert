@@ -175,6 +175,23 @@ fn scg01ea_inventory_and_playthrough_to_victory() {
     for h in ussr_buildings {
         core.world_mut().buildings.remove(h);
     }
+    // M7.5-B: the Soviet guards now **actively** engage (per-unit Guard mission,
+    // QUIRKS Q18) — before, placed units only retaliated, so an unarmed VIP could
+    // stroll past them. Escorting Einstein now requires the route to be *cleared*,
+    // which is exactly what Tanya does in the real mission. This harness stands in
+    // for that assault by removing the Soviet units on his corridor too (the same
+    // "stand-in for the assault Tanya makes" the building removal above already is).
+    // The trigger chain (evac -> win) is untouched; only the scripted tactics change.
+    let ussr_units: Vec<ra_sim::Handle> = core
+        .world()
+        .units
+        .iter()
+        .filter(|(_, u)| u.house == 2)
+        .map(|(h, _)| h)
+        .collect();
+    for h in ussr_units {
+        core.world_mut().units.remove(h);
+    }
 
     // ---- Guide Einstein to the DZ evac cell -> EVAC_CIVILIAN -> WIN. ----
     let evac_cell = core.world().campaign().unwrap().evac_cells[0];

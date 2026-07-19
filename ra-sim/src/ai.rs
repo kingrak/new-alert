@@ -849,7 +849,13 @@ impl AiPlayer {
                 if u.house == self.house
                     && u.weapon.is_some()
                     && !u.is_harvester
-                    && u.target.is_none()
+                    // A unit that is merely auto-guarding (M7.5-B `guard_target`)
+                    // counts as idle-and-available: recruiting it into a team
+                    // issues a Move that clears the guard target. Without this,
+                    // guard auto-acquisition would starve team recruitment (every
+                    // idle defender near an enemy holds a target) and the AI would
+                    // never mount an offensive — the scg05ea stall.
+                    && (u.target.is_none() || u.guard_target)
                     && crate::path::find_path(world.passability(), u.cell(), staging, u.locomotor)
                         .is_some()
                 {

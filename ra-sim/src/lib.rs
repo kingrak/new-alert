@@ -61,5 +61,5 @@ pub use ore::{OreCell, OreField};
 pub use path::Passability;
 pub use rng::RandomLcg;
 pub use shroud::Shroud;
-pub use unit::{HarvStatus, HarvestState, MoveStats, Unit, UnitKind};
+pub use unit::{HarvStatus, HarvestState, Mission, MoveStats, Passenger, Unit, UnitKind};
 pub use world::{apply, Command, GameOver, World};

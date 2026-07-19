@@ -506,6 +506,7 @@ fn factory_catalog() -> Catalog {
             cost: 20,
             prereq: vec![],
             sight: 2,
+            passengers: 0,
         }],
         econ: EconRules::default(),
     }

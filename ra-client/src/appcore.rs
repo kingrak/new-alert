@@ -1601,6 +1601,45 @@ impl AppCore {
                 .filter(|u| u.house != player_house)
                 .map(|_| h)
         });
+        // Load: right-clicking an **own transport** (a unit with passenger
+        // capacity) with infantry selected orders those infantry to board it
+        // (M7.5-B P1). Vehicles in the selection ignore the load order.
+        let own_transport = picked.filter(|&h| {
+            self.world
+                .units
+                .get(h)
+                .map(|u| u.house == player_house && u.capacity > 0)
+                .unwrap_or(false)
+        });
+        if let Some(transport) = own_transport {
+            let mut loaded_any = false;
+            for (unit, house) in &orders {
+                if *unit == transport {
+                    continue;
+                }
+                let is_inf = self
+                    .world
+                    .units
+                    .get(*unit)
+                    .map(|u| u.is_infantry())
+                    .unwrap_or(false);
+                if !is_inf {
+                    continue;
+                }
+                let cmd = Command::Load {
+                    passenger: *unit,
+                    transport,
+                    house: *house,
+                };
+                self.pending.push(cmd);
+                self.emitted.push(cmd);
+                loaded_any = true;
+            }
+            if loaded_any {
+                return;
+            }
+        }
+
         // An enemy building under the cursor is an attack target too (M6). Own
         // buildings are ignored here — a sell mode over own buildings is deferred
         // (noted): the sim already has `Command::Sell`, but no UI affordance yet.
@@ -1766,6 +1805,25 @@ impl AppCore {
             });
         if let Some(unit) = mcv {
             self.emit(Command::Deploy { unit, house });
+            return;
+        }
+        // Deploy also unloads a selected loaded transport (M7.5-B P1): the APC
+        // disgorges its passengers to free adjacent spots.
+        let loaded = self
+            .world
+            .units
+            .handles()
+            .into_iter()
+            .filter(|h| self.selected.contains(h))
+            .find(|&h| {
+                self.world
+                    .units
+                    .get(h)
+                    .map(|u| u.house == house && !u.cargo.is_empty())
+                    .unwrap_or(false)
+            });
+        if let Some(transport) = loaded {
+            self.emit(Command::Unload { transport, house });
         }
     }
 

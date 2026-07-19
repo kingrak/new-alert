@@ -494,6 +494,7 @@ fn simple_proto() -> SpawnProto {
         is_infantry: false,
         is_harvester: false,
         is_civ_evac: false,
+        passengers: 0,
     }
 }
 

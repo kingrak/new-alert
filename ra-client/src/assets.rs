@@ -27,9 +27,9 @@ use ra_formats::tmpl::Template;
 
 use ra_sim::coords::{CellCoord, Facing};
 use ra_sim::{
-    BuildItem, BuildingProto, Campaign, Catalog, EconRules, Handicap, Handle, MoveStats, OreField,
-    Passability, SpawnProto, TActionDef, TEventDef, TeamClass, TeamMission, TeamType, TriggerType,
-    UnitProto, World,
+    BuildItem, BuildingProto, Campaign, Catalog, EconRules, Handicap, Handle, Mission, MoveStats,
+    OreField, Passability, SpawnProto, TActionDef, TEventDef, TeamClass, TeamMission, TeamType,
+    TriggerType, UnitProto, World,
 };
 
 use crate::appcore::AppCore;
@@ -371,7 +371,7 @@ pub struct CampaignMission {
 
 /// One resolved `[INFANTRY]` spawn: `(type_id, house, cell, sub_cell, facing,
 /// strength, trigger, is_civ_evac)`.
-type InfantrySpawn = (u32, u8, CellCoord, u8, u8, u16, Option<u16>, bool);
+type InfantrySpawn = (u32, u8, CellCoord, u8, u8, u16, Option<u16>, bool, Mission);
 
 /// Whether a type name is a naval or aircraft unit we do not simulate yet (so a
 /// team member of this class is dropped, documented — M7.5 deferral).
@@ -476,6 +476,7 @@ fn register_campaign_unit(
         cost: rules.get_int(&key, "Cost").unwrap_or(0) as i32,
         prereq: Vec::new(),
         sight: ustats.sight,
+        passengers: rules.get_int(&key, "Passengers").unwrap_or(0).clamp(0, 255) as u8,
     });
     unit_sprites.push(sprite);
     infantry_anim.push(if is_inf {
@@ -654,7 +655,7 @@ pub fn load_campaign_from_bytes(
     // We must register every type BEFORE building the World's catalog snapshot,
     // so collect all placements first, then set the catalog, then spawn.
     // Vehicles from [UNITS].
-    let mut vehicle_spawns: Vec<(u32, u8, CellCoord, u8, u16)> = Vec::new();
+    let mut vehicle_spawns: Vec<(u32, u8, CellCoord, u8, u16, Mission)> = Vec::new();
     for p in &placements {
         match register_campaign_unit(
             &mut catalog,
@@ -672,6 +673,7 @@ pub fn load_campaign_from_bytes(
                 CellCoord::from_index(p.cell),
                 p.facing,
                 p.strength,
+                Mission::from_ini_name(&p.mission),
             )),
             None => skipped.push(p.unit_type.clone()),
         }
@@ -699,6 +701,7 @@ pub fn load_campaign_from_bytes(
                 p.strength,
                 trig_idx.get(&p.trigger).copied(),
                 is_civ_vip(&p.unit_type),
+                Mission::from_ini_name(&p.mission),
             )),
             None => skipped.push(p.unit_type.clone()),
         }
@@ -778,17 +781,17 @@ pub fn load_campaign_from_bytes(
 
     // Spawn vehicles.
     let mut units_placed = 0;
-    for (id, house, cell, facing, strength) in vehicle_spawns {
+    for (id, house, cell, facing, strength, mission) in vehicle_spawns {
         spawn_placed_unit(
-            &mut world, &catalog, id, house, cell, facing, strength, false, 0, None, false,
+            &mut world, &catalog, id, house, cell, facing, strength, false, 0, None, false, mission,
         );
         units_placed += 1;
     }
     // Spawn infantry.
     let mut infantry_placed = 0;
-    for (id, house, cell, sub, facing, strength, trig, vip) in infantry_spawns {
+    for (id, house, cell, sub, facing, strength, trig, vip, mission) in infantry_spawns {
         spawn_placed_unit(
-            &mut world, &catalog, id, house, cell, facing, strength, true, sub, trig, vip,
+            &mut world, &catalog, id, house, cell, facing, strength, true, sub, trig, vip, mission,
         );
         infantry_placed += 1;
     }
@@ -940,6 +943,7 @@ fn spawn_placed_unit(
     sub_cell: u8,
     trigger: Option<u16>,
     is_civ_evac: bool,
+    mission: Mission,
 ) {
     let proto = catalog.units[id as usize].clone();
     let max_h = proto.max_health as i32;
@@ -950,12 +954,19 @@ fn spawn_placed_unit(
     world.set_unit_combat(h, proto.armor, proto.weapon, proto.has_turret);
     world.set_unit_secondary(h, proto.secondary);
     world.set_unit_harvester(h, proto.is_harvester);
+    world.set_unit_capacity(h, proto.passengers);
     if let Some(u) = world.units.get_mut(h) {
         if is_infantry {
             u.make_infantry(sub_cell);
         }
         u.trigger = trigger;
         u.is_civ_evac = is_civ_evac;
+    }
+    // Harvesters keep their FSM regardless of INI order; everything else takes its
+    // scenario mission (Guard/Area Guard/Hunt/Sleep/Sticky). Area-Guard records its
+    // spawn cell as the post to leash to.
+    if !proto.is_harvester {
+        world.set_unit_mission(h, mission);
     }
 }
 
@@ -974,6 +985,7 @@ fn spawnproto_from_catalog(catalog: &Catalog, id: u32, name: &str) -> SpawnProto
         is_infantry: p.is_infantry,
         is_harvester: p.is_harvester,
         is_civ_evac: is_civ_vip(name),
+        passengers: p.passengers,
     }
 }
 
@@ -1734,6 +1746,7 @@ pub fn build_content(
             cost,
             prereq: prereq_ids(&prereq),
             sight: ustats.sight,
+            passengers: rules.get_int(name, "Passengers").unwrap_or(0).clamp(0, 255) as u8,
         });
     }
 

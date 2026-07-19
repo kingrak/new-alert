@@ -220,6 +220,10 @@ fn apply_op_with_units(core: &mut AppCore, op: MonkeyOp, index: usize) {
             // production/placement commands do not address a unit, and the monkey
             // never enables the sidebar so they cannot be emitted here anyway.
             Command::Deploy { unit, house } => (unit, house),
+            Command::Load {
+                passenger, house, ..
+            } => (passenger, house),
+            Command::Unload { transport, house } => (transport, house),
             Command::StartProduction { .. }
             | Command::PlaceBuilding { .. }
             | Command::CancelProduction { .. }
@@ -318,6 +322,10 @@ fn apply_op_with_armed_units(core: &mut AppCore, op: MonkeyOp, index: usize) {
             Command::Stop { unit, house } => (unit, house),
             Command::Attack { unit, house, .. } => (unit, house),
             Command::Deploy { unit, house } => (unit, house),
+            Command::Load {
+                passenger, house, ..
+            } => (passenger, house),
+            Command::Unload { transport, house } => (transport, house),
             Command::StartProduction { .. }
             | Command::PlaceBuilding { .. }
             | Command::CancelProduction { .. }
@@ -493,7 +501,16 @@ fn apply_op_with_econ(core: &mut AppCore, op: MonkeyOp, index: usize) {
             Command::Move { unit, house, .. }
             | Command::Stop { unit, house }
             | Command::Attack { unit, house, .. }
-            | Command::Deploy { unit, house } => {
+            | Command::Deploy { unit, house }
+            | Command::Load {
+                passenger: unit,
+                house,
+                ..
+            }
+            | Command::Unload {
+                transport: unit,
+                house,
+            } => {
                 assert_eq!(
                     house, 1,
                     "drained {cmd:?} was not issued for the controlled house"
@@ -737,7 +754,16 @@ fn apply_sidebar_monkey_op(
             Command::Move { unit, house, .. }
             | Command::Stop { unit, house }
             | Command::Attack { unit, house, .. }
-            | Command::Deploy { unit, house } => {
+            | Command::Deploy { unit, house }
+            | Command::Load {
+                passenger: unit,
+                house,
+                ..
+            }
+            | Command::Unload {
+                transport: unit,
+                house,
+            } => {
                 assert_eq!(
                     house, 1,
                     "drained {cmd:?} was not issued for the controlled house"
@@ -862,6 +888,7 @@ fn zero_and_overflow_columns_core(seed: u32) -> (AppCore, Vec<ra_sim::BuildItem>
         cost: 10,
         prereq: vec![],
         sight: 2,
+        passengers: 0,
     };
     let n_units = 12;
     let units: Vec<UnitProto> = (0..n_units).map(uproto).collect();
@@ -957,6 +984,7 @@ fn small_non_overflow_columns_core(seed: u32) -> (AppCore, Vec<ra_sim::BuildItem
         cost: 10,
         prereq: vec![],
         sight: 2,
+        passengers: 0,
     };
     let units: Vec<UnitProto> = (0..2).map(uproto).collect();
 

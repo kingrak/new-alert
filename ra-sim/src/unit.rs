@@ -24,6 +24,69 @@ pub enum UnitKind {
     Infantry,
 }
 
+/// A unit's standing mission — the INI `[UNITS]`/`[INFANTRY]` order (Guard, Area
+/// Guard, Hunt, Sleep, Sticky, Harvest…) or the default a produced/skirmish unit
+/// spawns with. Drives *autonomous* target acquisition and the guard "leash" in
+/// [`crate::world`]. Ported from the `MissionType` handlers (`foot.cpp`
+/// `Mission_Guard`/`Mission_Guard_Area`/`Mission_Hunt`, `mission.cpp`
+/// `Mission_Sleep`). Player Move/Attack orders do **not** change this field (they
+/// set a target directly and clear `guard_target`); when the order finishes the
+/// unit reverts to acquiring under its standing mission, exactly like the
+/// original's `Enter_Idle_Mode` (`unit.cpp:1343`, default `MISSION_GUARD`).
+///
+/// [`Mission::Guard`] is the default; it is hashed **only when non-default**, so a
+/// vehicle-only skirmish world whose units are all default-guard appends no bytes
+/// for this field (see [`Unit::hash_into`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum Mission {
+    /// `MISSION_GUARD` (`foot.cpp:594`): sit at post and acquire any enemy that
+    /// enters weapon range (`Target_Something_Nearby(THREAT_RANGE)`), then engage.
+    /// **Leash:** the acquired target is dropped the instant it leaves weapon range
+    /// (`In_Range` → `Assign_Target(TARGET_NONE)`) — plain Guard never chases. The
+    /// spawn default (`Enter_Idle_Mode`, `unit.cpp:1343`).
+    #[default]
+    Guard,
+    /// `MISSION_GUARD_AREA` (`foot.cpp:1001`): acquire within *twice* weapon range
+    /// of the guard post (`THREAT_AREA`), chase the target, but race back to the
+    /// post the moment it strays more than weapon range from it
+    /// (`Distance(ArchiveTarget) > Threat_Range(1)/2`).
+    AreaGuard,
+    /// `MISSION_HUNT` (`foot.cpp:670`): seek the nearest enemy anywhere and attack
+    /// (mirrors the separate [`Unit::hunt`] flag used by teams / `ALL_HUNT`).
+    Hunt,
+    /// `MISSION_SLEEP` (`mission.cpp:93`): fully inert — never auto-acquires and,
+    /// per the handler never touching TarCom, never retaliates.
+    Sleep,
+    /// `MISSION_STICKY`: holds position; like Sleep, never auto-acquires/retaliates.
+    Sticky,
+    /// `MISSION_HARVEST`: behaviour owned by the harvest FSM ([`Unit::is_harvester`]).
+    Harvest,
+}
+
+impl Mission {
+    /// Map a scenario INI mission string (`[UNITS]`/`[INFANTRY]` final field, e.g.
+    /// `"Guard"`, `"Area Guard"`, `"Sleep"`) to a [`Mission`]. Names follow the
+    /// original's `Missions[]` table (`const.cpp:71`); an unknown or empty order
+    /// falls back to Guard (the engine's own idle default).
+    pub fn from_ini_name(name: &str) -> Mission {
+        match name.trim().to_ascii_lowercase().as_str() {
+            "area guard" | "areaguard" => Mission::AreaGuard,
+            "hunt" => Mission::Hunt,
+            "sleep" | "harmless" => Mission::Sleep,
+            "sticky" | "ambush" => Mission::Sticky,
+            "harvest" => Mission::Harvest,
+            // "guard", "return", "none", "" and anything unrecognised → Guard.
+            _ => Mission::Guard,
+        }
+    }
+
+    /// Whether this mission autonomously scans for and engages enemies at its post
+    /// (Guard / Area Guard). Hunt uses the separate [`Unit::hunt`] path.
+    pub fn is_guarding(self) -> bool {
+        matches!(self, Mission::Guard | Mission::AreaGuard)
+    }
+}
+
 /// The 5-state harvester mission FSM, ported from `UnitClass::Mission_Harvest`
 /// (`unit.cpp:2898`): scan for ore, drive to it, harvest until full, find a
 /// refinery, dock, and unload. `Idle` is the guard state the original drops into
@@ -198,6 +261,87 @@ pub struct Unit {
     /// enemy and attacks it (`MISSION_HUNT`). Set by `TACTION_ALL_HUNT` and by
     /// campaign attack-teams (M7.5). Hashed only when `true`.
     pub hunt: bool,
+
+    // --- Per-unit mission layer (M7.5-B) ---
+    /// This unit's standing mission (Guard/Area Guard/Hunt/Sleep/Sticky/Harvest).
+    /// Drives autonomous acquisition + the guard leash in [`crate::world`]. Set
+    /// from the scenario INI order for placed units, and left at the spawn default
+    /// [`Mission::Guard`] for produced/skirmish units (matching the original's
+    /// `Enter_Idle_Mode`, `unit.cpp:1343`). Hashed **only when non-default**, so a
+    /// default-guard skirmish world appends no bytes for it.
+    pub mission: Mission,
+    /// The guard post (`ArchiveTarget`, `foot.cpp:1023`) an Area-Guard unit returns
+    /// to when it strays too far while chasing. Set to the spawn cell for
+    /// Area-Guard units. Hashed only when `Some`.
+    pub guard_post: Option<CellCoord>,
+    /// Whether the current [`Self::target`] was **auto-acquired** by a guard
+    /// mission (vs. a player Move/Attack order or retaliation). Only auto-acquired
+    /// guard targets are leashed (dropped when out of range / when the unit strays
+    /// from its post); a player order always chases. Hashed only when `true`.
+    pub guard_target: bool,
+
+    // --- Transport / passengers (M7.5-B P1) ---
+    /// Passenger capacity (`Passengers=` from rules.ini, `udata.cpp`). 0 for a
+    /// non-transport. Constant per unit type (like `sight`/`locomotor`), so — its
+    /// effect flowing through the hashed `passengers` list — it is **not** hashed.
+    pub capacity: u8,
+    /// Loaded passengers (`FootClass::Passenger`/cargo hold). A passenger is
+    /// removed from the map when it boards and stored here; it re-enters the arena
+    /// on unload, and **dies with the transport** (`DriveClass`/`foot` cargo kill).
+    /// Hashed only when non-empty, so a world with no loaded transport is
+    /// byte-identical.
+    pub cargo: Vec<Passenger>,
+    /// The transport this (infantry) unit is currently trying to board — set by a
+    /// `Load` order; it walks adjacent and boards when it arrives (`MISSION_ENTER`
+    /// radio approach, simplified). Cleared once aboard or if the transport is
+    /// gone/full. Hashed only when `Some`.
+    pub board_target: Option<Handle>,
+    /// A cell this transport should auto-unload its cargo at on arrival — set by a
+    /// scripted team `UNLOAD` mission so a campaign assault disgorges at the
+    /// objective. Cleared once it unloads. Hashed only when `Some`.
+    pub unload_at: Option<CellCoord>,
+}
+
+/// A boarded passenger — the minimal state needed to re-materialise a unit on
+/// unload (`InfantryClass`/`FootClass` limbo state). Stored on the transport's
+/// [`Unit::cargo`]; the passenger is out of the map arena while aboard.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Passenger {
+    /// Sprite/type index (`Unit::type_id`).
+    pub type_id: u32,
+    /// Owning house.
+    pub house: u8,
+    /// Current health (preserved across the ride).
+    pub health: u16,
+    /// Max strength.
+    pub max_health: u16,
+    /// Movement stats (to re-spawn a drivable unit).
+    pub stats: MoveStats,
+    /// Armor class.
+    pub armor: u8,
+    /// Primary weapon.
+    pub weapon: Option<WeaponProfile>,
+    /// Secondary weapon.
+    pub secondary: Option<WeaponProfile>,
+    /// Turret.
+    pub has_turret: bool,
+    /// Sight in cells.
+    pub sight: u8,
+    /// Infantry (sub-cell) vs vehicle.
+    pub is_infantry: bool,
+    /// The mission the passenger resumes on unload.
+    pub mission: Mission,
+}
+
+impl Passenger {
+    fn hash_into(&self, h: &mut Fnv1a) {
+        h.write_u32(self.type_id);
+        h.write_u8(self.house);
+        h.write_u16(self.health);
+        h.write_u16(self.max_health);
+        h.write_u8(self.is_infantry as u8);
+        h.write_u8(self.mission as u8);
+    }
 }
 
 impl Unit {
@@ -236,6 +380,13 @@ impl Unit {
             trigger: None,
             is_civ_evac: false,
             hunt: false,
+            mission: Mission::Guard,
+            guard_post: None,
+            guard_target: false,
+            capacity: 0,
+            cargo: Vec::new(),
+            board_target: None,
+            unload_at: None,
         }
     }
 
@@ -409,6 +560,42 @@ impl Unit {
         }
         if self.hunt {
             h.write_u8(0x2C);
+        }
+
+        // Per-unit mission layer (M7.5-B). Each field is folded ONLY when it
+        // departs from the inert spawn default (mission Guard / no post / not a
+        // guard target / empty cargo), appending no bytes otherwise — so every
+        // default-guard vehicle-only world (all prior skirmish/synthetic goldens)
+        // hashes byte-identically. `capacity` is a type constant (like `sight`),
+        // captured through the `cargo` list, so it is not hashed.
+        if self.mission != Mission::Guard {
+            h.write_u8(0x2D);
+            h.write_u8(self.mission as u8);
+        }
+        if let Some(p) = self.guard_post {
+            h.write_u8(0x2E);
+            h.write_i32(p.x);
+            h.write_i32(p.y);
+        }
+        if self.guard_target {
+            h.write_u8(0x2F);
+        }
+        if !self.cargo.is_empty() {
+            h.write_u8(0x30);
+            h.write_u32(self.cargo.len() as u32);
+            for p in &self.cargo {
+                p.hash_into(h);
+            }
+        }
+        if let Some(t) = self.board_target {
+            h.write_u8(0x31);
+            h.write_u32(t.index);
+            h.write_u32(t.gen);
+        }
+        if let Some(c) = self.unload_at {
+            h.write_u8(0x32);
+            h.write_i32(c.x);
+            h.write_i32(c.y);
         }
     }
 }
