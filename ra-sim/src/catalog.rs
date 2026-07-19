@@ -99,6 +99,20 @@ pub struct BuildingProto {
     pub sight: u8,
     /// Client sprite index for this building (opaque to the sim).
     pub sprite_id: u32,
+    /// Defensive weapon (`Primary=`), if this is a combat building (PBOX/GUN/
+    /// TSLA/…). `None` for ordinary structures. (M7.7 Chunk B)
+    pub weapon: Option<WeaponProfile>,
+    /// Whether the building aims an independently-rotating turret (GUN) vs. a
+    /// fixed emplacement that fires along a static facing (PBOX/TSLA/FTUR).
+    pub has_turret: bool,
+    /// Whether the weapon "charges up" before firing (`Charges=yes` — the tesla
+    /// coil): a fixed delay, then an instant bolt.
+    pub charges: bool,
+    /// Whether this "building" is a **wall** segment (SBAG/CYCL/BRIK): a 1×1
+    /// buildable that blocks movement and is attackable, but does not count as a
+    /// base structure (win/lose, AI base). Modeled as a 1×1 building rather than a
+    /// separate overlay layer — see QUIRKS Q9.
+    pub is_wall: bool,
 }
 
 /// A buildable unit type (vehicle) with the runtime stats it spawns with.

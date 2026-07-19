@@ -277,9 +277,13 @@ impl World {
     /// one live unit. Elimination is "all buildings AND all units destroyed"
     /// (the classic MP defeat check, `house.cpp:1290`).
     pub fn house_alive(&self, house: u8) -> bool {
+        // Walls (SBAG/CYCL/BRIK) are modeled as 1×1 buildings but are *not* base
+        // structures — a house whose only remaining "buildings" are walls is
+        // defeated, matching the original where walls are overlays, not buildings
+        // (QUIRKS Q9).
         self.buildings
             .iter()
-            .any(|(_, b)| b.house == house && b.is_alive())
+            .any(|(_, b)| b.house == house && b.is_alive() && !b.is_wall)
             || self.units.iter().any(|(_, u)| u.house == house)
     }
 
@@ -423,6 +427,14 @@ impl World {
             is_construction_yard: proto.is_construction_yard,
             is_war_factory: proto.is_war_factory,
             is_barracks: proto.is_barracks,
+            weapon: proto.weapon,
+            has_turret: proto.has_turret,
+            charges: proto.charges,
+            turret_facing: Facing(0),
+            arm: 0,
+            charge: 0,
+            target: None,
+            is_wall: proto.is_wall,
         };
         let handle = self.buildings.insert(building);
         // Stamp occupancy.
@@ -567,6 +579,11 @@ pub fn apply(world: &mut World, tick: u32, commands: &[Command]) {
 
     // System 4: combat (targeting + rotation + firing).
     run_combat(world);
+
+    // System 4.5: defense-building combat (auto-acquire + turret + fire), after
+    // unit combat so RNG (bullet scatter) is drawn in a fixed unit-then-building
+    // order.
+    run_building_combat(world);
 
     // System 5: movement.
     move_units(world);
@@ -1433,12 +1450,215 @@ fn run_combat(world: &mut World) {
             .unwrap_or(true);
 
         if arm_ready && aligned {
-            fire(world, handle, coord, aim, target, target_coord, &weapon);
+            let shooter_house = world.units.get(handle).map(|u| u.house).unwrap_or(0);
+            fire(
+                world,
+                handle,
+                shooter_house,
+                coord,
+                aim,
+                target,
+                target_coord,
+                &weapon,
+            );
             if let Some(u) = world.units.get_mut(handle) {
                 u.arm = weapon.rof;
             }
         }
     }
+}
+
+/// Tesla-coil charge-up time in ticks — the coil charges when it has a target,
+/// then looses an instant bolt (`Charging_AI`, `building.cpp:45`: 9 stages of the
+/// charge animation, `Fetch_Stage() >= 9`). Approximated at ~1s.
+const TESLA_CHARGE_TICKS: u16 = 15;
+
+/// Building turret rotation rate (`GUN` `ROT=12`). Emplaced defenses without a
+/// turret fire in any direction (no alignment gate).
+const BUILDING_TURRET_ROT: u8 = 12;
+
+/// A handle that matches no live unit — the "shooter" of a building's shot (a
+/// building is not a unit, so its bullet's `source_unit` is this sentinel; the
+/// blast-exclusion and retaliation-naming lookups simply never resolve it).
+const BUILDING_SHOOTER: Handle = Handle {
+    index: u32::MAX,
+    gen: u32::MAX,
+};
+
+/// System 4.5: **defense buildings** (PBOX/HBOX/GUN/FTUR/TSLA) — a building
+/// analogue of [`run_combat`]. Each armed, alive building (slot order) decrements
+/// its rearm timer, keeps or auto-acquires the nearest in-range enemy unit
+/// (`BuildingClass::Mission_Guard` → `Greatest_Threat`/`Target_Something_Nearby`,
+/// `building.cpp:3568`, `techno.cpp:5912` — simplified to nearest enemy *unit*),
+/// rotates its turret (GUN only), and fires through the shared bullet path. Tesla
+/// coils charge up first and require power (`Charging_AI`).
+fn run_building_combat(world: &mut World) {
+    for handle in world.buildings.handles() {
+        let (weapon, has_turret, charges, house, center) = match world.buildings.get(handle) {
+            Some(b) if b.is_alive() => match b.weapon {
+                Some(w) => (
+                    w,
+                    b.has_turret,
+                    b.charges,
+                    b.house,
+                    b.center_cell().center(),
+                ),
+                None => continue,
+            },
+            _ => continue,
+        };
+        // Decrement rearm.
+        if let Some(b) = world.buildings.get_mut(handle) {
+            if b.arm > 0 {
+                b.arm -= 1;
+            }
+        }
+
+        // Keep a still-valid target, else auto-acquire the nearest enemy unit.
+        let cur = world.buildings.get(handle).and_then(|b| b.target);
+        let target = validate_building_target(world, cur, house, center, weapon.range)
+            .or_else(|| acquire_nearest_enemy(world, house, center, weapon.range));
+        if let Some(b) = world.buildings.get_mut(handle) {
+            b.target = target;
+        }
+        let Some(target) = target else {
+            if let Some(b) = world.buildings.get_mut(handle) {
+                b.charge = 0; // no target — abandon any charge
+            }
+            continue;
+        };
+        let Some(target_coord) = building_target_position(world, target) else {
+            continue;
+        };
+
+        // Aim: a turret (GUN) rotates and must align; a fixed emplacement fires
+        // in any direction.
+        let desired = Facing::toward(center, target_coord);
+        if has_turret {
+            if let (Some(d), Some(b)) = (desired, world.buildings.get_mut(handle)) {
+                b.turret_facing = b.turret_facing.rotate_toward(d, BUILDING_TURRET_ROT);
+            }
+        }
+        let aim = world
+            .buildings
+            .get(handle)
+            .map(|b| b.turret_facing)
+            .unwrap_or(Facing(0));
+        let aligned = if has_turret {
+            desired
+                .map(|d| aligned_to_fire(aim, d, weapon.proj_rot))
+                .unwrap_or(true)
+        } else {
+            true
+        };
+        let in_range = leptons_distance(center, target_coord) <= weapon.range;
+        let arm_ready = world
+            .buildings
+            .get(handle)
+            .map(|b| b.arm == 0)
+            .unwrap_or(false);
+        if !(in_range && aligned && arm_ready) {
+            if let Some(b) = world.buildings.get_mut(handle) {
+                b.charge = 0;
+            }
+            continue;
+        }
+
+        // Tesla coils charge up (requiring power) before the bolt (`Charging_AI`,
+        // `House->Power_Fraction() >= 1`). Other defenses fire immediately.
+        if charges {
+            let powered = world.house(house).map(|h| !h.low_power()).unwrap_or(true);
+            if !powered {
+                if let Some(b) = world.buildings.get_mut(handle) {
+                    b.charge = 0;
+                }
+                continue;
+            }
+            let c = world.buildings.get(handle).map(|b| b.charge).unwrap_or(0);
+            if c + 1 < TESLA_CHARGE_TICKS {
+                if let Some(b) = world.buildings.get_mut(handle) {
+                    b.charge = c + 1;
+                }
+                continue; // still charging
+            }
+            if let Some(b) = world.buildings.get_mut(handle) {
+                b.charge = 0;
+            }
+        }
+
+        fire(
+            world,
+            BUILDING_SHOOTER,
+            house,
+            center,
+            aim,
+            target,
+            target_coord,
+            &weapon,
+        );
+        if let Some(b) = world.buildings.get_mut(handle) {
+            b.arm = weapon.rof;
+        }
+    }
+}
+
+/// The world position of a defense building's current target (unit centre /
+/// building centre / force-fire cell).
+fn building_target_position(world: &World, target: Target) -> Option<WorldCoord> {
+    match target {
+        Target::Unit(t) => world.units.get(t).filter(|u| u.is_alive()).map(|u| u.coord),
+        Target::Building(t) => world
+            .buildings
+            .get(t)
+            .filter(|b| b.is_alive())
+            .map(|b| b.center_cell().center()),
+        Target::Cell(c) => Some(c.center()),
+    }
+}
+
+/// Keep the building's current target only if it is still a live **enemy** unit
+/// within `range` leptons of `center`; otherwise `None` (forcing a re-acquire).
+fn validate_building_target(
+    world: &World,
+    cur: Option<Target>,
+    house: u8,
+    center: WorldCoord,
+    range: i32,
+) -> Option<Target> {
+    match cur {
+        Some(Target::Unit(t)) => {
+            let u = world.units.get(t)?;
+            if u.is_alive() && u.house != house && leptons_distance(center, u.coord) <= range {
+                Some(Target::Unit(t))
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+/// The nearest live enemy **unit** within `range` leptons of `center`, in slot
+/// order (ties broken by the earlier handle) — the defense's auto-acquire scan
+/// (`Greatest_Threat`, simplified to nearest by distance). Buildings and the
+/// force-fire cell are not auto-targeted.
+fn acquire_nearest_enemy(
+    world: &World,
+    house: u8,
+    center: WorldCoord,
+    range: i32,
+) -> Option<Target> {
+    let mut best: Option<(i32, Handle)> = None;
+    for (h, u) in world.units.iter() {
+        if u.house == house || !u.is_alive() {
+            continue;
+        }
+        let d = leptons_distance(center, u.coord);
+        if d <= range && best.map(|(bd, _)| d < bd).unwrap_or(true) {
+            best = Some((d, h));
+        }
+    }
+    best.map(|(_, h)| Target::Unit(h))
 }
 
 /// The passable cell in a building's one-cell footprint ring that is nearest to
@@ -1479,14 +1699,13 @@ fn nearest_adjacent_passable(
 fn fire(
     world: &mut World,
     shooter: Handle,
+    source_house: u8,
     muzzle: WorldCoord,
     aim: Facing,
     target: Target,
     target_coord: WorldCoord,
     weapon: &crate::combat::WeaponProfile,
 ) {
-    let source_house = world.units.get(shooter).map(|u| u.house).unwrap_or(0);
-
     // Direction the projectile is launched (toward the target; non-homing
     // bullets fire straight at it — `bullet.cpp:751`).
     let dir = Facing::toward(muzzle, target_coord).unwrap_or(aim);
@@ -2683,6 +2902,57 @@ mod tests {
         }
     }
 
+    /// M7.7 Chunk B smoke: a defense building auto-acquires the nearest enemy
+    /// unit in range and damages it through the shared bullet path — no player
+    /// order needed (`BuildingClass::Mission_Guard`).
+    #[test]
+    fn defense_building_auto_acquires_and_fires_on_an_enemy_in_range() {
+        use crate::catalog::{BuildingProto, Catalog, EconRules};
+        let mut world = World::new(Passability::all_passable(), 0xDEF0_0001);
+        let pbox = BuildingProto {
+            name: "PBOX".into(),
+            foot_w: 1,
+            foot_h: 1,
+            max_health: 400,
+            armor: 1,
+            power: -15,
+            cost: 400,
+            prereq: vec![],
+            is_refinery: false,
+            is_construction_yard: false,
+            is_war_factory: false,
+            is_barracks: false,
+            free_harvester_unit: None,
+            sight: 5,
+            sprite_id: 0,
+            weapon: Some(m60mg()), // instant hitscan, range 1024 leptons (4 cells)
+            has_turret: false,
+            charges: false,
+            is_wall: false,
+        };
+        world.set_catalog(Catalog {
+            buildings: vec![pbox],
+            units: vec![],
+            econ: EconRules::default(),
+        });
+        world.init_houses(3, 0);
+        world.spawn_building(0, 1, CellCoord::new(20, 20)).unwrap();
+        // Enemy (house 2), unarmored, 2 cells away — inside the pillbox's range.
+        let enemy = world.spawn_unit(0, 2, CellCoord::new(22, 20), Facing(0), 50, stats());
+        world.set_unit_combat(enemy, 0, None, false); // armor none → full SA damage
+        let hp0 = world.units.get(enemy).unwrap().health;
+        for _ in 0..40 {
+            world.tick(&[]);
+        }
+        // The pillbox should have acquired and hurt (or killed) the enemy.
+        let hurt = world
+            .units
+            .get(enemy)
+            .map(|u| u.health < hp0)
+            .unwrap_or(true); // removed = dead = definitely hurt
+        assert!(hurt, "the pillbox should auto-acquire and damage the enemy");
+    }
+
     /// The mammoth-tank weapon pick (`What_Weapon_Should_I_Use`): the AP cannon
     /// against armored targets, the HE missiles against unarmored ones — chosen
     /// purely from the `Verses` table, no per-unit special-casing.
@@ -3122,6 +3392,10 @@ mod m5_tests {
             free_harvester_unit: if refin { Some(U_HARV) } else { None },
             sight: 4,
             sprite_id: 0,
+            weapon: None,
+            has_turret: false,
+            charges: false,
+            is_wall: false,
         };
         let uproto =
             |name: &str, harv: bool, deploys: Option<u32>, cost: i32, prereq: Vec<u32>| UnitProto {

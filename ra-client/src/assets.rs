@@ -12,7 +12,7 @@ use std::error::Error;
 use std::path::Path;
 
 use ra_data::buildings::building_stats;
-use ra_data::combat::{resolve_unit_combat, WeaponDef};
+use ra_data::combat::{resolve_unit_combat, resolve_weapon, WeaponDef};
 use ra_data::house::{
     build_house_remaps, house_from_name, identity_remap, RemapTable, HOUSE_COUNT,
 };
@@ -573,6 +573,15 @@ const B_POWR: u32 = 1;
 const B_PROC: u32 = 2;
 const B_WEAP: u32 = 3;
 const B_TENT: u32 = 4;
+// M7.7 Chunk B defenses + walls (ids appended).
+const B_PBOX: u32 = 5;
+const B_HBOX: u32 = 6;
+const B_GUN: u32 = 7;
+const B_FTUR: u32 = 8;
+const B_TSLA: u32 = 9;
+const B_SBAG: u32 = 10;
+const B_CYCL: u32 = 11;
+const B_BRIK: u32 = 12;
 /// Fixed unit-proto ids.
 const U_MCV: u32 = 0;
 const U_HARV: u32 = 1;
@@ -760,21 +769,45 @@ pub fn build_content(
     lores: Option<&MixArchive>,
 ) -> Result<GameContent, Box<dyn Error>> {
     // --- Buildings (ids fixed by declaration order) ---
-    // (name, is_construction_yard, is_refinery, is_war_factory, is_barracks)
+    // (name, is_construction_yard, is_refinery, is_war_factory, is_barracks). New
+    // in M7.7 Chunk B: the defenses (PBOX/HBOX/GUN/FTUR/TSLA) and the walls
+    // (SBAG/CYCL/BRIK), appended so the existing FACT..TENT ids stay stable.
     let bspecs = [
         ("FACT", true, false, false, false),
         ("POWR", false, false, false, false),
         ("PROC", false, true, false, false),
         ("WEAP", false, false, true, false),
         ("TENT", false, false, false, true), // Allied barracks (infantry factory)
+        ("PBOX", false, false, false, false),
+        ("HBOX", false, false, false, false),
+        ("GUN", false, false, false, false),
+        ("FTUR", false, false, false, false),
+        ("TSLA", false, false, false, false),
+        ("SBAG", false, false, false, false),
+        ("CYCL", false, false, false, false),
+        ("BRIK", false, false, false, false),
     ];
+    // Per-name defense/wall attributes: GUN has a rotating turret; TSLA charges;
+    // SBAG/CYCL/BRIK are walls (1×1 buildable segments — QUIRKS Q9).
+    let defense_attrs = |name: &str| -> (bool, bool, bool) {
+        match name {
+            "GUN" => (true, false, false),                    // has_turret
+            "TSLA" => (false, true, false),                   // charges
+            "SBAG" | "CYCL" | "BRIK" => (false, false, true), // is_wall
+            _ => (false, false, false),
+        }
+    };
     let mut buildings = Vec::new();
     let mut building_sprites = Vec::new();
     let mut building_overlays = Vec::new();
     for (id, (name, is_cy, is_ref, is_wf, is_barr)) in bspecs.iter().enumerate() {
         let stats = building_stats(rules, name)
             .ok_or_else(|| format!("no building stats/footprint for {name}"))?;
-        building_sprites.push(load_unit_sprite(conquer, name)?);
+        // Building art: walls and some defenses may be absent in a given theater —
+        // degrade to a frameless sprite rather than failing the whole load.
+        building_sprites.push(
+            load_unit_sprite(conquer, name).unwrap_or_else(|_| UnitSprite { frames: Vec::new() }),
+        );
         // The war factory is two shapes in the original: WEAP (base) plus the
         // WEAP2 roof/door overlay drawn on top (building.cpp:513, bdata.cpp:3052).
         // Missing overlay art degrades gracefully to the base shape alone.
@@ -799,6 +832,16 @@ pub fn build_content(
             free_harvester_unit: if *is_ref { Some(U_HARV) } else { None },
             sight: stats.sight,
             sprite_id: id as u32,
+            // Defense weapon resolved from `Primary=` (buildings share the unit
+            // combat resolver — they have Primary=/Armor= sections too).
+            weapon: rules
+                .get(name, "Primary")
+                .and_then(|w| resolve_weapon(rules, w))
+                .as_ref()
+                .map(weapon_to_profile),
+            has_turret: defense_attrs(name).0,
+            charges: defense_attrs(name).1,
+            is_wall: defense_attrs(name).2,
         });
     }
 
@@ -900,6 +943,16 @@ pub fn build_content(
         BuildItem::Building(B_PROC),
         BuildItem::Building(B_WEAP),
         BuildItem::Building(B_TENT),
+        // Defenses (M7.7 Chunk B) — structures column.
+        BuildItem::Building(B_PBOX),
+        BuildItem::Building(B_HBOX),
+        BuildItem::Building(B_GUN),
+        BuildItem::Building(B_FTUR),
+        BuildItem::Building(B_TSLA),
+        // Walls.
+        BuildItem::Building(B_SBAG),
+        BuildItem::Building(B_CYCL),
+        BuildItem::Building(B_BRIK),
         BuildItem::Unit(U_1TNK),
         BuildItem::Unit(U_2TNK),
         BuildItem::Unit(U_3TNK),

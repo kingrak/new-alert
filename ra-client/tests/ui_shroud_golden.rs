@@ -315,12 +315,18 @@ fn real_skirmish_compose_game_map_sweep_with_shroud_no_panic() {
     // untouched, so map-sweep positions 1 and 3 still hash *identically* to each
     // other, confirming only the sidebar strip moved. Coordinator-authorised;
     // re-derived deterministically (read back once).
+    //
+    // **Re-pinned for M7.7 Chunk B** (defenses + walls): the structures column now
+    // lists PBOX/HBOX/GUN/FTUR/TSLA + SBAG/CYCL/BRIK, enough to overflow and show
+    // its own scroll arrows. Still sidebar **rendering** only — the sim is
+    // untouched, so map-sweep positions 1 and 3 remain identical to each other.
+    // Coordinator-authorised; re-derived deterministically (read back once).
     let golden: [u64; 5] = [
-        0x3b12_32c7_c132_360e,
-        0x153a_2655_33f1_b912,
-        0x1fe2_a65b_2e40_7c0a,
-        0x153a_2655_33f1_b912,
-        0x7bba_075a_3e92_e37e,
+        0x61c6_cbf1_e320_6666,
+        0xa484_51ec_76af_f50a,
+        0x6d60_2888_29e5_00e2,
+        0xa484_51ec_76af_f50a,
+        0x9f43_5bd3_ed15_8d56,
     ];
     let got: Vec<u64> = frames.iter().map(|p| support::fnv1a(p)).collect();
     assert_eq!(

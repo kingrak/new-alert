@@ -460,6 +460,10 @@ fn splash_building_catalog() -> ra_sim::Catalog {
         free_harvester_unit: None,
         sight: 1,
         sprite_id: 0,
+        weapon: None,
+        has_turret: false,
+        charges: false,
+        is_wall: false,
     };
     ra_sim::Catalog {
         buildings: vec![proto(3, 3), proto(1, 1)],

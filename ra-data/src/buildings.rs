@@ -58,6 +58,14 @@ pub fn footprint(name: &str) -> Option<(u8, u8)> {
         "SILO" => (1, 1),          // ore silo,            BSIZE_11
         "BARR" | "TENT" => (2, 2), // barracks,   BSIZE_22
         "DOME" => (2, 2),          // radar dome,          BSIZE_22
+        // --- Defenses (M7.7 Chunk B) ---
+        "PBOX" => (1, 1), // pillbox,             BSIZE_11 (bdata.cpp)
+        "HBOX" => (1, 1), // camo pillbox,        BSIZE_11
+        "GUN" => (1, 1),  // gun turret,          BSIZE_11
+        "FTUR" => (1, 1), // flame turret,        BSIZE_11
+        "TSLA" => (1, 2), // tesla coil,          BSIZE_12
+        // --- Walls (M7.7 Chunk B) — 1×1 buildable segments ---
+        "SBAG" | "CYCL" | "BRIK" => (1, 1),
         _ => return None,
     };
     Some((w, h))

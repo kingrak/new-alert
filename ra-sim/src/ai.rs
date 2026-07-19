@@ -251,6 +251,32 @@ impl AiPlayer {
                 }
             }
         }
+        // 3c) Base defense (`AI_Building` base-defense urgency, `house.cpp:5696`).
+        // Once a war factory is up, keep a handful of combat defenses scaled to the
+        // base size. Simplified to a deterministic priority tier — no new sim-RNG
+        // draw in building selection (the whole `next_structure` is deterministic
+        // priority, not the original's weighted-random). We prefer the *strongest*
+        // buildable defense (reverse catalog order → TSLA/GUN before PBOX) so a
+        // teched-up base fields tesla coils, not just pillboxes.
+        if has_factory {
+            let refineries = refinery_id.map(|r| self.count_owned(world, r)).unwrap_or(0);
+            let mut owned_def = 0i32;
+            let mut pick: Option<u32> = None;
+            for (id, p) in cat.buildings.iter().enumerate().rev() {
+                if p.weapon.is_some() && !p.is_wall {
+                    owned_def += self.count_owned(world, id as u32);
+                    if pick.is_none() && self.buildable(world, hs, id as u32) {
+                        pick = Some(id as u32);
+                    }
+                }
+            }
+            // Target a small, base-scaled number of defenses (2 + one per refinery).
+            if owned_def < 2 + refineries {
+                if let Some(d) = pick {
+                    return Some(d);
+                }
+            }
+        }
         // 4) Keep expanding: a second refinery, then a spare power plant.
         if let Some(r) = refinery_id {
             if self.count_owned(world, r) < 2 && self.buildable(world, hs, r) {

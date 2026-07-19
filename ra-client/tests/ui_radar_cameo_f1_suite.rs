@@ -252,6 +252,10 @@ fn radar_victory_fixture(seed: u32) -> AppCore {
             free_harvester_unit: None,
             sight: 2,
             sprite_id: 0,
+            weapon: None,
+            has_turret: false,
+            charges: false,
+            is_wall: false,
         }],
         units: vec![],
         econ: EconRules::default(),
@@ -370,6 +374,10 @@ fn cameo_row_core(seed: u32) -> AppCore {
         free_harvester_unit: None,
         sight: 4,
         sprite_id: 0,
+        weapon: None,
+        has_turret: false,
+        charges: false,
+        is_wall: false,
     };
     let uproto = |name: &str| UnitProto {
         is_infantry: false,
@@ -854,6 +862,10 @@ fn two_strip_core(seed: u32, n_units: usize) -> AppCore {
         free_harvester_unit: None,
         sight: 4,
         sprite_id: 0,
+        weapon: None,
+        has_turret: false,
+        charges: false,
+        is_wall: false,
     };
     let uproto = |name: String| UnitProto {
         is_infantry: false,

@@ -68,6 +68,10 @@ fn catalog() -> Catalog {
                 free_harvester_unit: None,
                 sight: 4,
                 sprite_id: 0,
+                weapon: None,
+                has_turret: false,
+                charges: false,
+                is_wall: false,
             }
         };
     Catalog {

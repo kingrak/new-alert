@@ -273,6 +273,10 @@ fn proto(name: &str, foot_w: u8, foot_h: u8, sight: u8) -> BuildingProto {
         free_harvester_unit: None,
         sight,
         sprite_id: 0,
+        weapon: None,
+        has_turret: false,
+        charges: false,
+        is_wall: false,
     }
 }
 

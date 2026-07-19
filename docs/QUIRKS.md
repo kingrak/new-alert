@@ -227,10 +227,13 @@ genuinely different rules. Tanks are `Track`, jeep/APC/harvester `Wheel`, infant
    (`cost == 0`). The `<100%` costs (Beach/Rough slowing vehicles, etc.) are
    collapsed to "passable"; every unit moves at full MPH on any drivable cell.
    The must-have (movement correctness — no driving over mountains/cliffs) is met.
-2. **Wall overlays** (`SBAG`/`BRIK`/… → `LAND_WALL`, `odata.cpp`) are not yet
-   folded into the masks; only *template* land types are. Ore overlays are
-   correctly passable. Wall-blocking is a small follow-up (the playtest complaint
-   was cliffs/mountains, which are templates).
+2. **Wall overlays** (`SBAG`/`BRIK`/… → `LAND_WALL`, `odata.cpp`) ~~are not yet
+   folded into the masks~~. **Closed in M7.7 Chunk B (see Q9):** walls are placed
+   as 1×1 buildings whose footprint stamps the building-occupancy layer
+   (`Passability::set_occupied`), so they block ground movement exactly like any
+   structure — the mover routes around a wall or holds. This is the observable
+   `LAND_WALL` behaviour (impassable to ground) without a separate overlay
+   land-type row.
 3. **Misparse safety:** a cell whose template has no ColorMap, or an unloaded
    template, or a clear sentinel, resolves to `Clear` (passable) — so a bad parse
    degrades to drivable rather than walling the map off.
@@ -333,3 +336,64 @@ We follow the data: V2RL fires straight, ARTY arcs. Documented rather than force
 **20 if armed, else 1** (`house.cpp:6172`), so the new armed vehicles (3TNK/4TNK/ARTY/V2RL/
 APC) join the weighted-random pool and the unarmed TRUK/MNLY are built rarely. AI-vs-AI
 still reaches decisive outcomes.
+
+---
+
+## Q9 — Defense buildings and walls-as-1×1-buildings
+
+**Milestone:** M7.7 Chunk B (P2 defenses + P3 walls).
+
+**Defenses (PBOX/HBOX/GUN/FTUR/TSLA).** Combat buildings fire through the *same*
+bullet path as units. A new `run_building_combat` system (tick order: after unit
+`run_combat`, before movement) gives each armed, alive building a rearm timer, an
+auto-acquired target, an optional turret, and a charge counter. Auto-acquisition
+is a simplified `BuildingClass::Mission_Guard` → `Greatest_Threat`/
+`Target_Something_Nearby` (`building.cpp:3568`, `techno.cpp:5912`): the nearest live
+enemy **unit** within weapon range (ties broken by slot order). Deviations:
+- **Units only** are auto-targeted (not enemy buildings / force-fire cells) — base
+  defences overwhelmingly shoot attacking units; a defence never auto-sieges a base.
+- **GUN** has a rotating turret (`ROT=12`, `has_turret`): it rotates `turret_facing`
+  toward the target and only fires when aligned (`aligned_to_fire`). The other
+  emplacements (PBOX/HBOX/FTUR) are fixed and fire in any direction.
+- **TSLA charge-up** (`Charges=yes`, `Charging_AI`, `building.cpp:45`): when it has a
+  target, is rearmed, and the house has power, it charges for a fixed
+  `TESLA_CHARGE_TICKS = 15` (≈1 s; the original ramps a 9-stage animation), then
+  looses an instant `Super`-warhead bolt (100 dmg). Losing power/target/range
+  abandons the charge. The client renders a charge glow and a two-segment zap line
+  (the bolt is an invisible hitscan projectile — no persistent bullet).
+- The bullet's `source_unit` is a **sentinel** handle (a building is not a unit), so
+  the blast-exclusion and retaliation-naming lookups simply never resolve it.
+- **AGUN deferred** (no aircraft to shoot).
+
+Defense combat *state* (turret facing, rearm, charge, target) is hashed **only for
+armed buildings**, so every pre-Chunk-B golden (no armed building) is byte-identical.
+
+**Walls (SBAG/CYCL/BRIK) — modeled as 1×1 buildings, not a separate overlay layer.**
+Each wall is a 1×1 `Building` with `is_wall=true` and no weapon. This reuses the whole
+building system for free:
+- **Occupancy / passability (closes Q6 #2):** the footprint stamps
+  `Passability::set_occupied`, so a wall cell is impassable to ground movers — they
+  route around it or hold. Verified: an enemy ordered across a wall line never enters
+  a wall cell.
+- **Attackable:** walls take damage through the normal `Target::Building` →
+  `modify_damage` path (`Armor=none`, `Strength=1`), so any weapon whose warhead
+  harms the none-armor column destroys them.
+- **Placement:** the existing proximity rule lets a wall extend from any owned
+  building — including another wall — so wall lines chain.
+- **Not a base structure:** `house_alive` and the AI's base logic ignore `is_wall`
+  buildings, matching the original where walls are overlays, not buildings (a house
+  whose only survivors are walls is defeated).
+
+**Deviations / deferrals (walls).**
+1. **Single-frame render, no adjacency-connect.** Walls draw as a single sprite/fill
+   per cell; the original's overlay art picks a connected frame from the 4-neighbour
+   wall mask. Deferred (coordinator-sanctioned "single-frame ok, note it").
+2. **Single-cell placement, no linear drag.** Each wall is placed one cell at a time
+   through the normal building placement flow (coordinator-sanctioned "single-cell ok").
+3. **No crushing.** Heavy vehicles do not crush walls (consistent with Q5.3 no-crush).
+
+**AI.** `AI_Building` gains a base-defense tier (`house.cpp:5696`): once a war factory
+is up, the AI keeps `2 + refineries` combat defences, preferring the strongest
+buildable one (reverse catalog order → tesla/gun before pillbox). Simplified to a
+deterministic priority tier (no new sim-RNG draw), consistent with the rest of
+`next_structure`. AI-vs-AI still reaches decisive outcomes.

@@ -66,6 +66,10 @@ const SCROLL_BTN_H: i32 = 14;
 /// Width of a single up/down scroll arrow button.
 const SCROLL_BTN_W: i32 = 16;
 
+/// Tesla-coil charge duration for the render glow ramp — mirrors the sim's
+/// `TESLA_CHARGE_TICKS` (cosmetic only; the sim owns the real timing).
+const TESLA_CHARGE_MAX: i32 = 15;
+
 /// Approximate classic-RA per-house marker colours for the radar, indexed by
 /// house id (Greece gold, USSR red, …); grey for anything out of range.
 const HOUSE_DOT: [[u8; 3]; 8] = [
@@ -1313,6 +1317,84 @@ impl AppCore {
             draw_line(frame, tx, ty, px, py, [255, 240, 160]);
             fill_rect(frame, px - 1, py - 1, px + 1, py + 1, [255, 255, 200]);
         }
+        self.draw_defense_effects(frame, viewport);
+    }
+
+    /// Draw defense-building firing effects (M7.7 Chunk B): the tesla coil's
+    /// charge glow and its instant zap bolt (`TeslaZap` is an invisible hitscan
+    /// weapon, so it never leaves a persistent bullet — it is drawn here at the
+    /// firing tick), plus a muzzle flash for the gun/pillbox emplacements whose
+    /// hitscan shots likewise leave no bullet.
+    fn draw_defense_effects(&self, frame: &mut RgbaImage, viewport: Rect) {
+        for (_h, b) in self.world.buildings.iter() {
+            let Some(w) = &b.weapon else { continue };
+            if !b.is_alive() {
+                continue;
+            }
+            // Coil/emplacement top, in screen pixels.
+            let cx =
+                (b.cell.x * CELL_PIXELS + b.foot_w as i32 * CELL_PIXELS / 2) as i64 - viewport.x;
+            let cy =
+                (b.cell.y * CELL_PIXELS + b.foot_h as i32 * CELL_PIXELS / 2) as i64 - viewport.y;
+            let (cx, cy) = (cx as i32, cy as i32);
+
+            // Tesla charge glow: brightens as the charge builds.
+            if b.charges && b.charge > 0 {
+                let t = (b.charge as i32 * 200 / TESLA_CHARGE_MAX).clamp(40, 220) as u8;
+                fill_rect(frame, cx - 2, cy - 2, cx + 2, cy + 2, [t, t, 255]);
+            }
+
+            // The target's screen position (for the zap line / flash aim).
+            let tpos = b.target.and_then(|t| self.target_screen_pos(t, viewport));
+
+            // Firing tick: arm has just reset toward ROF (same detection as the
+            // unit muzzle flash). For the tesla, draw a bright zap line to the
+            // target; for gun/pillbox, a muzzle flash at the barrel.
+            let firing = w.rof > 0 && b.arm + 2 >= w.rof && b.arm != 0;
+            if firing {
+                if b.charges {
+                    if let Some((tx, ty)) = tpos {
+                        // A jagged-ish bright bolt (two segments via a midpoint kink).
+                        let mx = (cx + tx) / 2;
+                        let my = (cy + ty) / 2 - 3;
+                        draw_line(frame, cx, cy, mx, my, [180, 210, 255]);
+                        draw_line(frame, mx, my, tx, ty, [220, 235, 255]);
+                        fill_rect(frame, tx - 2, ty - 2, tx + 2, ty + 2, [235, 245, 255]);
+                    }
+                } else if b.has_turret {
+                    // GUN: flash at the barrel tip in the turret direction.
+                    let (fx, fy) = offset_pixels(cx, cy, b.turret_facing, CELL_PIXELS / 2);
+                    fill_rect(frame, fx - 1, fy - 1, fx + 1, fy + 1, [255, 230, 120]);
+                } else if let Some((tx, ty)) = tpos {
+                    // Fixed emplacement (PBOX/HBOX/FTUR): flash partway to target.
+                    let fx = cx + (tx - cx) / 3;
+                    let fy = cy + (ty - cy) / 3;
+                    fill_rect(frame, fx - 1, fy - 1, fx + 1, fy + 1, [255, 210, 120]);
+                }
+            }
+        }
+    }
+
+    /// Screen-pixel position of a combat target (unit/building centre), if live.
+    fn target_screen_pos(&self, target: Target, viewport: Rect) -> Option<(i32, i32)> {
+        let coord = match target {
+            Target::Unit(t) => self
+                .world
+                .units
+                .get(t)
+                .filter(|u| u.is_alive())
+                .map(|u| u.coord)?,
+            Target::Building(t) => self
+                .world
+                .buildings
+                .get(t)
+                .filter(|b| b.is_alive())
+                .map(|b| b.center_cell().center())?,
+            Target::Cell(c) => c.center(),
+        };
+        let x = (leptons_to_pixel(coord.x.0) as i64 - viewport.x) as i32;
+        let y = (leptons_to_pixel(coord.y.0) as i64 - viewport.y) as i32;
+        Some((x, y))
     }
 
     /// Convert a viewport pixel to a map-pixel position at the current camera.
@@ -1968,14 +2050,30 @@ impl AppCore {
             }
             if drawn.is_none() {
                 // No sprite: fall back to a filled footprint so it is visible.
+                // Walls get a distinct darker fill so they read as barriers.
+                let fill = if b.is_wall {
+                    [120, 110, 80]
+                } else {
+                    [90, 90, 110]
+                };
                 fill_rect(
                     frame,
                     px as i32,
                     py as i32,
                     px as i32 + b.foot_w as i32 * CELL_PIXELS,
                     py as i32 + b.foot_h as i32 * CELL_PIXELS,
-                    [90, 90, 110],
+                    fill,
                 );
+            }
+            // GUN turret barrel: a short line from the emplacement centre in the
+            // (sim-tracked) turret facing, so the rotating turret is visible even
+            // without dedicated turret SHP frames.
+            if b.has_turret {
+                let ccx = px as i32 + b.foot_w as i32 * CELL_PIXELS / 2;
+                let ccy = py as i32 + b.foot_h as i32 * CELL_PIXELS / 2;
+                let (bx, by) = offset_pixels(ccx, ccy, b.turret_facing, CELL_PIXELS / 2);
+                draw_line(frame, ccx, ccy, bx, by, [40, 40, 48]);
+                fill_rect(frame, bx - 1, by - 1, bx + 1, by + 1, [30, 30, 36]);
             }
             // Damage bar.
             if b.health < b.max_health {

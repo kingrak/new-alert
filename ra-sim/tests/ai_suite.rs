@@ -99,6 +99,10 @@ fn catalog() -> Catalog {
         free_harvester_unit: if refin { Some(U_HARV) } else { None },
         sight: 5,
         sprite_id: 0,
+        weapon: None,
+        has_turret: false,
+        charges: false,
+        is_wall: false,
     };
     let uproto = |name: &str,
                   sprite_id: u32,

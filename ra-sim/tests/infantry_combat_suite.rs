@@ -808,6 +808,10 @@ fn catalog45() -> Catalog {
                 free_harvester_unit: None,
                 sight: 4,
                 sprite_id: 0,
+                weapon: None,
+                has_turret: false,
+                charges: false,
+                is_wall: false,
             },
             BuildingProto {
                 is_barracks: true,
@@ -825,6 +829,10 @@ fn catalog45() -> Catalog {
                 free_harvester_unit: None,
                 sight: 4,
                 sprite_id: 0,
+                weapon: None,
+                has_turret: false,
+                charges: false,
+                is_wall: false,
             },
         ],
         units: vec![
@@ -1068,6 +1076,10 @@ fn ai_catalog() -> Catalog {
         free_harvester_unit: if refin { Some(AI_U_HARV) } else { None },
         sight: 5,
         sprite_id: 0,
+        weapon: None,
+        has_turret: false,
+        charges: false,
+        is_wall: false,
     };
     let uproto = |name: &str,
                   sprite_id: u32,

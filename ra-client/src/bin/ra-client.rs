@@ -74,6 +74,7 @@ fn run(args: &[String]) -> Result<(), BoxErr> {
         "skirmish" => cmd_skirmish(args),
         "verify-m76" => cmd_verify_m76(args),
         "verify-m77" => cmd_verify_m77(args),
+        "verify-m77b" => cmd_verify_m77b(args),
         "verify-terrain" => cmd_verify_terrain(args),
         _ => {
             eprintln!(
@@ -1933,6 +1934,178 @@ fn cmd_verify_m77(mut args: Vec<String>) -> Result<(), BoxErr> {
     let (report, h1) = run(true)?;
     let (_r2, h2) = run(false)?;
     eprintln!("--- M7.7 Chunk A verification ---\n{report}");
+    if h1 == h2 {
+        eprintln!(
+            "DETERMINISM OK: identical {}-tick hash chains across two runs (final {:#018x})",
+            h1.len(),
+            h1.last().copied().unwrap_or(0)
+        );
+        Ok(())
+    } else {
+        let first = h1.iter().zip(&h2).position(|(a, b)| a != b).unwrap_or(0);
+        Err(format!("determinism FAILED: hash chains diverge at tick {first}").into())
+    }
+}
+
+/// M7.7 Chunk B showcase: a defended base (TSLA + PBOX + GUN) breaking an enemy
+/// attack wave, a wall blocking pathing, defense cameos in the structures strip,
+/// hand-checkable costs/damage, and a same-script-twice determinism check.
+/// Building ids match the loader (`assets.rs`): PBOX=5, GUN=7, TSLA=9, SBAG=10.
+fn cmd_verify_m77b(mut args: Vec<String>) -> Result<(), BoxErr> {
+    use ra_sim::{Command, Target};
+    const V_PBOX: u32 = 5;
+    const V_GUN: u32 = 7;
+    const V_TSLA: u32 = 9;
+    const V_SBAG: u32 = 10;
+    const V_2TNK: u32 = 3; // unit id (distinct id space from buildings)
+    let out_dir = take_flag(&mut args, "--out-dir").unwrap_or_else(|| ".".to_string());
+    let assets_flag = take_flag(&mut args, "--assets");
+    let scenario = take_flag(&mut args, "--scenario").unwrap_or_else(|| "scg05eb.ini".to_string());
+    let dir = platform::resolve_assets_dir(assets_flag.as_deref())
+        .ok_or("could not find an assets directory (try --assets DIR or RA_ASSETS_DIR)")?;
+    eprintln!("assets: {}  scenario: {scenario}", dir.display());
+
+    let run = |dump: bool| -> Result<(String, Vec<u64>), BoxErr> {
+        let game = assets::load_econ_from_dir(&dir, &scenario, 20000)?;
+        let mut core = game.core;
+        let house = game.controlled;
+        let enemy: u8 = if house == 2 { 3 } else { 2 };
+        let base = game.start_cell;
+        let mut hashes: Vec<u64> = Vec::new();
+        let mut report = String::new();
+
+        // --- Stamp a defended base: yard/power/factory + PBOX, GUN, TSLA. ---
+        {
+            let w = core.world_mut();
+            w.spawn_building(V_FACT, house, CellCoord::new(base.x, base.y));
+            w.spawn_building(V_POWR, house, CellCoord::new(base.x + 4, base.y));
+            w.spawn_building(V_POWR, house, CellCoord::new(base.x + 6, base.y));
+            w.spawn_building(V_POWR, house, CellCoord::new(base.x + 8, base.y)); // TSLA needs power
+            w.spawn_building(V_PBOX, house, CellCoord::new(base.x + 2, base.y + 6));
+            w.spawn_building(V_GUN, house, CellCoord::new(base.x + 5, base.y + 6));
+            w.spawn_building(V_TSLA, house, CellCoord::new(base.x + 8, base.y + 6));
+        }
+        let (pout, pdrain) = core.power();
+        report.push_str(&format!(
+            "defended base: PBOX+GUN+TSLA at row {}, power {pout}/{pdrain}\n",
+            base.y + 6
+        ));
+
+        // --- Wall blocking pathing: a wall line, an enemy ordered across it. ---
+        let wall_y = base.y + 10;
+        for dx in 0..6 {
+            core.world_mut()
+                .spawn_building(V_SBAG, enemy, CellCoord::new(base.x + dx, wall_y));
+        }
+        let crosser = spawn_combat_unit(
+            &mut core,
+            V_JEEP,
+            enemy,
+            CellCoord::new(base.x + 2, wall_y + 3),
+        );
+        core.inject_command(Command::Move {
+            unit: crosser,
+            dest: CellCoord::new(base.x + 2, wall_y - 3),
+            house: enemy,
+        });
+        let mut ever_on_wall = false;
+        for _ in 0..80 {
+            core.update(67);
+            hashes.push(core.sim_hash());
+            if let Some(u) = core.world().units.get(crosser) {
+                if u.cell().y == wall_y && (base.x..base.x + 6).contains(&u.cell().x) {
+                    ever_on_wall = true;
+                }
+            }
+        }
+        report.push_str(&format!(
+            "wall blocking: enemy JEEP {} entered a wall cell (should be false)\n",
+            ever_on_wall
+        ));
+
+        // --- Attack wave: several enemy units approach; defenses break it. ---
+        // The wave forms just inside defense range (north of its own wall) and
+        // pushes the base, so the pillbox/gun/tesla visibly break it. A mix of a
+        // couple of medium tanks (soak) and infantry (the pillbox shreds these).
+        let wave: Vec<ra_sim::Handle> = (0..6)
+            .map(|i| {
+                let kind = if i < 2 { V_2TNK } else { V_E1 };
+                let u = spawn_combat_unit(
+                    &mut core,
+                    kind,
+                    enemy,
+                    CellCoord::new(base.x + 1 + i, base.y + 9),
+                );
+                if kind == V_E1 {
+                    if let Some(un) = core.world_mut().units.get_mut(u) {
+                        un.make_infantry(1);
+                    }
+                }
+                u
+            })
+            .collect();
+        for &u in &wave {
+            core.inject_command(Command::Attack {
+                unit: u,
+                target: Target::Cell(CellCoord::new(base.x + 4, base.y + 6)),
+                house: enemy,
+            });
+        }
+        // Step; capture a frame while the TSLA is charging/zapping.
+        let mut tsla_fired = false;
+        let mut zap_dumped = false;
+        for _ in 0..400 {
+            core.update(67);
+            hashes.push(core.sim_hash());
+            // Detect the tesla firing (charge cycling / bullets from buildings).
+            let charging = core
+                .world()
+                .buildings
+                .iter()
+                .any(|(_, b)| b.charges && (b.charge > 0 || b.arm > 100));
+            if charging {
+                tsla_fired = true;
+            }
+            if tsla_fired && !zap_dumped && dump {
+                center_camera_on(&mut core, CellCoord::new(base.x + 5, base.y + 8));
+                dump_game_png(&mut core, &out_dir, "m77b_defended_base_zap.png")?;
+                zap_dumped = true;
+            }
+        }
+        let survivors = wave
+            .iter()
+            .filter(|&&u| core.world().units.contains(u))
+            .count();
+        report.push_str(&format!(
+            "attack wave: {}/{} attackers survived the defenses; tesla engaged={tsla_fired}\n",
+            survivors,
+            wave.len()
+        ));
+        if dump {
+            center_camera_on(&mut core, CellCoord::new(base.x + 5, base.y + 8));
+            dump_game_png(&mut core, &out_dir, "m77b_defended_base_after.png")?;
+        }
+
+        // --- Hand-checkable stats from the loaded catalog. ---
+        for (id, name) in [(V_PBOX, "PBOX"), (V_GUN, "GUN"), (V_TSLA, "TSLA")] {
+            if let Some(p) = core.world().catalog.building(id) {
+                report.push_str(&format!(
+                    "  {name}: cost={} strength={} power={} weaponDmg={:?} charges={} turret={}\n",
+                    p.cost,
+                    p.max_health,
+                    p.power,
+                    p.weapon.map(|w| w.damage),
+                    p.charges,
+                    p.has_turret,
+                ));
+            }
+        }
+        Ok((report, hashes))
+    };
+
+    let (report, h1) = run(true)?;
+    let (_r2, h2) = run(false)?;
+    eprintln!("--- M7.7 Chunk B verification ---\n{report}");
     if h1 == h2 {
         eprintln!(
             "DETERMINISM OK: identical {}-tick hash chains across two runs (final {:#018x})",

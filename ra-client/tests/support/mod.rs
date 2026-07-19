@@ -384,6 +384,10 @@ fn econ_catalog() -> ra_sim::Catalog {
         free_harvester_unit: if refin { Some(ECON_U_HARV) } else { None },
         sight: 4,
         sprite_id: 0,
+        weapon: None,
+        has_turret: false,
+        charges: false,
+        is_wall: false,
     };
     let uproto =
         |name: &str, harv: bool, deploys: Option<u32>, cost: i32, prereq: Vec<u32>| UnitProto {

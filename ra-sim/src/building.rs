@@ -5,7 +5,7 @@
 //! factory) the systems match on at their boundary (§3.1: closed-enum match, not
 //! scattered `What_Am_I()` casts).
 
-use crate::coords::CellCoord;
+use crate::coords::{CellCoord, Facing};
 use crate::hash::Fnv1a;
 
 /// A placed building.
@@ -45,6 +45,26 @@ pub struct Building {
     pub is_war_factory: bool,
     /// Barracks (TENT/BARR): builds infantry (M7.6).
     pub is_barracks: bool,
+
+    // --- Defense combat (M7.7 Chunk B) ---
+    /// Defensive weapon, or `None` for a non-combat structure.
+    pub weapon: Option<crate::combat::WeaponProfile>,
+    /// Whether it aims an independently-rotating turret (GUN).
+    pub has_turret: bool,
+    /// Whether the weapon charges up before firing (tesla coil).
+    pub charges: bool,
+    /// Turret/emplacement facing (binary angle) — the direction it last aimed.
+    pub turret_facing: Facing,
+    /// Rearm countdown in ticks (`Arm`): 0 = ready to fire.
+    pub arm: u16,
+    /// Charge-up countdown in ticks (tesla): counts up while charging; fires the
+    /// bolt when it reaches the charge time. 0 = not charging.
+    pub charge: u16,
+    /// Current auto-acquired attack target (`TarCom`), if any.
+    pub target: Option<crate::combat::Target>,
+    /// Wall segment (SBAG/CYCL/BRIK) — blocks movement, attackable, not a base
+    /// structure (see QUIRKS Q9).
+    pub is_wall: bool,
 }
 
 impl Building {
@@ -88,6 +108,11 @@ impl Building {
         self.health > 0
     }
 
+    /// Whether this is an armed defense building (fires through the combat path).
+    pub fn is_combat(&self) -> bool {
+        self.weapon.is_some()
+    }
+
     /// Health as integer permille (0..=1000) of max — for the client's bar.
     pub fn health_permille(&self) -> i32 {
         (self.health as i32 * 1000 / self.max_health.max(1) as i32).clamp(0, 1000)
@@ -104,6 +129,36 @@ impl Building {
         h.write_u16(self.max_health);
         h.write_i32(self.power);
         // `armor`, `sight`, and `cost` are constants derived from `type_id` (which
-        // is already hashed above), so they are not folded again.
+        // is already hashed above), so they are not folded again. Likewise
+        // `weapon`/`has_turret`/`charges`/`is_wall` are type constants.
+        //
+        // Defense combat *state* (turret facing, rearm, charge, target) changes
+        // over time and is folded in ONLY for armed buildings — appending no bytes
+        // for ordinary structures, so every pre-Chunk-B golden (no armed building)
+        // hashes byte-identically.
+        if self.is_combat() {
+            h.write_u8(0xDE);
+            h.write_u8(self.turret_facing.0);
+            h.write_u16(self.arm);
+            h.write_u16(self.charge);
+            match self.target {
+                None => h.write_u8(0),
+                Some(crate::combat::Target::Unit(t)) => {
+                    h.write_u8(1);
+                    h.write_u32(t.index);
+                    h.write_u32(t.gen);
+                }
+                Some(crate::combat::Target::Building(t)) => {
+                    h.write_u8(2);
+                    h.write_u32(t.index);
+                    h.write_u32(t.gen);
+                }
+                Some(crate::combat::Target::Cell(c)) => {
+                    h.write_u8(3);
+                    h.write_i32(c.x);
+                    h.write_i32(c.y);
+                }
+            }
+        }
     }
 }
