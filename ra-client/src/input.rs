@@ -69,6 +69,18 @@ pub enum InputEvent {
         /// New viewport height in pixels.
         height: u32,
     },
+    /// Scroll one sidebar build column (M7.7 P6 — the two-strip sidebar). The
+    /// original's `StripClass::Scroll(up, column)` (`sidebar.cpp`). `column`:
+    /// `0` = structures (left strip), `1` = units/other (right strip), matching
+    /// `SidebarClass::Which_Column`. `up = true` scrolls toward the top of the
+    /// list (shows earlier items), `up = false` toward the bottom. A pure UI
+    /// action — emits no sim command — so it is monkey/scripted-drive safe.
+    SidebarScroll {
+        /// Which build strip: 0 = structures, 1 = units.
+        column: u8,
+        /// Scroll direction: true = up (toward the first item).
+        up: bool,
+    },
 }
 
 /// A rectangle in map-pixel space: the region [`crate::AppCore::compose`] renders.

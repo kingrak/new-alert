@@ -86,6 +86,7 @@ fn catalog() -> Catalog {
             stats: stats(),
             armor: 0,
             weapon: None,
+            secondary: None,
             has_turret: false,
             is_harvester: false,
             deploys_to: None,

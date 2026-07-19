@@ -137,6 +137,12 @@ pub struct Unit {
     pub armor: u8,
     /// Resolved primary weapon, or `None` for unarmed units (e.g. HARV).
     pub weapon: Option<WeaponProfile>,
+    /// Resolved `Secondary=` weapon (e.g. the mammoth's MammothTusk missiles), or
+    /// `None`. When present, `run_combat` picks primary vs. secondary per the
+    /// target's armor (`What_Weapon_Should_I_Use`, `techno.cpp:360`). A type
+    /// constant, so — like `locomotor`/`sight` — it is **not** hashed; its effect
+    /// flows through the (hashed) `arm`/`health`/bullet state it produces.
+    pub secondary: Option<WeaponProfile>,
     /// Whether the unit aims an independently-rotating turret (1TNK/2TNK/JEEP)
     /// versus rotating its whole body to aim (turretless — e.g. HARV, if armed).
     pub has_turret: bool,
@@ -200,6 +206,7 @@ impl Unit {
             dest: None,
             armor: 0,
             weapon: None,
+            secondary: None,
             has_turret: false,
             turret_facing: facing,
             target: None,
@@ -255,6 +262,13 @@ impl Unit {
         if !has_turret {
             self.turret_facing = self.facing;
         }
+    }
+
+    /// Attach a `Secondary=` weapon (mammoth-tank style dual armament). Call
+    /// after [`Self::set_combat`]; harmless (no-op behavior) for units the sim
+    /// never selects a secondary for.
+    pub fn set_secondary(&mut self, secondary: Option<WeaponProfile>) {
+        self.secondary = secondary;
     }
 
     /// Set the maximum strength (called by the loader when a unit spawns at a

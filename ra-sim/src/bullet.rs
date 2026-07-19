@@ -48,7 +48,24 @@ pub struct Bullet {
     pub instant: bool,
     /// `Inviso=yes`: no projectile sprite (client renders a brief tracer).
     pub invisible: bool,
+    /// `Arcing=yes` (`Ballistic`/`Lobbed` projectiles — artillery, grenades): a
+    /// ballistic lob. The horizontal path is the same straight line to `impact`,
+    /// but the projectile carries a vertical `height` tracing a parabola so it
+    /// arcs over intervening terrain. Port of `bullet.cpp:809/838` + the fall
+    /// integration in `object.cpp:233`.
+    pub arcing: bool,
+    /// Current height above the ground in leptons (arcing only; 0 otherwise). The
+    /// client lifts the sprite by this much to draw the arc, and casts a shadow at
+    /// `pos`.
+    pub height: i32,
+    /// Vertical velocity in leptons/tick (arcing only): `Riser` — starts positive
+    /// (rising), loses `GRAVITY` each tick, so `height` traces a parabola.
+    pub riser: i32,
 }
+
+/// `Rule.Gravity` (`rules.cpp:214`, `[General] Gravity=3`): leptons/tick² pulled
+/// off an arcing projectile's `riser` each tick.
+pub const GRAVITY: i32 = 3;
 
 impl Bullet {
     /// Advance one tick along the straight line to `impact`. Returns `true` when
@@ -59,6 +76,17 @@ impl Bullet {
             self.pos = self.impact;
             return true;
         }
+        // Arcing lob: integrate the vertical parabola (`object.cpp:233`). The
+        // horizontal motion below is unchanged — the shell still flies straight to
+        // its pre-computed `impact`; `height` is a render/lob overlay that returns
+        // to ~0 as the shell arrives (the `riser` was sized for that at spawn).
+        if self.arcing {
+            self.height += self.riser;
+            if self.height < 0 {
+                self.height = 0;
+            }
+            self.riser = (self.riser - GRAVITY).max(-100);
+        }
         let dx = (self.impact.x.0 - self.pos.x.0) as i64;
         let dy = (self.impact.y.0 - self.pos.y.0) as i64;
         let dist2 = dx * dx + dy * dy;
@@ -66,13 +94,24 @@ impl Bullet {
         if dist2 <= step * step {
             // Within one step: snap to impact and detonate.
             self.pos = self.impact;
+            self.height = 0;
             return true;
         }
-        // Partial step along the straight line (integer, deterministic).
+        // Partial step along the straight line (integer, deterministic). Guarantee
+        // at least one lepton of progress along the dominant axis even when the
+        // rounded step underflows to zero (the `known_bug_speed_one` stall on a
+        // near-axis shot at speed 1) so a bullet can never stall in flight.
         let dist = crate::coords::isqrt(dist2);
-        let nx = self.pos.x.0 + (dx * step / dist) as i32;
-        let ny = self.pos.y.0 + (dy * step / dist) as i32;
-        self.pos = WorldCoord::new(nx, ny);
+        let mut ox = (dx * step / dist) as i32;
+        let mut oy = (dy * step / dist) as i32;
+        if ox == 0 && oy == 0 {
+            if dx.abs() >= dy.abs() {
+                ox = dx.signum() as i32;
+            } else {
+                oy = dy.signum() as i32;
+            }
+        }
+        self.pos = WorldCoord::new(self.pos.x.0 + ox, self.pos.y.0 + oy);
         false
     }
 
@@ -109,5 +148,13 @@ impl Bullet {
         h.write_u32(self.source_unit.gen);
         h.write_u8(self.instant as u8);
         h.write_u8(self.invisible as u8);
+        // Arcing state is folded in ONLY for arcing bullets, appending no bytes
+        // for straight shots — so every pre-M7.7 golden (all straight/hitscan
+        // bullets) hashes byte-identically; only worlds with a lob in flight move.
+        if self.arcing {
+            h.write_u8(0xA5);
+            h.write_i32(self.height);
+            h.write_i32(self.riser);
+        }
     }
 }

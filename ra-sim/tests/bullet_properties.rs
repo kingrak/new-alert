@@ -32,6 +32,9 @@ fn make_bullet(pos: WorldCoord, impact: WorldCoord, speed: i32, instant: bool) -
         source_unit: Handle { index: 0, gen: 0 },
         instant,
         invisible: false,
+        arcing: false,
+        height: 0,
+        riser: 0,
     }
 }
 
@@ -91,16 +94,12 @@ proptest! {
         sy in -2000i32..=2000,
         ix in -2000i32..=2000,
         iy in -2000i32..=2000,
-        // Speed starts at 2, not 1: speed==1 can stall a bullet *forever* on
-        // a non-axis-aligned shot (see `regression_examples::
-        // known_bug_speed_one_bullet_can_stall_forever` below) — a genuine
-        // bug in `Bullet::advance`'s per-axis truncated division, reported
-        // separately. It is unreachable with any real `rules.ini` weapon
-        // (the slowest, `Grenade`, resolves to `proj_speed=12` via
-        // `scale_to_256`), so excluding it here keeps this property test
-        // meaningful for the domain the sim actually exercises rather than
-        // silently passing over a real hang.
-        speed in 2i32..=255,
+        // Speed 1 is now included: the old speed==1 non-axis-aligned stall
+        // (`regression_examples::speed_one_bullet_makes_progress_and_detonates`)
+        // was fixed in M7.7 — `Bullet::advance` forces a 1-lepton step when the
+        // truncated per-axis division underflows to zero, so a bullet always
+        // makes progress and this property holds at every speed.
+        speed in 1i32..=255,
     ) {
         let start = WorldCoord::new(sx, sy);
         let impact = WorldCoord::new(ix, iy);
@@ -250,24 +249,75 @@ mod regression_examples {
     /// trigger it — plausible for future content/mods, not just a
     /// contrived unit test), not a currently-live desync risk.
     ///
-    /// This test is `#[ignore]`d so the suite stays green until ra-coder
-    /// fixes `Bullet::advance`'s forward-progress guarantee (e.g. round the
-    /// per-axis step instead of truncating, or force at least a 1-lepton
-    /// step toward the target when truncation would otherwise produce zero
-    /// net movement). Run with:
-    /// `cargo test -p ra-sim --test bullet_properties -- --ignored known_bug_speed_one`
+    /// **FIXED in M7.7 (P1 arcing pass).** `Bullet::advance` now guarantees
+    /// forward progress: when the truncated per-axis step underflows to zero
+    /// net movement, it forces a 1-lepton step along the dominant axis, so a
+    /// bullet can never stall. Un-ignored; the shot detonates at impact.
     #[test]
-    #[ignore = "known bug: speed==1 bullets can stall forever on non-axis-aligned shots — see doc comment; unreachable with any real rules.ini weapon today"]
-    fn known_bug_speed_one_bullet_can_stall_forever() {
+    fn speed_one_bullet_makes_progress_and_detonates() {
         let start = WorldCoord::new(0, 0);
         let impact = WorldCoord::new(3, 3);
         let b = make_bullet(start, impact, 1, false);
-        // A correct implementation detonates within, say, 20 ticks (a
-        // generous cap for distance ~4 at speed 1). The buggy
-        // implementation never detonates at all; `fly_to_detonation`'s
-        // internal cap panics well before that, demonstrating the hang.
+        // Detonates within a generous cap (distance ~4 at speed 1); the old
+        // truncation bug never detonated (fly_to_detonation's cap would panic).
         let (ticks, pos) = fly_to_detonation(b, 20);
         assert!(ticks <= 20);
         assert_eq!(pos, impact);
     }
+}
+
+// ===========================================================================
+// Arcing (ballistic lob) flight — M7.7 P1. Smoke coverage; ra-tester owns the
+// full property suite.
+// ===========================================================================
+
+/// Build an arcing bullet the way `world::fire` does (`bullet.cpp:809/838`):
+/// distance-scaled horizontal speed and a launch `riser` sized to the parabola.
+fn make_arcing(start: WorldCoord, impact: WorldCoord, base_speed: i32) -> Bullet {
+    let dx = (impact.x.0 - start.x.0) as i64;
+    let dy = (impact.y.0 - start.y.0) as i64;
+    let d = isqrt(dx * dx + dy * dy) as i32;
+    let speed = (base_speed + d / 32).max(25);
+    let riser = (((d / 2) / (speed + 1)) * ra_sim::bullet::GRAVITY).max(10);
+    let mut b = make_bullet(start, impact, speed, false);
+    b.arcing = true;
+    b.height = 1;
+    b.riser = riser;
+    b
+}
+
+#[test]
+fn arcing_shell_rises_then_falls_and_detonates_at_impact() {
+    let start = WorldCoord::new(0, 0);
+    let impact = WorldCoord::new(6 * 256, 2 * 256); // a long lob
+    let mut b = make_arcing(start, impact, 12); // 155mm-ish base speed
+    let mut max_h = 0;
+    let mut prev_h = b.height;
+    let mut rose = false;
+    let mut fell = false;
+    let mut detonated_at = None;
+    for t in 0..200 {
+        let det = b.advance();
+        max_h = max_h.max(b.height);
+        if b.height > prev_h {
+            rose = true;
+        }
+        if rose && b.height < prev_h {
+            fell = true;
+        }
+        prev_h = b.height;
+        if det {
+            detonated_at = Some(t);
+            break;
+        }
+    }
+    assert!(rose, "the shell should have gained height (arced up)");
+    assert!(fell, "the shell should have lost height on the way down");
+    assert!(
+        max_h > 128,
+        "a long lob should reach a visibly-arced height (~half a cell+)"
+    );
+    assert!(detonated_at.is_some(), "the shell must detonate");
+    assert_eq!(b.pos, impact, "it detonates at the impact point");
+    assert_eq!(b.height, 0, "height is zeroed at detonation (landed)");
 }

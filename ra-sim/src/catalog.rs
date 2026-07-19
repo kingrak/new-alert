@@ -116,6 +116,10 @@ pub struct UnitProto {
     pub armor: u8,
     /// Primary weapon (None = unarmed, e.g. HARV/MCV).
     pub weapon: Option<WeaponProfile>,
+    /// Secondary weapon (`Secondary=`), if any — e.g. the mammoth tank's
+    /// anti-infantry/air missiles. The sim selects primary vs. secondary per
+    /// target armor at fire time (`What_Weapon_Should_I_Use`).
+    pub secondary: Option<WeaponProfile>,
     /// Whether it aims an independent turret.
     pub has_turret: bool,
     /// Whether this unit is a harvester (drives the harvest FSM).

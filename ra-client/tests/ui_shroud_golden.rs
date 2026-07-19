@@ -305,12 +305,22 @@ fn real_skirmish_compose_game_map_sweep_with_shroud_no_panic() {
     // start-position pathing and the shroud they reveal differ; the composed
     // game-surface frames change accordingly. A rendering-only, coordinator-
     // authorised re-pin (QUIRKS Q5/Q6). Re-derived deterministically (read once).
+    //
+    // **Re-pinned for M7.7 Chunk A** (two-strip scrolling sidebar + the P1
+    // ground-roster additions): `draw_sidebar` was redrawn as two independently-
+    // scrolling columns (structures | units), and the units column now lists the
+    // fuller vehicle roster (3TNK/4TNK/ARTY/V2RL/APC/TRUK/MNLY) — enough to
+    // overflow the strip, so its scroll arrows now draw too. All of this is
+    // sidebar **rendering**: the sim (shroud, pathing, camera, unit spawns) is
+    // untouched, so map-sweep positions 1 and 3 still hash *identically* to each
+    // other, confirming only the sidebar strip moved. Coordinator-authorised;
+    // re-derived deterministically (read back once).
     let golden: [u64; 5] = [
-        0xbaf6_080b_886d_a255,
-        0x9ce6_eab5_3646_d3d9,
-        0x6eb0_114c_f78f_10e1,
-        0x9ce6_eab5_3646_d3d9,
-        0xbbfe_f8af_f7aa_f1a5,
+        0x3b12_32c7_c132_360e,
+        0x153a_2655_33f1_b912,
+        0x1fe2_a65b_2e40_7c0a,
+        0x153a_2655_33f1_b912,
+        0x7bba_075a_3e92_e37e,
     ];
     let got: Vec<u64> = frames.iter().map(|p| support::fnv1a(p)).collect();
     assert_eq!(

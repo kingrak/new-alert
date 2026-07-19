@@ -73,6 +73,7 @@ fn run(args: &[String]) -> Result<(), BoxErr> {
         "econ" => cmd_econ(args),
         "skirmish" => cmd_skirmish(args),
         "verify-m76" => cmd_verify_m76(args),
+        "verify-m77" => cmd_verify_m77(args),
         "verify-terrain" => cmd_verify_terrain(args),
         _ => {
             eprintln!(
@@ -1740,6 +1741,219 @@ fn cmd_verify_m76(mut args: Vec<String>) -> Result<(), BoxErr> {
     }
 }
 
+/// M7.7 Chunk A showcase: the two-strip sidebar, an artillery arc mid-flight, a
+/// mammoth (4TNK) switching weapons vs. a tank then infantry, and a
+/// same-script-twice determinism check. Dumps PNG evidence and prints
+/// hand-checkable stat lines. `V_*` unit ids match the loader's declaration order
+/// (`assets.rs`): 3TNK=8, 4TNK=9, ARTY=10, V2RL=11, APC=12, TRUK=13, MNLY=14.
+fn cmd_verify_m77(mut args: Vec<String>) -> Result<(), BoxErr> {
+    use ra_sim::{Command, Target};
+    const V_WEAP: u32 = 3;
+    const U_2TNK: u32 = 3;
+    const U_3TNK: u32 = 8;
+    const U_4TNK: u32 = 9;
+    const U_ARTY: u32 = 10;
+    let out_dir = take_flag(&mut args, "--out-dir").unwrap_or_else(|| ".".to_string());
+    let assets_flag = take_flag(&mut args, "--assets");
+    let scenario = take_flag(&mut args, "--scenario").unwrap_or_else(|| "scg05eb.ini".to_string());
+    let dir = platform::resolve_assets_dir(assets_flag.as_deref())
+        .ok_or("could not find an assets directory (try --assets DIR or RA_ASSETS_DIR)")?;
+    eprintln!("assets: {}  scenario: {scenario}", dir.display());
+
+    let run = |dump: bool| -> Result<(String, Vec<u64>), BoxErr> {
+        let game = assets::load_econ_from_dir(&dir, &scenario, 20000)?;
+        let mut core = game.core;
+        let house = game.controlled;
+        let enemy: u8 = if house == 2 { 3 } else { 2 };
+        let base = game.start_cell;
+        let mut hashes: Vec<u64> = Vec::new();
+        let mut report = String::new();
+
+        // Stamp a war factory so the sidebar's vehicle strip is fully buildable.
+        {
+            let w = core.world_mut();
+            w.spawn_building(V_FACT, house, CellCoord::new(base.x, base.y));
+            w.spawn_building(V_POWR, house, CellCoord::new(base.x + 4, base.y));
+            w.spawn_building(V_WEAP, house, CellCoord::new(base.x, base.y + 4));
+        }
+
+        // --- Scene C: the two-strip sidebar with the full roster. Scroll the
+        // units column to prove the scroll works, then dump. ---
+        core.handle(InputEvent::SidebarScroll {
+            column: 1,
+            up: false,
+        });
+        core.handle(InputEvent::SidebarScroll {
+            column: 1,
+            up: false,
+        });
+        center_camera_on(&mut core, base);
+        if dump {
+            dump_game_png(&mut core, &out_dir, "m77_sidebar_two_strip.png")?;
+        }
+        report.push_str(&format!(
+            "sidebar: {} buildables; units-column scroll offset = {}\n",
+            core.sidebar_items().len(),
+            core.sidebar_scroll(1)
+        ));
+
+        // --- Scene A: ARTY lobs an arcing 155mm shell at a distant target. ---
+        let arty_cell = CellCoord::new(base.x + 2, base.y + 12);
+        let arty = spawn_combat_unit(&mut core, U_ARTY, house, arty_cell);
+        let arty_target_cell = CellCoord::new(arty_cell.x + 6, arty_cell.y); // ~6 cells = in range
+        let arty_victim = spawn_combat_unit(&mut core, U_2TNK, enemy, arty_target_cell);
+        core.inject_command(Command::Attack {
+            unit: arty,
+            target: Target::Unit(arty_victim),
+            house,
+        });
+        // Step until an arcing shell is airborne at a clearly-arced height.
+        let mut peak_h = 0i32;
+        let mut arc_dumped = false;
+        for _ in 0..200 {
+            core.update(67);
+            hashes.push(core.sim_hash());
+            let airborne: Option<i32> = core
+                .world()
+                .bullets
+                .iter()
+                .filter(|(_, b)| b.arcing)
+                .map(|(_, b)| b.height)
+                .max();
+            if let Some(h) = airborne {
+                peak_h = peak_h.max(h);
+                if h > 96 && !arc_dumped && dump {
+                    let mid = CellCoord::new((arty_cell.x + arty_target_cell.x) / 2, arty_cell.y);
+                    center_camera_on(&mut core, mid);
+                    dump_game_png(&mut core, &out_dir, "m77_arty_arc_midflight.png")?;
+                    arc_dumped = true;
+                }
+            }
+        }
+        report.push_str(&format!(
+            "ARTY 155mm arcing shell: peak height {peak_h} leptons ({} px) mid-flight\n",
+            peak_h / (256 / CELL as i32).max(1)
+        ));
+
+        // --- Scene B: 4TNK (mammoth) fires its 120mm cannon at a heavy tank, then
+        // its MammothTusk missiles at infantry — the weapon switch is visible in
+        // the spawned bullet's Damage (120mm=40 vs MammothTusk=75). ---
+        let mammoth_cell = CellCoord::new(base.x + 12, base.y + 2);
+        let mammoth = spawn_combat_unit(&mut core, U_4TNK, house, mammoth_cell);
+        // A heavy-armor enemy tank right next to it.
+        let etank = spawn_combat_unit(
+            &mut core,
+            U_3TNK,
+            enemy,
+            CellCoord::new(mammoth_cell.x + 2, mammoth_cell.y),
+        );
+        let first_bullet_damage = |core: &AppCore| -> Option<i32> {
+            core.world()
+                .bullets
+                .iter()
+                .find(|(_, b)| b.source_unit == mammoth)
+                .map(|(_, b)| b.damage)
+        };
+        core.inject_command(Command::Attack {
+            unit: mammoth,
+            target: Target::Unit(etank),
+            house,
+        });
+        let mut vs_tank_dmg = None;
+        for _ in 0..60 {
+            core.update(67);
+            hashes.push(core.sim_hash());
+            if let Some(d) = first_bullet_damage(&core) {
+                vs_tank_dmg = Some(d);
+                break;
+            }
+        }
+        if dump {
+            center_camera_on(&mut core, mammoth_cell);
+            dump_game_png(&mut core, &out_dir, "m77_4tnk_vs_tank.png")?;
+        }
+        // Now retarget the mammoth at an infantryman (armor none).
+        let einf = {
+            let w = core.world_mut();
+            let h = w.spawn_unit(
+                0,
+                enemy,
+                CellCoord::new(mammoth_cell.x + 2, mammoth_cell.y + 1),
+                ra_sim::coords::Facing(0),
+                50,
+                spawn_stats(),
+            );
+            w.set_unit_combat(h, 0, None, false);
+            if let Some(u) = w.units.get_mut(h) {
+                u.make_infantry(1);
+            }
+            h
+        };
+        core.inject_command(Command::Attack {
+            unit: mammoth,
+            target: Target::Unit(einf),
+            house,
+        });
+        let mut vs_inf_dmg = None;
+        for _ in 0..80 {
+            core.update(67);
+            hashes.push(core.sim_hash());
+            // Wait for a *fresh* mammoth bullet whose damage differs from the tank shot.
+            if let Some(d) = first_bullet_damage(&core) {
+                if Some(d) != vs_tank_dmg {
+                    vs_inf_dmg = Some(d);
+                    break;
+                }
+            }
+        }
+        if dump {
+            center_camera_on(&mut core, mammoth_cell);
+            dump_game_png(&mut core, &out_dir, "m77_4tnk_vs_infantry.png")?;
+        }
+        report.push_str(&format!(
+            "4TNK weapon switch: vs heavy tank bullet Damage={vs_tank_dmg:?} (expect 120mm=40), \
+             vs infantry bullet Damage={vs_inf_dmg:?} (expect MammothTusk=75)\n"
+        ));
+
+        // --- Hand-checkable stats read straight from the loaded catalog. ---
+        for (id, name) in [(U_3TNK, "3TNK"), (U_4TNK, "4TNK"), (U_ARTY, "ARTY")] {
+            if let Some(p) = core.world().catalog.unit(id) {
+                report.push_str(&format!(
+                    "  {name}: cost={} strength={} primaryDmg={:?} secondaryDmg={:?}\n",
+                    p.cost,
+                    p.max_health,
+                    p.weapon.map(|w| w.damage),
+                    p.secondary.map(|w| w.damage),
+                ));
+            }
+        }
+        Ok((report, hashes))
+    };
+
+    let (report, h1) = run(true)?;
+    let (_r2, h2) = run(false)?;
+    eprintln!("--- M7.7 Chunk A verification ---\n{report}");
+    if h1 == h2 {
+        eprintln!(
+            "DETERMINISM OK: identical {}-tick hash chains across two runs (final {:#018x})",
+            h1.len(),
+            h1.last().copied().unwrap_or(0)
+        );
+        Ok(())
+    } else {
+        let first = h1.iter().zip(&h2).position(|(a, b)| a != b).unwrap_or(0);
+        Err(format!("determinism FAILED: hash chains diverge at tick {first}").into())
+    }
+}
+
+/// Default move stats for a scratch-spawned unit in the M7.7 showcase.
+fn spawn_stats() -> ra_sim::MoveStats {
+    ra_sim::MoveStats {
+        max_speed: 20,
+        rot: 8,
+    }
+}
+
 /// Start one infantryman of proto `unit_id` at `house`'s barracks and step until
 /// it spawns; returns its handle (or `None` on timeout).
 fn produce_one_infantry(
@@ -1800,6 +2014,7 @@ fn spawn_combat_unit(
     );
     w.set_unit_max_health(h, proto.max_health);
     w.set_unit_combat(h, proto.armor, proto.weapon, proto.has_turret);
+    w.set_unit_secondary(h, proto.secondary);
     h
 }
 

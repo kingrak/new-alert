@@ -289,6 +289,7 @@ pub fn load_game_from_bytes(
                 combat.weapon.as_ref().map(weapon_to_profile),
                 combat.has_turret,
             );
+            world.set_unit_secondary(handle, combat.secondary.as_ref().map(weapon_to_profile));
         }
         spawned.push(SpawnInfo {
             handle,
@@ -484,6 +485,7 @@ fn spawn_named(
                 c.weapon.as_ref().map(weapon_to_profile),
                 c.has_turret,
             );
+            world.set_unit_secondary(handle, c.secondary.as_ref().map(weapon_to_profile));
             (c.weapon, c.armor)
         }
         None => (None, 0),
@@ -580,6 +582,14 @@ const U_JEEP: u32 = 4;
 const U_E1: u32 = 5;
 const U_E2: u32 = 6;
 const U_E3: u32 = 7;
+// M7.7 P1 ground-roster completion (ids appended so existing ids are stable).
+const U_3TNK: u32 = 8;
+const U_4TNK: u32 = 9;
+const U_ARTY: u32 = 10;
+const U_V2RL: u32 = 11;
+const U_APC: u32 = 12;
+const U_TRUK: u32 = 13;
+const U_MNLY: u32 = 14;
 
 /// Map a prerequisite short-name to its building type id (only the starter set
 /// is modelled; unknown prereqs — e.g. `fix` for the MCV — are dropped, which is
@@ -793,8 +803,11 @@ pub fn build_content(
     }
 
     // --- Units (ids fixed by declaration order) ---
-    // (name, is_harvester, deploys_to, is_infantry, locomotor)
-    let uspecs: [(&str, bool, Option<u32>, bool, u8); 8] = [
+    // (name, is_harvester, deploys_to, is_infantry, locomotor). Locomotor follows
+    // rules.ini `Tracked=` (`udata.cpp:1301`): all the new vehicles are `Tracked=yes`
+    // (Track) except TRUK (no key → the SPEED_WHEEL default). Ids are *appended* so
+    // the existing MCV..E3 ids stay stable (no golden churn from renumbering).
+    let uspecs: [(&str, bool, Option<u32>, bool, u8); 15] = [
         ("MCV", false, Some(B_FACT), false, LOCO_TRACK as u8),
         ("HARV", true, None, false, LOCO_TRACK as u8),
         ("1TNK", false, None, false, LOCO_TRACK as u8),
@@ -803,6 +816,14 @@ pub fn build_content(
         ("E1", false, None, true, LOCO_FOOT as u8),
         ("E2", false, None, true, LOCO_FOOT as u8),
         ("E3", false, None, true, LOCO_FOOT as u8),
+        // --- M7.7 P1 vehicles ---
+        ("3TNK", false, None, false, LOCO_TRACK as u8), // Soviet heavy tank
+        ("4TNK", false, None, false, LOCO_TRACK as u8), // Mammoth (dual weapon)
+        ("ARTY", false, None, false, LOCO_TRACK as u8), // Artillery (arcing 155mm)
+        ("V2RL", false, None, false, LOCO_TRACK as u8), // V2 rocket launcher
+        ("APC", false, None, false, LOCO_TRACK as u8),  // Armed transport (no passengers — QUIRK)
+        ("TRUK", false, None, false, LOCO_WHEEL as u8), // Supply truck (unarmed)
+        ("MNLY", false, None, false, LOCO_TRACK as u8), // Minelayer (plain vehicle — QUIRK)
     ];
     let mut units = Vec::new();
     let mut unit_sprites = Vec::new();
@@ -852,6 +873,9 @@ pub fn build_content(
             weapon: combat
                 .as_ref()
                 .and_then(|c| c.weapon.as_ref().map(weapon_to_profile)),
+            secondary: combat
+                .as_ref()
+                .and_then(|c| c.secondary.as_ref().map(weapon_to_profile)),
             has_turret: combat.as_ref().map(|c| c.has_turret).unwrap_or(false),
             is_harvester: *is_harv,
             is_infantry: *is_inf,
@@ -878,7 +902,14 @@ pub fn build_content(
         BuildItem::Building(B_TENT),
         BuildItem::Unit(U_1TNK),
         BuildItem::Unit(U_2TNK),
+        BuildItem::Unit(U_3TNK),
+        BuildItem::Unit(U_4TNK),
         BuildItem::Unit(U_JEEP),
+        BuildItem::Unit(U_APC),
+        BuildItem::Unit(U_ARTY),
+        BuildItem::Unit(U_V2RL),
+        BuildItem::Unit(U_MNLY),
+        BuildItem::Unit(U_TRUK),
         BuildItem::Unit(U_HARV),
         BuildItem::Unit(U_E1),
         BuildItem::Unit(U_E2),

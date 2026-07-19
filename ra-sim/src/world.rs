@@ -12,7 +12,7 @@ use crate::arena::{Arena, Handle};
 use crate::building::Building;
 use crate::bullet::Bullet;
 use crate::catalog::Catalog;
-use crate::combat::{aligned_to_fire, modify_damage, Target};
+use crate::combat::{aligned_to_fire, modify_damage, Target, WeaponProfile};
 use crate::coords::{
     coord_move, isqrt, leptons_distance, spot_index, CellCoord, Facing, Locomotor, WorldCoord,
     SUBCELL_COUNT,
@@ -352,6 +352,17 @@ impl World {
     ) {
         if let Some(u) = self.units.get_mut(unit) {
             u.set_combat(armor, weapon, has_turret);
+        }
+    }
+
+    /// Attach a `Secondary=` weapon to a spawned unit (mammoth dual armament).
+    pub fn set_unit_secondary(
+        &mut self,
+        unit: Handle,
+        secondary: Option<crate::combat::WeaponProfile>,
+    ) {
+        if let Some(u) = self.units.get_mut(unit) {
+            u.set_secondary(secondary);
         }
     }
 
@@ -1249,11 +1260,45 @@ fn spawn_free_harvester(
     );
     world.set_unit_max_health(handle, proto.max_health);
     world.set_unit_combat(handle, proto.armor, proto.weapon, proto.has_turret);
+    world.set_unit_secondary(handle, proto.secondary);
     world.set_unit_harvester(handle, proto.is_harvester);
     if let Some(u) = world.units.get_mut(handle) {
         u.set_locomotor(loco_from_index(proto.locomotor));
     }
     world.set_unit_sight(handle, proto.sight);
+}
+
+/// Pick primary vs. secondary weapon for a target of class `armor` at `dist`
+/// leptons — a port of `TechnoClass::What_Weapon_Should_I_Use` (`techno.cpp:360`):
+/// score each weapon by its warhead's `Verses[armor]` modifier, doubled when the
+/// target is already within that weapon's range, and take the secondary only when
+/// it *strictly* outscores the primary. With no secondary (the common case), the
+/// primary is always used — so single-weapon units are byte-identical. This is
+/// what makes a mammoth tank use its 120mm cannon (AP, high vs. heavy) against
+/// tanks and its MammothTusk missiles (HE, high vs. none) against infantry, all
+/// from the `Verses` table with no per-unit special-casing.
+fn select_weapon(
+    primary: WeaponProfile,
+    secondary: Option<WeaponProfile>,
+    armor: u8,
+    dist: i32,
+) -> WeaponProfile {
+    let Some(sec) = secondary else {
+        return primary;
+    };
+    let ai = (armor as usize).min(crate::combat::ARMOR_COUNT - 1);
+    let score = |w: &WeaponProfile| -> i64 {
+        let mut v = w.warhead.verses[ai] as i64;
+        if dist <= w.range {
+            v *= 2; // in-range bonus (`In_Range(target) => value *= 2`)
+        }
+        v
+    };
+    if score(&sec) > score(&primary) {
+        sec
+    } else {
+        primary
+    }
 }
 
 /// Combat system: for each unit (in slot order) decrement its rearm timer,
@@ -1271,45 +1316,56 @@ fn run_combat(world: &mut World) {
         }
 
         // Snapshot what we need without holding a borrow across the RNG draw.
-        let (weapon, coord, turret, body, has_turret, rot, target) = match world.units.get(handle) {
-            Some(u) => match (u.target, u.weapon) {
-                (Some(t), Some(w)) => (
-                    w,
-                    u.coord,
-                    u.turret_facing,
-                    u.facing,
-                    u.has_turret,
-                    u.stats.rot,
-                    t,
-                ),
-                _ => continue,
-            },
-            None => continue,
-        };
+        let (primary, secondary, coord, turret, body, has_turret, rot, target) =
+            match world.units.get(handle) {
+                Some(u) => match (u.target, u.weapon) {
+                    (Some(t), Some(w)) => (
+                        w,
+                        u.secondary,
+                        u.coord,
+                        u.turret_facing,
+                        u.facing,
+                        u.has_turret,
+                        u.stats.rot,
+                        t,
+                    ),
+                    _ => continue,
+                },
+                None => continue,
+            };
 
-        // Resolve the target's current aim point; drop stale/dead targets.
+        // Resolve the target's current aim point + armor class; drop stale/dead
+        // targets. Armor drives the primary-vs-secondary weapon pick below.
         let drop_target = |world: &mut World| {
             if let Some(u) = world.units.get_mut(handle) {
                 u.target = None;
             }
         };
-        let target_coord = match target {
+        let (target_coord, target_armor) = match target {
             Target::Unit(t) => match world.units.get(t) {
-                Some(tu) if tu.is_alive() => tu.coord,
+                Some(tu) if tu.is_alive() => (tu.coord, tu.armor),
                 _ => {
                     drop_target(world);
                     continue;
                 }
             },
             Target::Building(t) => match world.buildings.get(t) {
-                Some(tb) if tb.is_alive() => tb.center_cell().center(),
+                Some(tb) if tb.is_alive() => (tb.center_cell().center(), tb.armor),
                 _ => {
                     drop_target(world);
                     continue;
                 }
             },
-            Target::Cell(c) => c.center(),
+            // A ground/force-fire cell has no object: the original presumes
+            // ARMOR_WOOD (index 1) for weapon selection (`techno.cpp:373`).
+            Target::Cell(c) => (c.center(), 1u8),
         };
+
+        // Pick primary vs. secondary for this target (`What_Weapon_Should_I_Use`,
+        // `techno.cpp:360`): the weapon whose warhead does the greater `Verses`
+        // modifier against the target's armor, each doubled when already in range.
+        let dist_pre = leptons_distance(coord, target_coord);
+        let weapon = select_weapon(primary, secondary, target_armor, dist_pre);
 
         // Desired aim direction toward the target.
         let desired = Facing::toward(coord, target_coord);
@@ -1452,11 +1508,24 @@ fn fire(
         target_coord
     };
 
+    // Arcing (ballistic lob) setup — `bullet.cpp:809/838`. The horizontal speed
+    // rises with distance (`MaxSpeed + Distance/32`, min 25) and the launch
+    // `riser` is sized so the parabola returns to the ground as the shell reaches
+    // impact (`((Distance/2)/(speed+1))*Gravity`, min 10).
+    let (speed, arcing, height, riser) = if weapon.arcing {
+        let d = leptons_distance(muzzle, target_coord);
+        let speed = (weapon.proj_speed + d / 32).max(25);
+        let riser = (((d / 2) / (speed + 1)) * crate::bullet::GRAVITY).max(10);
+        (speed, true, 1, riser)
+    } else {
+        (weapon.proj_speed, false, 0, 0)
+    };
+
     let bullet = Bullet {
         pos: if weapon.instant { impact } else { muzzle },
         impact,
         target,
-        speed: weapon.proj_speed,
+        speed,
         facing: dir,
         damage: weapon.damage,
         warhead: weapon.warhead,
@@ -1466,6 +1535,9 @@ fn fire(
         source_unit: shooter,
         instant: weapon.instant,
         invisible: weapon.invisible,
+        arcing,
+        height,
+        riser,
     };
     world.bullets.insert(bullet);
 }
@@ -1995,6 +2067,7 @@ fn spawn_produced_unit(world: &mut World, unit_id: u32, house: u8, cell: CellCoo
     );
     world.set_unit_max_health(handle, proto.max_health);
     world.set_unit_combat(handle, proto.armor, proto.weapon, proto.has_turret);
+    world.set_unit_secondary(handle, proto.secondary);
     world.set_unit_harvester(handle, proto.is_harvester);
     if let Some(u) = world.units.get_mut(handle) {
         u.set_locomotor(loco_from_index(proto.locomotor));
@@ -2586,6 +2659,58 @@ mod tests {
         }
     }
 
+    /// A MammothTusk-style HE missile: high vs. unarmored/wood, low vs. heavy —
+    /// the opposite armor profile to the AP `ninety_mm` cannon.
+    fn he_missile() -> WeaponProfile {
+        WeaponProfile {
+            damage: 75,
+            rof: 80,
+            range: 1280,
+            proj_speed: 76,
+            proj_rot: 5,
+            invisible: false,
+            instant: false,
+            warhead: WarheadProfile {
+                spread: 6,
+                verses: pct5([90, 75, 60, 25, 25]),
+            },
+            warhead_ap: false,
+            arcing: false,
+            ballistic_scatter: 256,
+            homing_scatter: 512,
+            min_damage: 1,
+            max_damage: 1000,
+        }
+    }
+
+    /// The mammoth-tank weapon pick (`What_Weapon_Should_I_Use`): the AP cannon
+    /// against armored targets, the HE missiles against unarmored ones — chosen
+    /// purely from the `Verses` table, no per-unit special-casing.
+    #[test]
+    fn secondary_weapon_selected_by_target_armor() {
+        let primary = ninety_mm(); // AP: verses none=30%, heavy=100%
+        let secondary = he_missile(); // HE: verses none=90%, heavy=25%
+        let dist = 500; // both weapons in range
+
+        // vs. unarmored infantry (armor 0): HE outscores AP → secondary.
+        let w = super::select_weapon(primary, Some(secondary), 0, dist);
+        assert_eq!(
+            w.warhead.verses, secondary.warhead.verses,
+            "vs none → HE secondary"
+        );
+
+        // vs. heavy steel (armor 3): AP outscores HE → primary.
+        let w = super::select_weapon(primary, Some(secondary), 3, dist);
+        assert_eq!(
+            w.warhead.verses, primary.warhead.verses,
+            "vs heavy → AP primary"
+        );
+
+        // No secondary → always the primary (single-weapon units unchanged).
+        let w = super::select_weapon(primary, None, 0, dist);
+        assert_eq!(w.warhead.verses, primary.warhead.verses);
+    }
+
     fn spawn_tank(w: &mut World, house: u8, cell: CellCoord, hp: u16) -> Handle {
         let h = w.spawn_unit(0, house, cell, Facing(0), hp, stats());
         w.set_unit_combat(h, 3 /*heavy=steel*/, Some(ninety_mm()), true);
@@ -3008,6 +3133,7 @@ mod m5_tests {
                 stats: stats(),
                 armor: 0,
                 weapon: None,
+                secondary: None,
                 has_turret: false,
                 is_harvester: harv,
                 deploys_to: deploys,

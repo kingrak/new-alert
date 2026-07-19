@@ -398,6 +398,7 @@ fn econ_catalog() -> ra_sim::Catalog {
             },
             armor: 0,
             weapon: None,
+            secondary: None,
             has_turret: false,
             is_harvester: harv,
             deploys_to: deploys,

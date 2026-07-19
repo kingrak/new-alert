@@ -303,28 +303,37 @@ impl AiPlayer {
                 }
             }
             if !issued {
-                // Weighted-random pick among buildable armed **vehicles**
-                // (house.cpp:6186; uniform weights). Infantry are excluded here —
-                // they build on the barracks strip below.
-                let eligible: Vec<u32> = cat
+                // Weighted-random pick among buildable **vehicles** — the original
+                // `AI_Unit` table (`house.cpp:6172`): each buildable non-harvester
+                // unit weighs **20 if it has a primary weapon, else 1** (so the
+                // unarmed support vehicles TRUK/MNLY are built, but rarely). Infantry
+                // are excluded here — they build on the barracks strip below.
+                let eligible: Vec<(u32, i32)> = cat
                     .units
                     .iter()
                     .enumerate()
                     .filter(|(id, p)| {
-                        p.weapon.is_some()
-                            && !p.is_harvester
+                        !p.is_harvester
                             && !p.is_infantry
                             && p.deploys_to.is_none()
                             && self.unit_buildable(world, hs, *id as u32)
                     })
-                    .map(|(id, _)| id as u32)
+                    .map(|(id, p)| (id as u32, if p.weapon.is_some() { 20 } else { 1 }))
                     .collect();
-                if !eligible.is_empty() {
-                    let pick = rng.range(0, eligible.len() as i32 - 1) as usize;
-                    out.push(Command::StartProduction {
-                        house: self.house,
-                        item: BuildItem::Unit(eligible[pick]),
-                    });
+                let total: i32 = eligible.iter().map(|(_, w)| *w).sum();
+                if total > 0 {
+                    // Weighted walk over the counter array (house.cpp:6186).
+                    let mut choice = rng.range(0, total - 1);
+                    for (id, w) in &eligible {
+                        if choice < *w {
+                            out.push(Command::StartProduction {
+                                house: self.house,
+                                item: BuildItem::Unit(*id),
+                            });
+                            break;
+                        }
+                        choice -= *w;
+                    }
                 }
             }
         }

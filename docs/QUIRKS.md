@@ -267,12 +267,69 @@ independent of the war factory, matching the original's separate infantry queue.
 3. **Death animations + `InfDeath` variants** (`DO_GUN_DEATH`/`EXPLOSION_DEATH`/…)
    — infantry are removed from the arena on death like vehicles; the client draws
    the shared explosion, not the per-warhead infantry death SHP band.
-4. **Arcing grenade → straight flight.** E2's grenade is `Arcing` in rules.ini;
-   the projectile flies the straight flat-trajectory path (`bullet.rs` advance) —
-   the arc is cosmetic and the impact point is the same. (`bullet.cpp:751` fires
-   straight; the arc is a draw-time parabola we do not render.)
+4. **Arcing grenade → straight flight.** ~~E2's grenade is `Arcing` in rules.ini;
+   the projectile flies the straight flat-trajectory path.~~ **Closed in M7.7
+   (P1 arcing pass):** E2's grenade (`Lobbed` projectile, `Arcing=yes`) now flies
+   the real ballistic lob (`bullet.cpp:809/838` + `object.cpp:233`) like ARTY's
+   155mm — a height/riser parabola sized to land at the impact point. The impact
+   point and damage are unchanged, so combat outcomes are identical; only the
+   in-flight trajectory (and its render arc) changed. See Q8.
 5. **Vehicle/infantry cell coexistence forbidden (updated M7.7):** vehicles and
    infantry no longer co-occupy a cell at all — the mover re-routes/holds rather
    than crushing or stacking (see Q5.3). Turrets: infantry are correctly
    turretless (`has_turret=false`, M7.7 P0c) — they aim by rotating their body,
    matching `udata.cpp` (`is_turret_equipped=false` for every infantry type).
+
+---
+
+## Q8 — Ground-roster completion: dual weapons, arcing lobs, and deferred vehicle abilities
+
+**Milestone:** M7.7 Chunk A (P1 — 3TNK/4TNK/ARTY/V2RL/APC/TRUK/MNLY).
+
+**Dual weapons (`Secondary=`).** The mammoth tank (4TNK) carries a 120mm AP cannon
+(`Primary`) *and* MammothTusk HE missiles (`Secondary`); 3TNK's `Secondary` equals
+its `Primary` (105mm). The sim picks primary vs. secondary per shot from a port of
+`TechnoClass::What_Weapon_Should_I_Use` (`techno.cpp:360`): score each weapon by its
+warhead's `Verses[target_armor]` modifier (doubled when already in range), take the
+secondary only when it *strictly* outscores the primary. So a mammoth uses its cannon
+(AP, high vs. heavy) against tanks and its missiles (HE, high vs. none) against
+infantry — entirely from the `Verses` table, no per-unit special-case. Verified: the
+4TNK fires Damage-40 (120mm) at a heavy tank and Damage-75 (MammothTusk) at infantry.
+`Unit::secondary` is a type constant (like `locomotor`/`sight`), so it is **not** hashed
+— single-weapon units and all pre-M7.7 goldens are byte-identical.
+
+**Arcing / ballistic projectiles.** ARTY's 155mm (`Ballistic` projectile, `Arcing=yes`)
+now flies a real parabolic lob: horizontal speed `MaxSpeed + Distance/32` (min 25) and a
+launch `riser` of `((Distance/2)/(speed+1))*Gravity` (min 10, `Gravity=3`), integrated
+each tick (`height += riser; riser -= Gravity`) — a port of `bullet.cpp:809/838` +
+`object.cpp:233`. The shell detonates at its pre-computed impact point (horizontal path
+unchanged), the `height` tracing an arc that returns to ~0 on arrival; the client lifts
+the sprite by `height` and draws a ground shadow. E2's grenade shares this path (closes
+Q7.4 #4). Arcing state is hashed **only** for arcing bullets, so straight/hitscan goldens
+are byte-identical. **Bonus fix:** `Bullet::advance` now forces a 1-lepton step when the
+truncated per-axis division underflows to zero, eliminating the `speed==1` non-axis-aligned
+stall (the old `known_bug_speed_one` ignore is un-ignored and passing; inert for every real
+weapon, which all resolve `proj_speed >= 12`).
+
+**V2RL is NOT arcing.** The coordinator grouped ARTY+V2RL under "arcing", but rules.ini is
+the source of truth (DESIGN §3.8): V2RL's `SCUD` weapon uses the `FROG` projectile, which
+has **no** `Arcing` flag (`High=yes, Rotates=yes` — a fast, high-flying straight rocket).
+We follow the data: V2RL fires straight, ARTY arcs. Documented rather than forced to arc.
+
+**Deferred vehicle abilities (behaviour QUIRKs).**
+1. **APC — armed transport, no passenger loading.** The APC spawns with its M60mg and
+   fights as an armed vehicle, but the **transport/passenger system is deferred** (no
+   load/unload, no capacity). It is, for now, just a fast armoured gun platform. The
+   original's `Mission_Unload`/cargo hold (`unit.cpp`) is out of Chunk A scope.
+2. **MNLY — plain vehicle, mine-laying deferred.** The minelayer is a buildable vehicle
+   with no weapon and no mine-laying (`LaysMines` capability, `Ammo=5` mines, deferred).
+   It drives and dies like any vehicle but lays nothing. (The mine/overlay system does
+   not exist yet.)
+3. **TRUK — unarmed supply truck.** Buildable, drivable, unarmed; the supply/convoy money
+   mechanic is not modelled (it is `TechLevel=-1` — not normally player-buildable in the
+   original either, surfaced here to complete the roster).
+
+**AI production.** The AI's `AI_Unit` table now weighs each buildable non-harvester vehicle
+**20 if armed, else 1** (`house.cpp:6172`), so the new armed vehicles (3TNK/4TNK/ARTY/V2RL/
+APC) join the weighted-random pool and the unarmed TRUK/MNLY are built rarely. AI-vs-AI
+still reaches decisive outcomes.

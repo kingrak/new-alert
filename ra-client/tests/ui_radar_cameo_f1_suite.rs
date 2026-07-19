@@ -383,6 +383,7 @@ fn cameo_row_core(seed: u32) -> AppCore {
         },
         armor: 0,
         weapon: None,
+        secondary: None,
         has_turret: false,
         is_harvester: false,
         deploys_to: None,
@@ -414,9 +415,15 @@ fn cameo_row_core(seed: u32) -> AppCore {
     core
 }
 
-/// A sidebar-strip x coordinate for `core`'s current viewport.
+/// One build-column width (`appcore`'s private `COLUMN_W = CAMEO_W = 64`).
+const COLUMN_W: i32 = 64;
+
+/// A sidebar-strip x coordinate for `core`'s current viewport. The fixture's
+/// buildables are all `BuildItem::Unit`s, which live in the **right** strip
+/// (column 1) of the two-strip sidebar (M7.7 P6 / `Which_Column`), so this
+/// points into column 1.
 fn sidebar_x(core: &AppCore) -> i32 {
-    core.tactical_width() as i32 + 10
+    core.tactical_width() as i32 + 1 + COLUMN_W + 10
 }
 
 #[test]
@@ -816,5 +823,173 @@ fn drain_sounds_empties_the_queue() {
     assert!(
         core.drain_sounds().is_empty(),
         "a second immediate drain must return nothing new"
+    );
+}
+
+// ===========================================================================
+// Two-strip scrolling sidebar (M7.7 P6) — smoke coverage. Full coverage
+// (monkey over scroll events, per-column overflow, resize re-clamp) is
+// ra-tester's to build out; these pin the core contract.
+// ===========================================================================
+
+/// A sidebar fixture with one structure (column 0) and many units (column 1),
+/// plus cameo art, so column 1 overflows a short viewport and must scroll.
+fn two_strip_core(seed: u32, n_units: usize) -> AppCore {
+    use ra_sim::{BuildingProto, Catalog, EconRules, MoveStats, Passability, UnitProto, World};
+    let bproto = BuildingProto {
+        is_barracks: false,
+        name: "WEAP".into(),
+        foot_w: 2,
+        foot_h: 2,
+        max_health: 400,
+        armor: 0,
+        power: 0,
+        cost: 10,
+        prereq: vec![],
+        is_refinery: false,
+        // A construction yard so both the structure row (needs a yard present to
+        // be buildable) and the unit rows (need the war factory) are clickable.
+        is_construction_yard: true,
+        is_war_factory: true,
+        free_harvester_unit: None,
+        sight: 4,
+        sprite_id: 0,
+    };
+    let uproto = |name: String| UnitProto {
+        is_infantry: false,
+        locomotor: 1,
+        name,
+        sprite_id: 0,
+        max_health: 100,
+        stats: MoveStats {
+            max_speed: 20,
+            rot: 8,
+        },
+        armor: 0,
+        weapon: None,
+        secondary: None,
+        has_turret: false,
+        is_harvester: false,
+        deploys_to: None,
+        cost: 10,
+        prereq: vec![],
+        sight: 2,
+    };
+    let units: Vec<UnitProto> = (0..n_units).map(|i| uproto(format!("U{i}"))).collect();
+    let mut world = World::new(Passability::all_passable(), seed);
+    world.set_catalog(Catalog {
+        buildings: vec![bproto],
+        units,
+        econ: EconRules::default(),
+    });
+    world.init_houses(3, 5000);
+    world.spawn_building(0, 1, CellCoord::new(20, 20)).unwrap();
+
+    let (raster, palette) = support::synthetic_fixture();
+    let mut core = AppCore::with_sim(raster.clone(), *palette, world, Vec::new(), Vec::new());
+    let mut buildables = vec![BuildItem::Building(0)];
+    buildables.extend((0..n_units).map(|i| BuildItem::Unit(i as u32)));
+    core.enable_sidebar(1, buildables);
+    core.set_cameo_art(
+        (0..=n_units)
+            .map(|i| Some(fake_cameo_sprite(i as u8 + 1)))
+            .collect(),
+    );
+    // Short viewport so the units column cannot fit all its rows.
+    core.handle(InputEvent::MouseLeft);
+    core
+}
+
+fn only_start(core: &mut AppCore) -> Option<BuildItem> {
+    let cmds = core.drain_commands();
+    match cmds.as_slice() {
+        [Command::StartProduction { item, .. }] => Some(*item),
+        _ => None,
+    }
+}
+
+#[test]
+fn structures_go_left_column_units_go_right_column() {
+    let mut core = two_strip_core(0x5B01_0001, 3);
+    core.handle(InputEvent::Resize {
+        width: 500,
+        height: 500,
+    });
+    let top = NO_RADAR_ROWS_TOP + 5;
+    let tw = core.tactical_width() as i32;
+    // Column 0 (left) row 0 → the structure.
+    core.handle(InputEvent::MouseDown {
+        button: MouseButton::Left,
+        x: tw + 1 + 10,
+        y: top,
+    });
+    assert_eq!(only_start(&mut core), Some(BuildItem::Building(0)));
+    // Column 1 (right) row 0 → the first unit.
+    core.handle(InputEvent::MouseDown {
+        button: MouseButton::Left,
+        x: tw + 1 + COLUMN_W + 10,
+        y: top,
+    });
+    assert_eq!(only_start(&mut core), Some(BuildItem::Unit(0)));
+}
+
+#[test]
+fn scrolling_the_units_column_shifts_which_row0_builds() {
+    // Many units + a short viewport → column 1 overflows and scrolls.
+    let mut core = two_strip_core(0x5B01_0002, 12);
+    core.handle(InputEvent::Resize {
+        width: 500,
+        height: 260,
+    });
+    assert_eq!(core.sidebar_scroll(1), 0, "starts un-scrolled");
+    let tw = core.tactical_width() as i32;
+    let ux = tw + 1 + COLUMN_W + 10;
+    let y0 = NO_RADAR_ROWS_TOP + 5;
+
+    // Row 0 builds unit 0 before scrolling.
+    core.handle(InputEvent::MouseDown {
+        button: MouseButton::Left,
+        x: ux,
+        y: y0,
+    });
+    assert_eq!(only_start(&mut core), Some(BuildItem::Unit(0)));
+
+    // Scroll the units column (col 1) down twice.
+    core.handle(InputEvent::SidebarScroll {
+        column: 1,
+        up: false,
+    });
+    core.handle(InputEvent::SidebarScroll {
+        column: 1,
+        up: false,
+    });
+    assert_eq!(core.sidebar_scroll(1), 2);
+
+    // Row 0 now builds unit 2 (the window slid down by two).
+    core.handle(InputEvent::MouseDown {
+        button: MouseButton::Left,
+        x: ux,
+        y: y0,
+    });
+    assert_eq!(only_start(&mut core), Some(BuildItem::Unit(2)));
+
+    // Scrolling up past the top clamps at 0.
+    for _ in 0..10 {
+        core.handle(InputEvent::SidebarScroll {
+            column: 1,
+            up: true,
+        });
+    }
+    assert_eq!(core.sidebar_scroll(1), 0);
+
+    // Column 0 (one structure) never scrolls.
+    core.handle(InputEvent::SidebarScroll {
+        column: 0,
+        up: false,
+    });
+    assert_eq!(
+        core.sidebar_scroll(0),
+        0,
+        "a non-overflowing column stays put"
     );
 }

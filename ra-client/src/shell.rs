@@ -118,6 +118,17 @@ async fn amain(mut core: AppCore, smoke_seconds: Option<f32>, sounds: Vec<(Sound
             }
         }
 
+        // Mouse-wheel over a sidebar column scrolls that build strip (M7.7 P6).
+        // The column is chosen from the cursor x; the arrows are also clickable.
+        let (_wheel_x, wheel_y) = mouse_wheel();
+        if wheel_y != 0.0 && core.sidebar_enabled() && mx as i32 >= core.tactical_width() as i32 {
+            let col = core.sidebar_column_at_x(mx as i32);
+            core.handle(InputEvent::SidebarScroll {
+                column: col,
+                up: wheel_y > 0.0,
+            });
+        }
+
         // Deploy the selected MCV (M5): the 'D' key, edge-triggered.
         if is_key_pressed(KeyCode::D) {
             core.handle(InputEvent::KeyDown(Key::Deploy));

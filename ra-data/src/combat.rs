@@ -36,6 +36,11 @@ pub struct UnitCombat {
     pub has_turret: bool,
     /// The resolved primary weapon, if the unit is armed.
     pub weapon: Option<WeaponDef>,
+    /// The resolved `Secondary=` weapon, if any (e.g. the mammoth tank's
+    /// anti-infantry/air MammothTusk missiles alongside its 120mm cannon). The
+    /// sim picks primary vs. secondary per target armor
+    /// (`TechnoClass::What_Weapon_Should_I_Use`, `techno.cpp:360`).
+    pub secondary: Option<WeaponDef>,
 }
 
 /// A fully-resolved weapon (weapon + warhead + projectile + general bounds),
@@ -165,10 +170,14 @@ pub fn resolve_unit_combat(rules: &Ini, name: &str) -> Option<UnitCombat> {
     let weapon = rules
         .get(name, "Primary")
         .and_then(|w| resolve_weapon(rules, w));
+    let secondary = rules
+        .get(name, "Secondary")
+        .and_then(|w| resolve_weapon(rules, w));
     Some(UnitCombat {
         armor,
         has_turret: turret_equipped(name),
         weapon,
+        secondary,
     })
 }
 

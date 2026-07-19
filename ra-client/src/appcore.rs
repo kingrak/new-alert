@@ -52,6 +52,20 @@ const CAMEO_H: i32 = 48;
 /// Taller sidebar row when cameo art is shown (cameo height + label strip).
 const SIDEBAR_ROW_H_CAMEO: i32 = CAMEO_H + 12;
 
+/// Two-strip sidebar (M7.7 P6). The build list is split into two columns like
+/// the original's `Column[COLUMNS=2]` (`sidebar.h`): structures on the left,
+/// units on the right (`SidebarClass::Which_Column`). Each column is one cameo
+/// wide and scrolls independently.
+const SIDEBAR_COLUMNS: usize = 2;
+/// One build-column width, in sidebar pixels (a cameo). Two of these (128) fit
+/// inside `SIDEBAR_W` (130) with a 1px margin each side, so `tactical_width`
+/// (hence every `compose`/`compose_game` camera golden) is unchanged.
+const COLUMN_W: i32 = CAMEO_W;
+/// Height of the per-column scroll-button row at the bottom of the strips.
+const SCROLL_BTN_H: i32 = 14;
+/// Width of a single up/down scroll arrow button.
+const SCROLL_BTN_W: i32 = 16;
+
 /// Approximate classic-RA per-house marker colours for the radar, indexed by
 /// house id (Greece gold, USSR red, …); grey for anything out of range.
 const HOUSE_DOT: [[u8; 3]; 8] = [
@@ -292,6 +306,11 @@ pub struct AppCore {
     cameo_sprites: Vec<Option<UnitSprite>>,
     /// Whether the radar minimap panel is drawn in the sidebar (M7).
     radar_enabled: bool,
+    /// Per-column scroll offset (`TopIndex`, `sidebar.h`) for the two-strip
+    /// sidebar (M7.7 P6): `[structures, units]`. Index of the first visible row
+    /// in each column's item list; clamped so a column never scrolls past its
+    /// last page.
+    sidebar_scroll: [usize; 2],
 
     // --- Audio cue queue (M7, cosmetic) ---
     /// Logical sound cues awaiting playback, drained by the shell each frame.
@@ -364,6 +383,7 @@ impl AppCore {
             ore_gold_sprites: Vec::new(),
             ore_gem_sprites: Vec::new(),
             cameo_sprites: Vec::new(),
+            sidebar_scroll: [0, 0],
             radar_enabled: false,
             sounds: Vec::new(),
             prev_game_over: GameOver::Ongoing,
@@ -705,7 +725,9 @@ impl AppCore {
                 self.viewport_w = width.clamp(1, MAX_VIEWPORT_DIM);
                 self.viewport_h = height.clamp(1, MAX_VIEWPORT_DIM);
                 self.clamp_camera();
+                self.clamp_sidebar_scroll();
             }
+            InputEvent::SidebarScroll { column, up } => self.scroll_sidebar(column, up),
         }
     }
 
@@ -1270,7 +1292,22 @@ impl AppCore {
                 continue;
             }
             let px = (leptons_to_pixel(b.pos.x.0) as i64 - viewport.x) as i32;
-            let py = (leptons_to_pixel(b.pos.y.0) as i64 - viewport.y) as i32;
+            let py_ground = (leptons_to_pixel(b.pos.y.0) as i64 - viewport.y) as i32;
+            // Arcing lob (artillery/grenade): lift the projectile off the ground
+            // by its sim `height` (leptons → pixels) and draw a small shadow at the
+            // ground point, so the shell visibly arcs. Straight shots have height 0.
+            let lift = leptons_to_pixel(b.height);
+            let py = py_ground - lift;
+            if b.arcing && lift > 1 {
+                fill_rect(
+                    frame,
+                    px - 1,
+                    py_ground,
+                    px + 1,
+                    py_ground + 1,
+                    [20, 20, 24],
+                );
+            }
             // Small tracer: a couple of pixels back along the flight direction.
             let (tx, ty) = offset_pixels(px, py, Facing(b.facing.0.wrapping_add(128)), 4);
             draw_line(frame, tx, ty, px, py, [255, 240, 160]);
@@ -1589,22 +1626,174 @@ impl AppCore {
         }
     }
 
-    /// The buildable index for a sidebar viewport point, if it lands on a row.
+    /// Which build column a buildable belongs to: `0` = structures (left),
+    /// `1` = units/other (right). Mirrors `SidebarClass::Which_Column`
+    /// (`sidebar.cpp`: `RTTI_BUILDING* -> 0`, else `1`).
+    fn which_column(item: BuildItem) -> usize {
+        match item {
+            BuildItem::Building(_) => 0,
+            BuildItem::Unit(_) => 1,
+        }
+    }
+
+    /// The live [`SidebarItem`]s in build column `col`, in list order. The flat
+    /// [`Self::sidebar_items`] is exactly `column_items(0)` followed by
+    /// `column_items(1)` (buildables are declared structures-first), so name
+    /// lookups and column lookups stay consistent.
+    fn column_items(&self, col: usize) -> Vec<SidebarItem> {
+        self.sidebar_items()
+            .into_iter()
+            .filter(|it| Self::which_column(it.item) == col)
+            .collect()
+    }
+
+    /// The number of buildables in column `col` (cheap; avoids materialising the
+    /// `SidebarItem`s just to count).
+    fn column_len(&self, col: usize) -> usize {
+        let Some(house) = self.player_house else {
+            return 0;
+        };
+        let hs = self.world.house(house);
+        self.buildables
+            .iter()
+            .filter(|&&item| Self::which_column(item) == col)
+            .filter(|&&item| self.describe_buildable(house, hs, item).is_some())
+            .count()
+    }
+
+    /// Left viewport x of build column `col`.
+    fn column_x(&self, col: usize) -> i32 {
+        self.tactical_width() as i32 + 1 + col as i32 * COLUMN_W
+    }
+
+    /// How many cameo rows are visible per column at the current viewport height
+    /// (`StripClass::MAX_VISIBLE` is fixed at 4 in the original's 200px sidebar;
+    /// we derive it from the actual height so it adapts, reserving the
+    /// scroll-button row at the bottom). At least one row is always shown.
+    fn sidebar_visible_rows(&self) -> usize {
+        let top = self.sidebar_rows_top();
+        let avail = self.viewport_h as i32 - top - SCROLL_BTN_H;
+        (avail / self.sidebar_row_h()).max(1) as usize
+    }
+
+    /// Whether the build sidebar is enabled (game mode). For the shell's input
+    /// routing (e.g. mouse-wheel scroll only over the sidebar).
+    pub fn sidebar_enabled(&self) -> bool {
+        self.sidebar_enabled
+    }
+
+    /// Which build column a sidebar viewport x lands in (`0` structures, `1`
+    /// units), clamped to a valid column. For the shell's wheel-scroll routing.
+    pub fn sidebar_column_at_x(&self, x: i32) -> u8 {
+        let rel = x - self.column_x(0);
+        let col = (rel / COLUMN_W).clamp(0, SIDEBAR_COLUMNS as i32 - 1);
+        col.max(0) as u8
+    }
+
+    /// The scroll offset (`TopIndex`) of column `col`, clamped to a valid page.
+    pub fn sidebar_scroll(&self, col: usize) -> usize {
+        let max = self.max_scroll(col);
+        self.sidebar_scroll.get(col).copied().unwrap_or(0).min(max)
+    }
+
+    /// The maximum scroll offset for a column (0 when it fits without scrolling).
+    fn max_scroll(&self, col: usize) -> usize {
+        self.column_len(col)
+            .saturating_sub(self.sidebar_visible_rows())
+    }
+
+    /// Whether column `col` has more items than fit (so its scroll arrows show).
+    fn column_overflows(&self, col: usize) -> bool {
+        self.max_scroll(col) > 0
+    }
+
+    /// Scroll a build column by one row (`StripClass::Scroll(up, column)`).
+    /// A no-op past either end. Public so scripted drives / the shell drive it.
+    pub fn scroll_sidebar(&mut self, column: u8, up: bool) {
+        let col = column as usize;
+        if col >= SIDEBAR_COLUMNS {
+            return;
+        }
+        let max = self.max_scroll(col);
+        let cur = self.sidebar_scroll[col].min(max);
+        self.sidebar_scroll[col] = if up {
+            cur.saturating_sub(1)
+        } else {
+            (cur + 1).min(max)
+        };
+    }
+
+    /// Re-clamp both columns' scroll after a resize (fewer visible rows may make
+    /// a previously-valid offset overshoot).
+    fn clamp_sidebar_scroll(&mut self) {
+        for col in 0..SIDEBAR_COLUMNS {
+            self.sidebar_scroll[col] = self.sidebar_scroll[col].min(self.max_scroll(col));
+        }
+    }
+
+    /// The up/down scroll-arrow button rects for column `col`, as
+    /// `(up_rect, down_rect)` in `(x0,y0,x1,y1)` viewport pixels — `None` when
+    /// the column does not overflow (no arrows shown).
+    #[allow(clippy::type_complexity)]
+    fn scroll_buttons(&self, col: usize) -> Option<((i32, i32, i32, i32), (i32, i32, i32, i32))> {
+        if !self.column_overflows(col) {
+            return None;
+        }
+        let top = self.sidebar_rows_top();
+        let by = top + self.sidebar_visible_rows() as i32 * self.sidebar_row_h();
+        let cx = self.column_x(col);
+        let up = (cx + 1, by, cx + 1 + SCROLL_BTN_W, by + SCROLL_BTN_H);
+        let dx = cx + COLUMN_W - 1 - SCROLL_BTN_W;
+        let down = (dx, by, dx + SCROLL_BTN_W, by + SCROLL_BTN_H);
+        Some((up, down))
+    }
+
+    /// If `(x,y)` lands on a scroll arrow, the `(column, up)` it triggers.
+    fn scroll_button_at(&self, x: i32, y: i32) -> Option<(u8, bool)> {
+        let hit = |(x0, y0, x1, y1): (i32, i32, i32, i32)| x >= x0 && x < x1 && y >= y0 && y < y1;
+        for col in 0..SIDEBAR_COLUMNS {
+            if let Some((up, down)) = self.scroll_buttons(col) {
+                if hit(up) {
+                    return Some((col as u8, true));
+                }
+                if hit(down) {
+                    return Some((col as u8, false));
+                }
+            }
+        }
+        None
+    }
+
+    /// The buildable's **flat** [`Self::sidebar_items`] index for a sidebar
+    /// viewport point, if it lands on a visible cameo row. Maps the 2D
+    /// (column, visible-row) hit through each column's scroll offset back to the
+    /// flat index (structures block first, then units) so `sidebar_click` and the
+    /// name-based test lookups agree.
     fn sidebar_row_at(&self, x: i32, y: i32) -> Option<usize> {
-        if x < self.tactical_width() as i32 {
+        let x0 = self.tactical_width() as i32;
+        if x < x0 {
+            return None;
+        }
+        // Which column? (past the right edge of column 1 → miss)
+        let col = ((x - self.column_x(0)) / COLUMN_W) as usize;
+        if col >= SIDEBAR_COLUMNS || x < self.column_x(0) {
             return None;
         }
         let top = self.sidebar_rows_top();
         if y < top {
             return None;
         }
-        let idx = ((y - top) / self.sidebar_row_h()) as usize;
-        let items = self.sidebar_items();
-        if idx < items.len() {
-            Some(idx)
-        } else {
-            None
+        let row = ((y - top) / self.sidebar_row_h()) as usize;
+        if row >= self.sidebar_visible_rows() {
+            return None; // in the scroll-button band or below
         }
+        let pos = self.sidebar_scroll(col) + row;
+        if pos >= self.column_len(col) {
+            return None;
+        }
+        // Flat index: all of column 0 precedes column 1 in `sidebar_items`.
+        let base = if col == 0 { 0 } else { self.column_len(0) };
+        Some(base + pos)
     }
 
     /// Whether a viewport point lands on the radar panel; returns the map cell it
@@ -1636,6 +1825,11 @@ impl AppCore {
             let px = (cell.x * CELL_PIXELS - self.tactical_width() as i32 / 2) as f32;
             let py = (cell.y * CELL_PIXELS - self.viewport_h as i32 / 2) as f32;
             self.set_camera(px, py);
+            return;
+        }
+        // Scroll arrows work regardless of order-acceptance (pure UI navigation).
+        if let Some((col, up)) = self.scroll_button_at(x, y) {
+            self.scroll_sidebar(col, up);
             return;
         }
         if !self.accepting_orders() {
@@ -1853,11 +2047,28 @@ impl AppCore {
         // Radar minimap panel (top of the strip, under the header).
         self.draw_radar(frame);
 
-        // Buildable rows.
-        let items = self.sidebar_items();
+        // Two build strips: structures (col 0, left) then units (col 1, right),
+        // each scrolled independently through its own `TopIndex`.
+        for col in 0..SIDEBAR_COLUMNS {
+            self.draw_sidebar_column(frame, col);
+        }
+    }
+
+    /// Draw one build strip (column) of cameo rows plus, when it overflows, its
+    /// up/down scroll arrows. Only the visible window `[scroll .. scroll+rows]`
+    /// is drawn.
+    fn draw_sidebar_column(&self, frame: &mut RgbaImage, col: usize) {
+        let cx0 = self.column_x(col);
         let row_h = self.sidebar_row_h();
+        let rows = self.sidebar_visible_rows();
+        let scroll = self.sidebar_scroll(col);
+        let items = self.column_items(col);
         let mut ry = self.sidebar_rows_top();
-        for item in &items {
+
+        for slot in 0..rows {
+            let Some(item) = items.get(scroll + slot) else {
+                break;
+            };
             let row_bg = if item.ready {
                 [30, 70, 30]
             } else if item.buildable {
@@ -1865,26 +2076,24 @@ impl AppCore {
             } else {
                 [30, 30, 34]
             };
-            fill_rect(frame, x0 + 2, ry, w - 3, ry + row_h - 2, row_bg);
-            let name_col = if item.buildable || item.progress.is_some() || item.ready {
+            fill_rect(frame, cx0, ry, cx0 + COLUMN_W - 1, ry + row_h - 2, row_bg);
+            let active = item.buildable || item.progress.is_some() || item.ready;
+            let name_col = if active {
                 [230, 230, 230]
             } else {
                 [110, 110, 120]
             };
 
-            // Cameo art (centred) when installed; else the item's short name.
-            let cameo = self.cameo_for(item.item);
-            let label_y = if let Some(sprite) = cameo {
+            // Cameo art when installed; else the item's short name (text fallback).
+            let label_y = if let Some(sprite) = self.cameo_for(item.item) {
                 if let Some(f) = sprite.frames.first() {
-                    let cx = x0 + (SIDEBAR_W as i32 - CAMEO_W) / 2;
-                    draw_sprite_topleft(frame, cx, ry + 2, f, &identity_remap(), &self.palette);
-                    // Dim non-buildable cameos.
-                    if !(item.buildable || item.progress.is_some() || item.ready) {
+                    draw_sprite_topleft(frame, cx0, ry + 2, f, &identity_remap(), &self.palette);
+                    if !active {
                         fill_rect_alpha(
                             frame,
-                            cx,
+                            cx0,
                             ry + 2,
-                            cx + CAMEO_W,
+                            cx0 + CAMEO_W,
                             ry + 2 + CAMEO_H,
                             [10, 10, 14],
                             140,
@@ -1893,29 +2102,83 @@ impl AppCore {
                 }
                 ry + CAMEO_H + 2
             } else {
-                font::draw_text(frame, tx, ry + 2, &item.name, name_col);
+                font::draw_text(frame, cx0 + 2, ry + 2, &item.name, name_col);
                 ry + 2 + font::GLYPH_H + 1
             };
 
-            // Cost line.
+            // Cost line, and a ready tag or a progress bar under the cameo.
             font::draw_text(
                 frame,
-                tx,
+                cx0 + 2,
                 label_y,
                 &format!("${}", item.cost),
                 [180, 180, 140],
             );
-            // Progress bar / ready tag.
             if item.ready {
-                font::draw_text(frame, tx + 40, label_y, "READY", [120, 240, 120]);
+                font::draw_text(
+                    frame,
+                    cx0 + 2,
+                    label_y + font::GLYPH_H,
+                    "RDY",
+                    [120, 240, 120],
+                );
             } else if let Some(pm) = item.progress {
-                let bx0 = x0 + 44;
-                let bx1 = w - 4;
-                fill_rect(frame, bx0, label_y + 1, bx1, label_y + 7, [20, 20, 24]);
+                let bx0 = cx0 + 2;
+                let bx1 = cx0 + COLUMN_W - 3;
+                fill_rect(
+                    frame,
+                    bx0,
+                    label_y + font::GLYPH_H,
+                    bx1,
+                    label_y + font::GLYPH_H + 4,
+                    [20, 20, 24],
+                );
                 let fill = bx0 + (bx1 - bx0) * pm / 1000;
-                fill_rect(frame, bx0, label_y + 1, fill, label_y + 7, [80, 160, 240]);
+                fill_rect(
+                    frame,
+                    bx0,
+                    label_y + font::GLYPH_H,
+                    fill,
+                    label_y + font::GLYPH_H + 4,
+                    [80, 160, 240],
+                );
             }
             ry += row_h;
+        }
+
+        // Scroll arrows (only when the column overflows its visible window).
+        if let Some((up, down)) = self.scroll_buttons(col) {
+            let at_top = scroll == 0;
+            let at_bottom = scroll >= self.max_scroll(col);
+            self.draw_scroll_arrow(frame, up, true, !at_top);
+            self.draw_scroll_arrow(frame, down, false, !at_bottom);
+        }
+    }
+
+    /// Draw a single up/down scroll arrow in `rect`. `enabled` brightens it.
+    fn draw_scroll_arrow(
+        &self,
+        frame: &mut RgbaImage,
+        rect: (i32, i32, i32, i32),
+        up: bool,
+        enabled: bool,
+    ) {
+        let (x0, y0, x1, y1) = rect;
+        let bg = if enabled { [70, 70, 84] } else { [38, 38, 44] };
+        fill_rect(frame, x0, y0, x1 - 1, y1 - 1, bg);
+        let fg = if enabled {
+            [230, 230, 240]
+        } else {
+            [90, 90, 100]
+        };
+        // A little triangle: rows of a centred run of pixels.
+        let cx = (x0 + x1) / 2;
+        let h = (y1 - y0 - 4).max(3);
+        for i in 0..h {
+            // up: widen toward the bottom; down: widen toward the top.
+            let spread = if up { i } else { h - 1 - i };
+            let yy = y0 + 2 + i;
+            fill_rect(frame, cx - spread, yy, cx + spread, yy, fg);
         }
     }
 
