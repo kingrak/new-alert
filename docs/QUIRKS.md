@@ -469,3 +469,90 @@ the skirmish AI lacks) — `house.cpp:6400`. The structure priority gains a **ra
 dome** once the economy is running (`AI_Building`, `house.cpp:5696`). SILO/FIX/tech
 centres are not in the AI's build order (situational; deferred). AI-vs-AI still
 reaches decisive outcomes.
+
+---
+
+## Q11 — M7.8 carried fixes (audit follow-ups)
+
+**Milestone:** M7.8 (the four design gaps ra-tester's M7.7 audit pinned in
+`ra-sim/tests/support_suite.rs`, now resolved against the reference source).
+
+**(a) SILO sell/destroy — immediate tiberium reconcile, excess lost.** Selling or
+destroying a storage building (SILO/PROC) used to leave over-cap tiberium stale
+until the *next* harvest tick silently clamped it. We now reconcile in
+`remove_building` (and on `capture_building` for the former owner) the instant
+capacity drops: `House::reconcile_capacity` clamps `tiberium` to the recomputed
+`house_storage_capacity` and **wastes** the excess with no credit refund. This
+matches `HouseClass::Adjust_Capacity` (`house.cpp:2104-2125`): the clamp is eager,
+and building removal/destruction passes `inanger = true` (`building.cpp:2514`
+`Limbo`), which discards the excess (`IsMaxedOut = true`) rather than refunding it
+(the peacetime `inanger = false` path *would* `Refund_Money`). **Deferral:** the
+original credits the *capturer* with the old owner's excess as "booty"
+(`building.cpp:3288`); we discard it on capture too rather than transferring it —
+a minor, documented divergence on the rare storage-capture path. Pin:
+`selling_a_full_silo_reconciles_stored_tiberium_immediately_no_refund`.
+
+**(b) Engineer + friendly building — renovate-and-consume (brief was wrong).** The
+brief hypothesised RA engineers refuse friendly buildings; the reference shows the
+opposite. `InfantryClass::Per_Cell_Process`/`MISSION_CAPTURE` (`infantry.cpp:636-680`)
+calls `Renovate()` on an allied building — `TechnoClass::Renovate` sets
+`Strength = MaxStrength` (`techno.cpp:3988`) — and the engineer is deleted at the
+shared terminal (`infantry.cpp:782`). So an engineer marched onto a **friendly**
+building now **heals it to full and is consumed** (the classic RA instant-repair),
+per rule 3 (reference is ground truth). Pin:
+`engineer_renovates_a_damaged_friendly_building_and_is_consumed`.
+
+**(c) Engineer + wall — refused, not consumed.** Walls are `OverlayType`s in the
+original, not `BuildingClass`es, so they can never be capture/enter targets
+(`Can_Capture` needs `RTTI_BUILDING` + `IsCaptureable`, `building.cpp:3537`;
+`object.cpp:421` returns false; wall stubs default `IsCaptureable = false`,
+`bdata.cpp:2746`). We model walls as 1×1 buildings (Q9), so `run_engineers` gates
+`is_wall` out explicitly: an engineer ordered onto a wall (friend or foe) refuses,
+is **not** consumed, and the wall is untouched. Pin:
+`engineer_cannot_capture_a_wall_and_is_not_consumed`.
+
+**(d) Medic — symmetric friendly-infantry-only guard.** The medic's
+"keep the current target" fast path now applies the *same* validity test as fresh
+acquisition (`is_infantry` + friendly + alive + wounded). Previously a friendly
+*vehicle* survived re-validation and healed (via an explicit order) while the
+identical enemy order was clobbered — an asymmetry. Now both invalid explicit
+orders (friendly vehicle, enemy unit) are cleared identically the same tick, so a
+medic can only ever heal friendly infantry — matching the original's
+`THREAT_INFANTRY`-only, ally-only heal logic (`techno.cpp:1606,2154`;
+`combat.cpp:84` nullifies heals on non-`ARMOR_NONE` targets — vehicle healing is
+the separate MECHANIC unit). Pins:
+`medic_never_heals_a_vehicle_even_when_explicitly_ordered`,
+`medic_explicit_order_to_heal_an_enemy_is_silently_clobbered_back_to_a_no_op`.
+
+---
+
+## Q12 — Pre-game state machine wraps the game surface (M7.8)
+
+**Milestone:** M7.8 (main menu + skirmish setup + pause/game-over flow).
+
+**Our design.** A new windowless `App` (`ra-client/src/menu.rs`) is the outer
+state machine — `MainMenu → SkirmishSetup → InGame → Paused/GameOver` — driven
+entirely through `handle`/`update`/`compose` (DESIGN §4.8). It *wraps* an optional
+in-game `AppCore`: `InGame` delegates to it; `Paused`/`GameOver` freeze it by not
+calling `update` (the sim tick count does not advance); the menus are **pre-World**
+and never touch `compose_game` or the sim.
+
+**Why it doesn't move goldens.** Because the menu states render their own frames
+and never invoke the game surface, enabling the state machine cannot perturb any
+in-game golden — `compose_game` output is byte-identical whether or not the menu
+wraps it. The two new `AppCore` seams are inert by default: `radar_always_on`
+starts `false` (so `has_radar` is unchanged), and `set_house_remap` is only called
+by the configured skirmish loader (never on the existing golden paths). The
+existing `ui_*` golden suites remain the proof.
+
+**Classic-radar toggle.** The setup screen's "CLASSIC RADAR" option threads to
+`AppCore::set_classic_radar`: ON keeps authentic DOME power-gating (Q10); OFF sets
+`radar_always_on`, making `has_radar` bypass the DOME check (always on). Cosmetic
+only — never touches the sim hash.
+
+**Map scanning.** `general.mix` indexes by name-hash with no directory, so
+`scan_archive_maps` probes the RA multiplayer naming space (`scmNN<t><v>.ini`) and
+keeps every name that resolves (24 maps on the freeware set). User maps are scanned
+from the per-OS data dir (`platform::user_maps_dir`, e.g.
+`~/.local/share/new-alert/maps`), created on first run, and load via the same
+INI-text path (`load_from_text` / `load_skirmish_configured`) as archive maps.

@@ -7,7 +7,7 @@
 //! FNV-1a hash (§4.2): the hash chain is the determinism backbone, asserted in
 //! replays and multiplayer alike.
 
-use crate::ai::AiPlayer;
+use crate::ai::{AiPlayer, Difficulty};
 use crate::arena::{Arena, Handle};
 use crate::building::Building;
 use crate::bullet::Bullet;
@@ -266,6 +266,20 @@ impl World {
     /// Designate the tracked player house for win/lose resolution (skirmish).
     pub fn set_player_house(&mut self, house: u8) {
         self.player_house = Some(house);
+    }
+
+    /// The tracked player house, if one was designated.
+    pub fn player_house(&self) -> Option<u8> {
+        self.player_house
+    }
+
+    /// The difficulty of the AI controlling `house`, if any (verification hook —
+    /// lets a scripted drive assert the chosen difficulty was threaded through).
+    pub fn ai_difficulty(&self, house: u8) -> Option<Difficulty> {
+        self.ai
+            .iter()
+            .find(|a| a.house == house)
+            .map(|a| a.difficulty)
     }
 
     /// The current terminal game state (`Ongoing` until a house is eliminated).
@@ -1162,6 +1176,19 @@ fn remove_building(world: &mut World, handle: Handle) {
     if was_barracks && !house_has_barracks(world, house) {
         abandon_production_lane(world, house, ProdKind::Infantry);
     }
+
+    // Reconcile stored tiberium against the now-lower storage capacity
+    // *immediately* (M7.8 carried fix a). Selling or destroying a SILO/PROC
+    // drops the house's `Capacity`; the original recomputes it on the spot and
+    // clamps `House->Tiberium` down, wasting the excess with no refund
+    // (`HouseClass::Silo_Redraw`/`Adjust_Capacity`). Previously the excess sat
+    // stale until the next harvest tick silently clamped it — same net loss, but
+    // deferred and invisible. Reconciling here makes the loss happen at the
+    // moment capacity changes, matching the original's timing.
+    let new_cap = house_storage_capacity(world, house);
+    if let Some(hs) = world.houses.get_mut(house as usize) {
+        hs.reconcile_capacity(new_cap);
+    }
 }
 
 /// Whether `house` still owns a live barracks (infantry factory).
@@ -1658,12 +1685,22 @@ fn maybe_acquire_heal_target(world: &mut World, handle: Handle) {
         },
         None => return,
     };
-    // Keep a still-valid wounded-friendly target.
+    // Keep a still-valid wounded-friendly **infantry** target. The `is_infantry`
+    // clause here is the symmetric guard added in M7.8 (carried fix d): a heal is
+    // only ever valid on a friendly infantryman, so the "keep the current target"
+    // fast path applies the *same* validity test the fresh-acquisition scan below
+    // does (`is_infantry` + friendly + alive + wounded). Without it, an explicit
+    // `Command::Attack` onto a friendly *vehicle* survived re-validation forever
+    // (and healed it) while the identical order onto an *enemy* was clobbered —
+    // an asymmetry. Now both invalid explicit orders are cleared identically the
+    // same tick, so a medic can only ever heal friendly infantry.
     let keep = match world.units.get(handle).and_then(|u| u.target) {
         Some(Target::Unit(t)) => world
             .units
             .get(t)
-            .map(|tu| tu.is_alive() && tu.house == house && tu.health < tu.max_health)
+            .map(|tu| {
+                tu.is_alive() && tu.house == house && tu.is_infantry() && tu.health < tu.max_health
+            })
             .unwrap_or(false),
         _ => false,
     };
@@ -1706,11 +1743,32 @@ const ENGINEER_CAPTURE_DEN: i32 = 4;
 const ENGINEER_DAMAGE_NUM: i32 = 1;
 const ENGINEER_DAMAGE_DEN: i32 = 3;
 
-/// System 4.25: **engineers** (E6). An engineer ordered to attack an enemy
-/// building marches to the footprint and, on arrival, either **captures** it
-/// (health ≤ `EngineerCaptureLevel`, ownership flips) or **damages** it by
-/// `EngineerDamage` of its max strength (`InfantryClass::Mission_Capture` /
-/// `infantry.cpp:659`). The engineer is **consumed** on use either way.
+/// System 4.25: **engineers** (E6). An engineer ordered to attack a building
+/// marches to the footprint and, on arrival, acts by the target's ownership
+/// (`InfantryClass::Per_Cell_Process`, `MISSION_CAPTURE`, `infantry.cpp:636-680`):
+///
+/// - **Enemy building:** **captures** it (health ≤ `EngineerCaptureLevel`,
+///   ownership flips) or else **damages** it by `EngineerDamage` of its max
+///   strength (`infantry.cpp:659`).
+/// - **Friendly building** (carried fix b): **renovates** it — heals it to full
+///   strength (`Renovate` → `Strength = MaxStrength`, `techno.cpp:3988`). This is
+///   the classic RA "engineer instant-repairs your own building" mechanic. The
+///   brief hypothesised RA engineers *don't* repair friendly buildings; the
+///   reference source shows the opposite (both the vanilla and the
+///   `FIXIT_ENGINEER_CAPTURE` branches call `Renovate()`), so we follow the
+///   source.
+///
+/// The engineer is **consumed on every action** — capture, damage, *or* renovate
+/// (`delete this`, the shared terminal at `infantry.cpp:782`). The one path that
+/// does **not** consume it is a *refused* order:
+///
+/// - **Wall segment** (carried fix c): walls are `OverlayType`s in the original,
+///   not `BuildingClass`es, so they are never valid capture/enter targets
+///   (`Can_Capture` requires `RTTI_BUILDING` + `IsCaptureable`,
+///   `building.cpp:3537`; `object.cpp:421` returns false; wall stubs default
+///   `IsCaptureable=false`, `bdata.cpp:2746`). We model walls as 1×1 buildings
+///   (QUIRKS Q9), so we gate them out explicitly: an engineer ordered onto a wall
+///   (friend or foe) refuses, is not consumed, and the wall is untouched.
 fn run_engineers(world: &mut World) {
     for handle in world.units.handles() {
         let (house, coord, target) = match world.units.get(handle) {
@@ -1721,7 +1779,7 @@ fn run_engineers(world: &mut World) {
             _ => continue,
         };
         // Target still a live enemy building?
-        let (bcell, bw, bh, bhouse, bhealth, bmax) = match world.buildings.get(target) {
+        let (bcell, bw, bh, bhouse, bhealth, bmax, bwall) = match world.buildings.get(target) {
             Some(b) if b.is_alive() => (
                 b.cell,
                 b.foot_w as i32,
@@ -1729,6 +1787,7 @@ fn run_engineers(world: &mut World) {
                 b.house,
                 b.health as i32,
                 b.max_health as i32,
+                b.is_wall,
             ),
             _ => {
                 if let Some(u) = world.units.get_mut(handle) {
@@ -1737,8 +1796,9 @@ fn run_engineers(world: &mut World) {
                 continue;
             }
         };
-        if bhouse == house {
-            // Friendly building — nothing to capture; drop the order.
+        if bwall {
+            // A wall (fix c) is never a valid engineer target (friend or foe).
+            // Refuse: drop the order, the engineer is NOT consumed, wall untouched.
             if let Some(u) = world.units.get_mut(handle) {
                 u.target = None;
             }
@@ -1769,17 +1829,27 @@ fn run_engineers(world: &mut World) {
             }
             continue;
         }
-        // Arrived: capture (health at/below the capture level) or damage.
-        let capturable = bhealth * ENGINEER_CAPTURE_DEN <= bmax * ENGINEER_CAPTURE_NUM;
-        if capturable {
-            capture_building(world, target, house);
-        } else {
-            let dmg = (bmax * ENGINEER_DAMAGE_NUM / ENGINEER_DAMAGE_DEN).min(bhealth - 1);
+        // Arrived. Act by ownership:
+        if bhouse == house {
+            // Friendly (fix b): renovate — heal to full strength
+            // (`TechnoClass::Renovate`, `techno.cpp:3988`).
             if let Some(b) = world.buildings.get_mut(target) {
-                b.health = (b.health as i32 - dmg).max(1) as u16;
+                b.health = b.max_health;
+            }
+        } else {
+            // Enemy: capture (health at/below the capture level) or damage.
+            let capturable = bhealth * ENGINEER_CAPTURE_DEN <= bmax * ENGINEER_CAPTURE_NUM;
+            if capturable {
+                capture_building(world, target, house);
+            } else {
+                let dmg = (bmax * ENGINEER_DAMAGE_NUM / ENGINEER_DAMAGE_DEN).min(bhealth - 1);
+                if let Some(b) = world.buildings.get_mut(target) {
+                    b.health = (b.health as i32 - dmg).max(1) as u16;
+                }
             }
         }
-        // The engineer is consumed on use (`delete this`, `infantry.cpp:680`).
+        // The engineer is consumed on every action — capture, damage, or
+        // renovate (`delete this`, the shared terminal at `infantry.cpp:782`).
         world.units.remove(handle);
     }
 }
@@ -1816,6 +1886,13 @@ fn capture_building(world: &mut World, building: Handle, new_house: u8) {
     if let Some(b) = world.buildings.get_mut(building) {
         b.house = new_house;
         b.target = None; // a captured defense re-acquires for its new owner
+    }
+    // Capturing a storage building shrinks the former owner's capacity — clamp
+    // its stored tiberium down immediately, same reconcile as a sale/destruction
+    // (carried fix a). The new owner's capacity only grows, so it needs none.
+    let old_cap = house_storage_capacity(world, old_house);
+    if let Some(oh) = world.houses.get_mut(old_house as usize) {
+        oh.reconcile_capacity(old_cap);
     }
 }
 

@@ -33,7 +33,8 @@ use ra_sim::{
 
 use crate::appcore::AppCore;
 use crate::appcore::SoundEvent;
-use crate::compositor::Palette;
+use crate::compositor::{IndexedImage, Palette, RgbaImage};
+use crate::menu::{GameFactory, MapEntry, MapSource, ResolvedSkirmish};
 use crate::terrain::{build_passability_masks, rasterize, TileSet};
 use crate::unit_render::{InfantryAnim, UnitSprite};
 
@@ -74,15 +75,33 @@ pub fn load_from_bytes(
     redalert_bytes: &[u8],
     scenario_name: &str,
 ) -> Result<LoadedTerrain, Box<dyn Error>> {
-    let main = MixArchive::parse(main_bytes)?;
+    let ini_text = scenario_text_from_archive(main_bytes, scenario_name)?;
+    load_from_text(main_bytes, redalert_bytes, &ini_text)
+}
 
-    // Scenario INIs live in general.mix inside main.mix.
+/// Fetch a scenario INI's text from general.mix (inside main.mix) by name.
+pub fn scenario_text_from_archive(
+    main_bytes: &[u8],
+    scenario_name: &str,
+) -> Result<String, Box<dyn Error>> {
+    let main = MixArchive::parse(main_bytes)?;
     let general = main.open_nested("general.mix")?;
     let ini_bytes = general
         .get(scenario_name)
         .ok_or_else(|| format!("scenario '{scenario_name}' not found in general.mix"))?;
-    let ini_text = String::from_utf8_lossy(ini_bytes);
-    let scenario = Scenario::parse(&ini_text)?;
+    Ok(String::from_utf8_lossy(ini_bytes).into_owned())
+}
+
+/// Load a scenario's terrain from its INI **text** (rather than an archive name),
+/// so a user-supplied `.ini`/`.mpr` file can be loaded with the same path the
+/// archive maps use. The theater tiles + palette still come from the archives.
+pub fn load_from_text(
+    main_bytes: &[u8],
+    redalert_bytes: &[u8],
+    ini_text: &str,
+) -> Result<LoadedTerrain, Box<dyn Error>> {
+    let main = MixArchive::parse(main_bytes)?;
+    let scenario = Scenario::parse(ini_text)?;
 
     // Theater templates.
     let theater_mix = main.open_nested(scenario.theater.mix_name())?;
@@ -1179,6 +1198,37 @@ pub struct SkirmishGame {
     pub ai_start: CellCoord,
 }
 
+/// Skirmish setup choices threaded from the M7.8 setup screen into the loader.
+/// `Default` reproduces the pre-M7.8 behaviour (house from `[Basic] Player=`,
+/// own colour, classic DOME radar gating), so the existing loaders are unchanged.
+#[derive(Clone, Copy, Debug)]
+pub struct SkirmishSettings {
+    /// Starting credits for both houses.
+    pub credits: i32,
+    /// AI difficulty.
+    pub difficulty: ra_sim::Difficulty,
+    /// Override the player house (else derived from `[Basic] Player=`, def Greece).
+    pub player_house: Option<u8>,
+    /// House index whose colour-remap paints the player's units (else the player
+    /// house's own colour).
+    pub color_house: Option<u8>,
+    /// Classic radar rules: `true` = authentic DOME power-gating (default),
+    /// `false` = always-on radar.
+    pub classic_radar: bool,
+}
+
+impl Default for SkirmishSettings {
+    fn default() -> SkirmishSettings {
+        SkirmishSettings {
+            credits: 5000,
+            difficulty: ra_sim::Difficulty::Normal,
+            player_house: None,
+            color_house: None,
+            classic_radar: true,
+        }
+    }
+}
+
 /// Load an M6 skirmish from the archives under `dir`. `difficulty` tunes the AI.
 pub fn load_skirmish_from_dir(
     dir: &Path,
@@ -1199,10 +1249,8 @@ pub fn load_skirmish_from_dir(
     )
 }
 
-/// Build the skirmish from in-memory archives: terrain/palette/remaps + the
-/// starter catalog + ore (growing), the shroud enabled, and two houses (the
-/// `[Basic] Player=` house vs an AI house) each seeded with an MCV at a
-/// multiplayer start waypoint.
+/// Back-compat wrapper (pre-M7.8 signature): credits + difficulty, everything
+/// else default.
 pub fn load_skirmish_from_bytes(
     main_bytes: &[u8],
     redalert_bytes: &[u8],
@@ -1210,19 +1258,40 @@ pub fn load_skirmish_from_bytes(
     starting_credits: i32,
     difficulty: ra_sim::Difficulty,
 ) -> Result<SkirmishGame, Box<dyn Error>> {
+    let ini_text = scenario_text_from_archive(main_bytes, scenario_name)?;
+    load_skirmish_configured(
+        main_bytes,
+        redalert_bytes,
+        &ini_text,
+        &SkirmishSettings {
+            credits: starting_credits,
+            difficulty,
+            ..SkirmishSettings::default()
+        },
+    )
+}
+
+/// Build the skirmish from a scenario INI's **text** and the in-memory archives:
+/// terrain/palette/remaps + the starter catalog + ore (growing), the shroud
+/// enabled, and two houses (the chosen or `[Basic] Player=` house vs an AI house)
+/// each seeded with an MCV at a multiplayer start waypoint. M7.8: honours
+/// [`SkirmishSettings`] (player house, colour, credits, difficulty, radar mode).
+/// Taking the INI text (not an archive name) lets user-map files load identically.
+pub fn load_skirmish_configured(
+    main_bytes: &[u8],
+    redalert_bytes: &[u8],
+    scenario_ini_text: &str,
+    settings: &SkirmishSettings,
+) -> Result<SkirmishGame, Box<dyn Error>> {
     let main = MixArchive::parse(main_bytes)?;
     let redalert = MixArchive::parse(redalert_bytes)?;
 
-    let loaded = load_from_bytes(main_bytes, redalert_bytes, scenario_name)?;
+    let loaded = load_from_text(main_bytes, redalert_bytes, scenario_ini_text)?;
     let raster = rasterize(&loaded.scenario, &loaded.tiles);
     let palette = loaded.palette;
     let scenario = loaded.scenario;
 
-    let general = main.open_nested("general.mix")?;
-    let ini_bytes = general
-        .get(scenario_name)
-        .ok_or_else(|| format!("scenario '{scenario_name}' not found"))?;
-    let scen_ini = Ini::parse(&String::from_utf8_lossy(ini_bytes));
+    let scen_ini = Ini::parse(scenario_ini_text);
 
     let local = redalert.open_nested("local.mix")?;
     let rules = Ini::parse(&String::from_utf8_lossy(
@@ -1236,12 +1305,15 @@ pub fn load_skirmish_from_bytes(
         None => vec![identity_remap(); HOUSE_COUNT],
     };
 
-    // Player house from [Basic] Player (default Greece=1); AI is a distinct
-    // house (USSR=2, or Spain=0 if the player already is USSR).
-    let player_house = scen_ini
-        .get("Basic", "Player")
-        .and_then(house_from_name)
-        .unwrap_or(1);
+    // Player house: the setup screen's choice wins; else [Basic] Player (default
+    // Greece=1). The AI takes a distinct house (USSR=2, or Spain=0 if the player
+    // already is USSR).
+    let player_house = settings.player_house.unwrap_or_else(|| {
+        scen_ini
+            .get("Basic", "Player")
+            .and_then(house_from_name)
+            .unwrap_or(1)
+    });
     let ai_house = if player_house == 2 { 0 } else { 2 };
 
     let conquer = main.open_nested("conquer.mix")?;
@@ -1251,13 +1323,13 @@ pub fn load_skirmish_from_bytes(
     let grid = make_passability(&scenario, &loaded.tiles, &rules);
     let mut world = World::new(grid, 0x1234_5678);
     world.set_catalog(content.catalog.clone());
-    world.init_houses(HOUSE_COUNT, starting_credits);
+    world.init_houses(HOUSE_COUNT, settings.credits);
     world.set_ore(OreField::from_overlay(128, 128, &scenario.overlay));
     world.enable_shroud();
     let (grows, spreads) = ore_growth_flags(&rules);
     world.set_ore_growth(grows, spreads);
     world.set_player_house(player_house);
-    world.set_ai(vec![ra_sim::AiPlayer::new(ai_house, difficulty)]);
+    world.set_ai(vec![ra_sim::AiPlayer::new(ai_house, settings.difficulty)]);
 
     // Two well-separated starts, preferring multiplayer waypoints.
     let (player_start, ai_start) = pick_two_starts(&world, &scenario, &scen_ini);
@@ -1281,11 +1353,21 @@ pub fn load_skirmish_from_bytes(
     spawn_mcv(&mut world, player_house, player_start);
     spawn_mcv(&mut world, ai_house, ai_start);
 
+    // Player colour choice: paint the player's units with the chosen house's
+    // remap (captured before `remaps` is moved into the core).
+    let player_color = settings
+        .color_house
+        .and_then(|c| remaps.get(c as usize).copied());
+
     let mut core = AppCore::with_sim(raster, palette, world, content.unit_sprites, remaps);
     core.set_building_sprites(content.building_sprites);
     core.set_building_overlays(content.building_overlays);
     core.set_infantry_anim(content.infantry_anim.clone());
     core.enable_sidebar(player_house, content.buildables.clone());
+    core.set_classic_radar(settings.classic_radar);
+    if let Some(table) = player_color {
+        core.set_house_remap(player_house, table);
+    }
 
     // M7 cosmetic art: ore/gem tiles, explosion + buildup anims, cameos, radar.
     let theater_mix = main.open_nested(scenario.theater.mix_name()).ok();
@@ -1498,4 +1580,236 @@ pub fn weapon_to_profile(w: &WeaponDef) -> ra_sim::WeaponProfile {
         min_damage: w.min_damage,
         max_damage: w.max_damage,
     }
+}
+
+// ===========================================================================
+// M7.8 menu: map scanning + a factory that builds games from the archives.
+// ===========================================================================
+
+/// Parse the map-list metadata from a scenario INI text: `(name, players,
+/// width, height)`. Player count is the number of start waypoints (`[Waypoints]`
+/// indices `< 8`), defaulting to 2 when absent.
+fn scenario_meta(ini_text: &str) -> (String, u8, u32, u32) {
+    let ini = Ini::parse(ini_text);
+    let name = ini
+        .get("Basic", "Name")
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_default();
+    let width = ini.get_int("Map", "Width").unwrap_or(0).max(0) as u32;
+    let height = ini.get_int("Map", "Height").unwrap_or(0).max(0) as u32;
+    let players = ini
+        .section_entries("Waypoints")
+        .map(|e| {
+            e.iter()
+                .filter_map(|(k, _)| k.parse::<u32>().ok())
+                .filter(|&i| i < 8)
+                .count()
+        })
+        .unwrap_or(0);
+    let players = if players == 0 { 2 } else { players.min(8) } as u8;
+    (name, players, width, height)
+}
+
+/// Build a small 1px-per-cell terrain preview over a scenario's playable rect, by
+/// sampling the centre pixel of each cell in the rasterized map. Returns an empty
+/// image (a placeholder is drawn by the menu) if the terrain can't be rendered.
+fn preview_from_raster(raster: &IndexedImage, palette: &Palette, s: &Scenario) -> RgbaImage {
+    const CELL: u32 = 24; // ICON_WIDTH
+    let pw = (s.map_width as u32).clamp(1, 128);
+    let ph = (s.map_height as u32).clamp(1, 128);
+    let mut pixels = vec![0u8; (pw * ph * 4) as usize];
+    for cy in 0..ph {
+        for cx in 0..pw {
+            let mx = (s.map_x as u32 + cx) * CELL + CELL / 2;
+            let my = (s.map_y as u32 + cy) * CELL + CELL / 2;
+            let idx = if mx < raster.width && my < raster.height {
+                raster.pixels[(my * raster.width + mx) as usize]
+            } else {
+                0
+            };
+            let rgb = palette[idx as usize];
+            let di = ((cy * pw + cx) * 4) as usize;
+            pixels[di] = rgb[0];
+            pixels[di + 1] = rgb[1];
+            pixels[di + 2] = rgb[2];
+            pixels[di + 3] = 255;
+        }
+    }
+    RgbaImage {
+        width: pw,
+        height: ph,
+        pixels,
+    }
+}
+
+/// Render a map preview from a scenario INI text (best effort; empty on failure).
+fn render_preview(main_bytes: &[u8], redalert_bytes: &[u8], ini_text: &str) -> RgbaImage {
+    match load_from_text(main_bytes, redalert_bytes, ini_text) {
+        Ok(loaded) => {
+            let raster = rasterize(&loaded.scenario, &loaded.tiles);
+            preview_from_raster(&raster, &loaded.palette, &loaded.scenario)
+        }
+        Err(_) => RgbaImage {
+            width: 0,
+            height: 0,
+            pixels: Vec::new(),
+        },
+    }
+}
+
+/// Scan general.mix for multiplayer scenario INIs (`scm*.ini`). The MIX indexes
+/// by name-hash (there is no directory), so we probe the standard RA multiplayer
+/// naming space (`scmNN<t><v>.ini`) and keep every name that resolves.
+pub fn scan_archive_maps(main_bytes: &[u8], redalert_bytes: &[u8]) -> Vec<MapEntry> {
+    let mut out = Vec::new();
+    let Ok(main) = MixArchive::parse(main_bytes) else {
+        return out;
+    };
+    let Ok(general) = main.open_nested("general.mix") else {
+        return out;
+    };
+    let mut seen = std::collections::BTreeSet::new();
+    for n in 1..=99u32 {
+        // Theater letter (e/t/i/s/w/a…) then variant (a..d) — covers the shipped
+        // multiplayer set (scm01ea, scm02ea, …) plus theater/variant siblings.
+        for t in ['e', 'a', 't', 'i', 's', 'w', 'u'] {
+            for v in ['a', 'b', 'c', 'd'] {
+                let fname = format!("scm{n:02}{t}{v}.ini");
+                if seen.contains(&fname) {
+                    continue;
+                }
+                let Some(bytes) = general.get(&fname) else {
+                    continue;
+                };
+                seen.insert(fname.clone());
+                let text = String::from_utf8_lossy(bytes).into_owned();
+                let (name, players, w, h) = scenario_meta(&text);
+                let preview = render_preview(main_bytes, redalert_bytes, &text);
+                out.push(MapEntry {
+                    name: if name.is_empty() { fname.clone() } else { name },
+                    filename: fname,
+                    players,
+                    width: w,
+                    height: h,
+                    source: MapSource::Archive,
+                    preview,
+                });
+            }
+        }
+    }
+    out
+}
+
+/// Scan a user maps folder for `*.ini` / `*.mpr` scenario files. Each becomes a
+/// [`MapEntry`] with metadata + a terrain preview (theater art from the archives).
+pub fn scan_user_maps(main_bytes: &[u8], redalert_bytes: &[u8], dir: &Path) -> Vec<MapEntry> {
+    let mut out = Vec::new();
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return out;
+    };
+    for entry in rd.flatten() {
+        let path = entry.path();
+        let ext_ok = path
+            .extension()
+            .map(|e| {
+                let e = e.to_ascii_lowercase();
+                e == "ini" || e == "mpr"
+            })
+            .unwrap_or(false);
+        if !ext_ok {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let fname = path
+            .file_name()
+            .map(|f| f.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let (name, players, w, h) = scenario_meta(&text);
+        let preview = render_preview(main_bytes, redalert_bytes, &text);
+        out.push(MapEntry {
+            name: if name.is_empty() { fname.clone() } else { name },
+            filename: fname,
+            players,
+            width: w,
+            height: h,
+            source: MapSource::User,
+            preview,
+        });
+    }
+    out.sort_by(|a, b| a.filename.cmp(&b.filename));
+    out
+}
+
+/// A [`GameFactory`] backed by the loaded archives (+ an optional user maps dir),
+/// used by the shell and the M7.8 verification harness.
+pub struct ArchiveFactory {
+    main_bytes: Vec<u8>,
+    redalert_bytes: Vec<u8>,
+    user_dir: Option<std::path::PathBuf>,
+}
+
+impl ArchiveFactory {
+    /// Wrap already-read archive bytes.
+    pub fn new(
+        main_bytes: Vec<u8>,
+        redalert_bytes: Vec<u8>,
+        user_dir: Option<std::path::PathBuf>,
+    ) -> ArchiveFactory {
+        ArchiveFactory {
+            main_bytes,
+            redalert_bytes,
+            user_dir,
+        }
+    }
+
+    /// Resolve a scenario's INI text: the archive first, then the user maps dir.
+    fn scenario_text(&self, filename: &str) -> Result<String, String> {
+        if let Ok(t) = scenario_text_from_archive(&self.main_bytes, filename) {
+            return Ok(t);
+        }
+        if let Some(dir) = &self.user_dir {
+            if let Ok(t) = std::fs::read_to_string(dir.join(filename)) {
+                return Ok(t);
+            }
+        }
+        Err(format!(
+            "scenario '{filename}' not found in archive or user maps"
+        ))
+    }
+}
+
+impl GameFactory for ArchiveFactory {
+    fn build(&self, res: &ResolvedSkirmish) -> Result<(AppCore, CellCoord), String> {
+        let settings = SkirmishSettings {
+            credits: res.credits,
+            difficulty: res.difficulty,
+            player_house: Some(res.player_house),
+            color_house: Some(res.color_house),
+            classic_radar: res.classic_radar,
+        };
+        let text = self.scenario_text(&res.map_filename)?;
+        let game =
+            load_skirmish_configured(&self.main_bytes, &self.redalert_bytes, &text, &settings)
+                .map_err(|e| e.to_string())?;
+        Ok((game.core, game.player_start))
+    }
+}
+
+/// Load the menu: read the archives under `dir`, scan archive + user maps, and
+/// return the map list plus a factory to build games from selections.
+pub fn load_menu(dir: &Path) -> Result<(Vec<MapEntry>, ArchiveFactory), Box<dyn Error>> {
+    let main_bytes =
+        std::fs::read(dir.join("main.mix")).map_err(|e| format!("reading main.mix: {e}"))?;
+    let redalert_bytes = std::fs::read(dir.join("redalert.mix"))
+        .map_err(|e| format!("reading redalert.mix: {e}"))?;
+    let user_dir = crate::platform::user_maps_dir();
+    let mut maps = scan_archive_maps(&main_bytes, &redalert_bytes);
+    if let Some(ud) = &user_dir {
+        maps.extend(scan_user_maps(&main_bytes, &redalert_bytes, ud));
+    }
+    let factory = ArchiveFactory::new(main_bytes, redalert_bytes, user_dir);
+    Ok((maps, factory))
 }

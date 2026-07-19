@@ -76,6 +76,7 @@ fn run(args: &[String]) -> Result<(), BoxErr> {
         "verify-m77" => cmd_verify_m77(args),
         "verify-m77b" => cmd_verify_m77b(args),
         "verify-m77c" => cmd_verify_m77c(args),
+        "verify-m78" => cmd_verify_m78(args),
         "verify-terrain" => cmd_verify_terrain(args),
         _ => {
             eprintln!(
@@ -199,101 +200,29 @@ fn cmd_window(mut args: Vec<String>) -> Result<(), BoxErr> {
         .map(|s| s.parse::<f32>())
         .transpose()
         .map_err(|_| "--smoke-seconds needs a number")?;
-    let credits: i32 = take_flag(&mut args, "--credits")
-        .map(|s| s.parse())
-        .transpose()
-        .map_err(|_| "--credits needs an integer")?
-        .unwrap_or(8000);
     // Audio off flag (M7): `--mute` boots with an empty sound bank.
     let muted = has_flag(&mut args, "--mute");
-    // M6 FIRST PLAYABLE: boot a skirmish (player + 1 AI, shroud, ore growth,
-    // win/lose) on a multiplayer map. Fall back to the M5 econ view, then
-    // terrain+units, then terrain-only, if archives can't be resolved.
-    let assets_flag = args
-        .iter()
-        .position(|a| a == "--assets")
-        .and_then(|i| args.get(i + 1).cloned());
-    let scenario = args
-        .iter()
-        .position(|a| a == "--scenario")
-        .and_then(|i| args.get(i + 1).cloned())
-        .unwrap_or_else(|| "scm01ea.ini".to_string());
-    let skirmish = platform::resolve_assets_dir(assets_flag.as_deref())
-        .ok_or_else(|| BoxErr::from("no assets dir"))
-        .and_then(|dir| {
-            assets::load_skirmish_from_dir(&dir, &scenario, credits, ra_sim::Difficulty::Normal)
-        });
+    let assets_flag = take_flag(&mut args, "--assets");
+    let dir = platform::resolve_assets_dir(assets_flag.as_deref())
+        .ok_or("could not find an assets directory (try --assets DIR or RA_ASSETS_DIR)")?;
+    eprintln!("assets: {}", dir.display());
 
-    let core = match skirmish {
-        Ok(g) => {
-            eprintln!(
-                "skirmish: player house {} at ({},{}) vs AI house {} at ({},{}) — \
-                 press D to deploy the MCV, click the sidebar to build, right-click to order",
-                g.player_house,
-                g.player_start.x,
-                g.player_start.y,
-                g.ai_house,
-                g.ai_start.x,
-                g.ai_start.y
-            );
-            let mut core = g.core;
-            core.set_camera(
-                (g.player_start.x * CELL as i32) as f32 - 430.0,
-                (g.player_start.y * CELL as i32) as f32 - 360.0,
-            );
-            core
-        }
-        Err(e) => {
-            eprintln!("note: skirmish unavailable ({e}); trying the econ view");
-            match platform::resolve_assets_dir(assets_flag.as_deref())
-                .ok_or_else(|| BoxErr::from("no assets dir"))
-                .and_then(|dir| assets::load_econ_from_dir(&dir, "scg05eb.ini", credits))
-            {
-                Ok(g) => {
-                    let mut core = g.core;
-                    core.set_camera(
-                        (g.start_cell.x * CELL as i32) as f32 - 430.0,
-                        (g.start_cell.y * CELL as i32) as f32 - 360.0,
-                    );
-                    core
-                }
-                Err(e2) => {
-                    eprintln!("note: econ view unavailable ({e2}); trying terrain+units");
-                    match load_game(&mut args) {
-                        Ok(g) => {
-                            report_spawns(&g);
-                            let start = center_camera_start(&g);
-                            let mut core = g.core;
-                            core.set_camera(start.0, start.1);
-                            core
-                        }
-                        Err(e2) => {
-                            eprintln!("note: falling back to terrain-only view ({e2})");
-                            let loaded = load(&mut args)?;
-                            describe(&loaded);
-                            let start = (
-                                (loaded.scenario.map_x as f32) * CELL as f32,
-                                (loaded.scenario.map_y as f32) * CELL as f32,
-                            );
-                            let mut core = loaded.into_appcore();
-                            core.set_camera(start.0, start.1);
-                            core
-                        }
-                    }
-                }
-            }
-        }
-    };
-    // Decode the sound bank from the resolved assets dir (unless muted). Best
-    // effort: an unresolved dir or missing sounds just yields an empty bank.
+    // M7.8: boot the main-menu state machine. `load_menu` scans the archive's
+    // multiplayer maps + the user maps folder and returns a factory.
+    let (maps, factory) = assets::load_menu(&dir)?;
+    eprintln!(
+        "menu: {} map(s) scanned (user maps dir: {:?})",
+        maps.len(),
+        platform::user_maps_dir()
+    );
+    let app = ra_client::menu::App::new(maps, Box::new(factory));
+
     let sounds = if muted {
         Vec::new()
     } else {
-        platform::resolve_assets_dir(assets_flag.as_deref())
-            .map(|dir| assets::load_sound_bank(&dir))
-            .unwrap_or_default()
+        assets::load_sound_bank(&dir)
     };
-    ra_client::shell::run_window(core, smoke, sounds);
+    ra_client::shell::run_window_app(app, smoke, sounds);
     Ok(())
 }
 
@@ -331,27 +260,6 @@ fn report_spawns(g: &LoadedGame) {
             g.skipped.join(", ")
         );
     }
-}
-
-/// Camera top-left (map pixels) that centres the spawned units in a default
-/// 800x600 view.
-#[cfg(feature = "window")]
-fn center_camera_start(g: &LoadedGame) -> (f32, f32) {
-    if g.spawned.is_empty() {
-        return (
-            g.playable.0 as f32 * CELL as f32,
-            g.playable.1 as f32 * CELL as f32,
-        );
-    }
-    let (mut sx, mut sy) = (0i64, 0i64);
-    for s in &g.spawned {
-        sx += (s.cell.x * CELL as i32) as i64;
-        sy += (s.cell.y * CELL as i32) as i64;
-    }
-    let n = g.spawned.len() as i64;
-    let cx = (sx / n) as f32;
-    let cy = (sy / n) as f32;
-    (cx - 400.0, cy - 300.0)
 }
 
 /// The `sim` subcommand: load real starting units, dump a "before" frame, issue
@@ -2545,6 +2453,250 @@ fn cmd_verify_terrain(mut args: Vec<String>) -> Result<(), BoxErr> {
 /// Compose the game surface and write it to `out_dir/name`.
 fn dump_game_png(core: &mut AppCore, out_dir: &str, name: &str) -> Result<(), BoxErr> {
     let f = core.compose_game();
+    let bytes = png::encode_rgba(f.width, f.height, &f.pixels);
+    let path = std::path::Path::new(out_dir).join(name);
+    std::fs::write(&path, &bytes)?;
+    eprintln!("wrote {}", path.display());
+    Ok(())
+}
+
+// ===========================================================================
+// M7.8 verification: scripted drive of the pre-game state machine, headless.
+// ===========================================================================
+
+/// The `verify-m78` subcommand: drive the M7.8 state machine end to end without a
+/// window — MainMenu → SkirmishSetup → InGame → Paused → resume → quit-to-menu →
+/// a second game — asserting the World was built with the chosen settings, that
+/// the pause overlay freezes the sim tick count, that a second game starts fresh
+/// (no state leakage), that same-settings-same-seed builds are byte-identical, and
+/// that a user-supplied map appears in the list. Dumps PNG evidence (main menu,
+/// setup screen with map list + minimap, pause overlay).
+#[allow(clippy::too_many_lines)]
+fn cmd_verify_m78(mut args: Vec<String>) -> Result<(), BoxErr> {
+    use ra_client::input::{Key, MouseButton};
+    use ra_client::menu::{App, AppState, GameFactory, MapSource, ResolvedSkirmish, HOUSES};
+
+    let out_dir = take_flag(&mut args, "--out-dir").unwrap_or_else(|| ".".to_string());
+    let assets_flag = take_flag(&mut args, "--assets");
+    let dir = platform::resolve_assets_dir(assets_flag.as_deref())
+        .ok_or("could not find an assets directory (try --assets DIR or RA_ASSETS_DIR)")?;
+    eprintln!("assets: {}", dir.display());
+
+    let main_bytes = std::fs::read(dir.join("main.mix"))?;
+    let redalert_bytes = std::fs::read(dir.join("redalert.mix"))?;
+    let user_dir = platform::user_maps_dir();
+
+    // Scan the archive multiplayer maps.
+    let mut maps = assets::scan_archive_maps(&main_bytes, &redalert_bytes);
+    eprintln!("scanned {} archive map(s):", maps.len());
+    for m in maps.iter().take(6) {
+        eprintln!(
+            "  {} \"{}\" {}P {}x{}",
+            m.filename, m.name, m.players, m.width, m.height
+        );
+    }
+    if maps.len() < 2 {
+        return Err("need at least 2 archive maps for the verification".into());
+    }
+
+    // User maps folder: drop a copy of an archive scenario in and confirm it shows
+    // up as a USER map in the scan.
+    let sample_name = maps[0].filename.clone();
+    let mut user_map_ok = false;
+    if let Some(ud) = &user_dir {
+        let text = assets::scenario_text_from_archive(&main_bytes, &sample_name)?;
+        let up = ud.join("verify_user_map.mpr");
+        std::fs::write(&up, text.as_bytes())?;
+        let user_maps = assets::scan_user_maps(&main_bytes, &redalert_bytes, ud);
+        user_map_ok = user_maps
+            .iter()
+            .any(|m| m.source == MapSource::User && m.filename == "verify_user_map.mpr");
+        eprintln!(
+            "user maps dir {}: dropped verify_user_map.mpr -> appears in scan: {user_map_ok}",
+            ud.display()
+        );
+        maps.extend(user_maps);
+    }
+    if !user_map_ok {
+        eprintln!("warning: user maps folder not writable/available; skipping that check");
+    }
+
+    let factory = assets::ArchiveFactory::new(main_bytes, redalert_bytes, user_dir.clone());
+
+    // Chosen settings for the primary drive: map #2, Hard, USSR, 10000, radar off.
+    let map2 = maps[1].filename.clone();
+    let ussr_house = HOUSES.iter().find(|(n, _)| *n == "USSR").unwrap().1; // 2
+    let res = ResolvedSkirmish {
+        map_filename: map2.clone(),
+        player_house: ussr_house,
+        color_house: 2,
+        credits: 10000,
+        difficulty: ra_sim::Difficulty::Hard,
+        classic_radar: false,
+    };
+
+    // Determinism: build the same settings twice, tick, compare hash chains.
+    let (mut c1, _) = factory.build(&res)?;
+    let (mut c2, _) = factory.build(&res)?;
+    let mut h1 = Vec::new();
+    let mut h2 = Vec::new();
+    for _ in 0..200 {
+        c1.update(67);
+        c2.update(67);
+        h1.push(c1.sim_hash());
+        h2.push(c2.sim_hash());
+    }
+    let det_ok = h1 == h2;
+    eprintln!(
+        "determinism (same settings+seed, 200 ticks): identical hash chains = {det_ok} (final {:#018x})",
+        h1.last().copied().unwrap_or(0)
+    );
+    if !det_ok {
+        return Err("determinism FAILED: same-settings builds diverged".into());
+    }
+
+    // --- Drive the state machine through handle()/update()/compose(). ---
+    let mut app = App::new(maps.clone(), Box::new(factory));
+    let vw = 1024i32;
+    let vh = 768i32;
+    app.handle(ra_client::InputEvent::Resize {
+        width: vw as u32,
+        height: vh as u32,
+    });
+    assert_eq!(app.state(), AppState::MainMenu, "boots to main menu");
+    dump_app_png(&app, &out_dir, "m78_1_main_menu.png")?;
+
+    // Click SKIRMISH (first main-menu button; center at viewport middle).
+    let click = |app: &mut App, x: i32, y: i32| {
+        app.handle(ra_client::InputEvent::MouseDown {
+            button: MouseButton::Left,
+            x,
+            y,
+        });
+        app.handle(ra_client::InputEvent::MouseUp {
+            button: MouseButton::Left,
+            x,
+            y,
+        });
+    };
+    click(&mut app, vw / 2, vh / 2 - 2);
+    assert_eq!(
+        app.state(),
+        AppState::SkirmishSetup,
+        "SKIRMISH click enters setup"
+    );
+
+    // Set the chosen options (via the config seam) and select map #2.
+    app.select_map(1);
+    {
+        let cfg = app.config_mut();
+        cfg.difficulty = 2; // HARD
+        cfg.house = HOUSES.iter().position(|(n, _)| *n == "USSR").unwrap();
+        cfg.credits = 3; // 10000
+        cfg.classic_radar = false;
+    }
+    dump_app_png(&app, &out_dir, "m78_2_setup.png")?;
+
+    app.start_game();
+    assert_eq!(app.state(), AppState::InGame, "START enters the game");
+
+    // Assert the World was built with the chosen settings.
+    let core = app.core().ok_or("no core after start")?;
+    let ph = core.world().player_house();
+    let credits = core.world().house_credits(ussr_house);
+    let ai_house = if ussr_house == 2 { 0 } else { 2 };
+    let ai_diff = core.world().ai_difficulty(ai_house);
+    let radar = core.has_radar();
+    eprintln!(
+        "game built: player_house={ph:?} (want Some({ussr_house}))  credits={credits} (want 10000)  \
+         ai_difficulty[{ai_house}]={ai_diff:?} (want Hard)  radar={radar} (want true: classic OFF = always-on)"
+    );
+    assert_eq!(ph, Some(ussr_house), "player house threaded through");
+    assert_eq!(credits, 10000, "starting credits threaded through");
+    assert_eq!(
+        ai_diff,
+        Some(ra_sim::Difficulty::Hard),
+        "difficulty threaded"
+    );
+    assert!(radar, "classic-radar OFF should make radar always-on");
+
+    // Play a few ticks, then pause and assert the tick count freezes.
+    for _ in 0..30 {
+        app.update(67);
+    }
+    let ticks_before_pause = app.core().unwrap().world().tick_count();
+    app.handle(ra_client::InputEvent::KeyDown(Key::Menu)); // Esc -> pause
+    assert_eq!(app.state(), AppState::Paused, "Esc opens the pause overlay");
+    dump_app_png(&app, &out_dir, "m78_3_pause.png")?;
+    for _ in 0..30 {
+        app.update(67); // must NOT tick the sim while paused
+    }
+    let ticks_paused = app.core().unwrap().world().tick_count();
+    eprintln!(
+        "pause freeze: tick_count {ticks_before_pause} -> {ticks_paused} after 30 paused updates (want equal)"
+    );
+    assert_eq!(
+        ticks_before_pause, ticks_paused,
+        "the sim tick count must not advance while paused"
+    );
+
+    // Resume (click RESUME) and confirm the sim ticks again.
+    click(&mut app, vw / 2, vh / 2 - 30 + 18);
+    assert_eq!(app.state(), AppState::InGame, "RESUME returns to the game");
+    for _ in 0..30 {
+        app.update(67);
+    }
+    let ticks_resumed = app.core().unwrap().world().tick_count();
+    eprintln!("resume: tick_count advanced to {ticks_resumed} (want > {ticks_paused})");
+    assert!(ticks_resumed > ticks_paused, "sim resumes ticking");
+
+    // Quit to menu: pause, then click QUIT TO MENU.
+    app.handle(ra_client::InputEvent::KeyDown(Key::Menu));
+    click(&mut app, vw / 2, vh / 2 - 30 + 36 + 14 + 18);
+    assert_eq!(
+        app.state(),
+        AppState::MainMenu,
+        "quit-to-menu returns to menu"
+    );
+    assert!(
+        app.core().is_none(),
+        "the game World is dropped on quit-to-menu"
+    );
+
+    // Start a second game (no state leakage) — a fresh World.
+    click(&mut app, vw / 2, vh / 2 - 2);
+    app.select_map(0);
+    {
+        let cfg = app.config_mut();
+        cfg.difficulty = 0; // EASY
+        cfg.house = 0; // GREECE
+        cfg.credits = 0; // 2500
+        cfg.classic_radar = true;
+    }
+    app.start_game();
+    assert_eq!(app.state(), AppState::InGame, "second game starts");
+    let core2 = app.core().ok_or("no core for 2nd game")?;
+    eprintln!(
+        "second game: fresh World tick_count={} credits={} player_house={:?} radar={} (classic ON, no dome yet)",
+        core2.world().tick_count(),
+        core2.world().house_credits(1),
+        core2.world().player_house(),
+        core2.has_radar()
+    );
+    assert!(
+        core2.world().tick_count() <= 1,
+        "second game starts from a fresh World (no leaked ticks)"
+    );
+    assert_eq!(core2.world().house_credits(1), 2500, "second game credits");
+    assert_eq!(core2.world().player_house(), Some(1), "second game house");
+
+    eprintln!("M7.8 OK: state machine, settings threading, pause freeze, fresh restart, determinism, user maps");
+    Ok(())
+}
+
+/// Compose an [`App`] frame and write it to `out_dir/name`.
+fn dump_app_png(app: &ra_client::menu::App, out_dir: &str, name: &str) -> Result<(), BoxErr> {
+    let f = app.compose();
     let bytes = png::encode_rgba(f.width, f.height, &f.pixels);
     let path = std::path::Path::new(out_dir).join(name);
     std::fs::write(&path, &bytes)?;

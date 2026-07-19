@@ -17,6 +17,11 @@ pub enum Key {
     Deploy,
     /// Toggle the on-screen controls hint overlay (M7, F1).
     Help,
+    /// Menu / pause key (Escape, M7.8). In-game it opens the pause overlay; in a
+    /// menu it backs out one level.
+    Menu,
+    /// Confirm / activate the focused menu item (Enter, M7.8 keyboard fallback).
+    Confirm,
 }
 
 /// A pointer button. Left drives selection; right issues move orders.

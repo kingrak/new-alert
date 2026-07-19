@@ -116,7 +116,7 @@ pub type Frame = RgbaImage;
 pub const TICKS_PER_SECOND: u64 = 15;
 
 /// Pixels per cell edge in the terrain raster (SHP icon size).
-const CELL_PIXELS: i32 = ICON_WIDTH as i32;
+pub(crate) const CELL_PIXELS: i32 = ICON_WIDTH as i32;
 
 /// Maximum sim ticks stepped in a single [`AppCore::update`] call. Real frames
 /// advance virtual time by ~16 ms (≈¼ tick), so this only bites under a
@@ -310,6 +310,11 @@ pub struct AppCore {
     cameo_sprites: Vec<Option<UnitSprite>>,
     /// Whether the radar minimap panel is drawn in the sidebar (M7).
     radar_enabled: bool,
+    /// "Classic radar rules" override (M7.8 skirmish option). When `true` the
+    /// radar bypasses DOME power-gating and is always on (as long as the sidebar
+    /// radar is enabled) — the "OFF = always-on radar" setup choice. Default
+    /// `false` keeps the authentic DOME gating (QUIRKS Q10).
+    radar_always_on: bool,
     /// Per-column scroll offset (`TopIndex`, `sidebar.h`) for the two-strip
     /// sidebar (M7.7 P6): `[structures, units]`. Index of the first visible row
     /// in each column's item list; clamped so a column never scrolls past its
@@ -389,6 +394,7 @@ impl AppCore {
             cameo_sprites: Vec::new(),
             sidebar_scroll: [0, 0],
             radar_enabled: false,
+            radar_always_on: false,
             sounds: Vec::new(),
             prev_game_over: GameOver::Ongoing,
             prev_low_power: false,
@@ -429,6 +435,25 @@ impl AppCore {
     /// Turn the radar minimap panel on (drawn at the top of the sidebar strip).
     pub fn enable_radar(&mut self) {
         self.radar_enabled = true;
+    }
+
+    /// Set the "classic radar rules" mode (M7.8 skirmish option). `true` keeps the
+    /// authentic DOME power-gating (default); `false` makes the radar always-on
+    /// (bypasses [`Self::has_radar`]'s DOME check). Cosmetic — never touches the
+    /// sim, so it leaves the hash chain identical.
+    pub fn set_classic_radar(&mut self, classic: bool) {
+        self.radar_always_on = !classic;
+    }
+
+    /// Replace the house-colour remap table for a single house (M7.8 player-colour
+    /// choice). Grows the remap vector with identity tables as needed so the index
+    /// is always valid.
+    pub fn set_house_remap(&mut self, house: u8, table: RemapTable) {
+        let i = house as usize;
+        if self.remaps.len() <= i {
+            self.remaps.resize(i + 1, identity_remap());
+        }
+        self.remaps[i] = table;
     }
 
     /// Install building idle sprites, indexed by building type id.
@@ -743,6 +768,7 @@ impl AppCore {
             Key::Down => self.down = down,
             Key::Deploy => {} // handled at the event layer (edge-triggered)
             Key::Help => {}   // handled at the event layer (edge-triggered)
+            Key::Menu | Key::Confirm => {} // menu/pause keys — handled by the App layer
         }
     }
 
@@ -1703,6 +1729,10 @@ impl AppCore {
     pub fn has_radar(&self) -> bool {
         if !self.radar_enabled {
             return false;
+        }
+        // Classic-radar-rules OFF: always on (skip DOME gating).
+        if self.radar_always_on {
+            return true;
         }
         let Some(house) = self.player_house else {
             return false;

@@ -11,6 +11,7 @@ use macroquad::prelude::*;
 
 use crate::appcore::{AppCore, SoundEvent};
 use crate::input::{InputEvent, Key, MouseButton};
+use crate::menu::{App, AppState};
 
 /// Playback volume for cosmetic sound cues (0.0..=1.0). Kept modest so EVA lines
 /// and SFX layer without clipping.
@@ -42,6 +43,156 @@ const ARROWS: [(KeyCode, Key); 4] = [
     (KeyCode::Up, Key::Up),
     (KeyCode::Down, Key::Down),
 ];
+
+/// Run the windowed app driving the full M7.8 state machine ([`App`]): main menu
+/// → skirmish setup → in-game → pause / game-over. A thin adapter — it translates
+/// device input to [`InputEvent`]s (Escape → `Key::Menu`, Enter → `Key::Confirm`),
+/// ticks [`App::update`], plays drained sound cues, and uploads [`App::compose`].
+pub fn run_window_app(app: App, smoke_seconds: Option<f32>, sounds: Vec<(SoundEvent, Vec<u8>)>) {
+    let conf = Conf {
+        window_title: "new-alert — M7.8".to_string(),
+        window_width: 1024,
+        window_height: 768,
+        high_dpi: false,
+        ..Default::default()
+    };
+    macroquad::Window::from_config(conf, amain_app(app, smoke_seconds, sounds));
+}
+
+async fn amain_app(mut app: App, smoke_seconds: Option<f32>, sounds: Vec<(SoundEvent, Vec<u8>)>) {
+    let mut last_size = (0u32, 0u32);
+    let mut last_mouse = (f32::NAN, f32::NAN);
+    let mut elapsed = 0.0f32;
+
+    #[cfg(feature = "audio")]
+    let sound_bank: Vec<(SoundEvent, macroquad::audio::Sound)> = {
+        let mut m = Vec::new();
+        for (ev, wav) in &sounds {
+            if let Ok(s) = macroquad::audio::load_sound_from_bytes(wav).await {
+                m.push((*ev, s));
+            }
+        }
+        m
+    };
+    #[cfg(not(feature = "audio"))]
+    let _ = &sounds;
+
+    loop {
+        let (sw, sh) = (screen_width() as u32, screen_height() as u32);
+        if (sw, sh) != last_size {
+            last_size = (sw, sh);
+            app.handle(InputEvent::Resize {
+                width: sw,
+                height: sh,
+            });
+        }
+
+        for (code, key) in ARROWS {
+            if is_key_pressed(code) {
+                app.handle(InputEvent::KeyDown(key));
+            }
+            if is_key_released(code) {
+                app.handle(InputEvent::KeyUp(key));
+            }
+        }
+
+        let (mx, my) = mouse_position();
+        if (mx, my) != last_mouse {
+            last_mouse = (mx, my);
+            app.handle(InputEvent::MouseMoved {
+                x: mx as i32,
+                y: my as i32,
+            });
+        }
+
+        for (mqbtn, button) in [
+            (macroquad::input::MouseButton::Left, MouseButton::Left),
+            (macroquad::input::MouseButton::Right, MouseButton::Right),
+        ] {
+            if is_mouse_button_pressed(mqbtn) {
+                app.handle(InputEvent::MouseDown {
+                    button,
+                    x: mx as i32,
+                    y: my as i32,
+                });
+            }
+            if is_mouse_button_released(mqbtn) {
+                app.handle(InputEvent::MouseUp {
+                    button,
+                    x: mx as i32,
+                    y: my as i32,
+                });
+            }
+        }
+
+        // In-game-only device keys.
+        if app.state() == AppState::InGame {
+            let (_wx, wheel_y) = mouse_wheel();
+            if wheel_y != 0.0 {
+                if let Some(core) = app.core() {
+                    if core.sidebar_enabled() && mx as i32 >= core.tactical_width() as i32 {
+                        let col = core.sidebar_column_at_x(mx as i32);
+                        app.handle(InputEvent::SidebarScroll {
+                            column: col,
+                            up: wheel_y > 0.0,
+                        });
+                    }
+                }
+            }
+            if is_key_pressed(KeyCode::D) {
+                app.handle(InputEvent::KeyDown(Key::Deploy));
+                app.handle(InputEvent::KeyUp(Key::Deploy));
+            }
+            if is_key_pressed(KeyCode::F1) {
+                app.handle(InputEvent::KeyDown(Key::Help));
+                app.handle(InputEvent::KeyUp(Key::Help));
+            }
+        }
+
+        // Escape = menu/pause/back; Enter = confirm focused menu item.
+        if is_key_pressed(KeyCode::Escape) {
+            app.handle(InputEvent::KeyDown(Key::Menu));
+        }
+        if is_key_pressed(KeyCode::Enter) || is_key_pressed(KeyCode::KpEnter) {
+            app.handle(InputEvent::KeyDown(Key::Confirm));
+        }
+
+        let dt = get_frame_time();
+        elapsed += dt;
+        if let Some(limit) = smoke_seconds {
+            if elapsed >= limit {
+                break;
+            }
+        }
+        app.update((dt * 1000.0) as u32);
+        if app.quit_requested() {
+            break;
+        }
+
+        let cues = app.drain_sounds();
+        #[cfg(feature = "audio")]
+        for ev in cues {
+            if let Some((_, sound)) = sound_bank.iter().find(|(e, _)| *e == ev) {
+                macroquad::audio::play_sound(
+                    sound,
+                    macroquad::audio::PlaySoundParams {
+                        looped: false,
+                        volume: SOUND_VOLUME,
+                    },
+                );
+            }
+        }
+        #[cfg(not(feature = "audio"))]
+        let _ = cues;
+
+        let frame = app.compose();
+        let tex = Texture2D::from_rgba8(frame.width as u16, frame.height as u16, &frame.pixels);
+        tex.set_filter(FilterMode::Nearest);
+        clear_background(BLACK);
+        draw_texture(&tex, 0.0, 0.0, WHITE);
+        next_frame().await;
+    }
+}
 
 async fn amain(mut core: AppCore, smoke_seconds: Option<f32>, sounds: Vec<(SoundEvent, Vec<u8>)>) {
     let mut last_size = (0u32, 0u32);

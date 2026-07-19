@@ -312,20 +312,17 @@ fn silo_cap_boundary_is_exact_no_off_by_one() {
     }
 }
 
-/// FINDING (design gap, not a crash/panic bug): selling a SILO while the
-/// tiberium pool is above the house's *new* (lower) capacity does **not**
-/// reconcile the stored tiberium against the new cap, and does **not**
-/// convert any of it to credits — `remove_building` (`world.rs:1125-1165`)
-/// only reverses power/building-count bookkeeping, it never touches
-/// `house.tiberium`. The sell refund (`apply_sell`, `world.rs:1104-1115`) is
-/// purely `cost * refund_percent / 100`, unrelated to stored resources. So
-/// the over-cap tiberium just sits there, stale, until the **next**
-/// `add_harvest` call (the next harvester delivery) silently clamps it down
-/// to the new capacity — at which point the excess evaporates with **zero**
-/// credit compensation, and nothing in the API surfaces that it happened.
-/// This test pins both halves of that behavior precisely.
+/// Carried fix (a): selling (or destroying) a SILO while the tiberium pool is
+/// above the house's *new* (lower) capacity now reconciles the stored tiberium
+/// **immediately**, at the moment capacity changes — not lazily on the next
+/// harvest tick. `remove_building` recomputes `house_storage_capacity` after the
+/// building drops out of the arena and calls `House::reconcile_capacity`, which
+/// clamps `tiberium` down and **wastes** the excess with no credit refund
+/// (matching the original recomputing `House->Capacity` and clamping
+/// `House->Tiberium` in `HouseClass::Silo_Redraw`/`Adjust_Capacity`). The sell
+/// refund is still purely cost-based, unrelated to stored resources.
 #[test]
-fn selling_a_full_silo_does_not_reconcile_or_convert_stored_tiberium() {
+fn selling_a_full_silo_reconciles_stored_tiberium_immediately_no_refund() {
     let mut w = world(0);
     w.spawn_building(B_PROC, 1, CellCoord::new(10, 10)).unwrap();
     let silo = w.spawn_building(B_SILO, 1, CellCoord::new(20, 10)).unwrap();
@@ -344,28 +341,30 @@ fn selling_a_full_silo_does_not_reconcile_or_convert_stored_tiberium() {
     let cap_after = w.house_capacity(1);
     assert_eq!(cap_after, 1000, "capacity should drop by the SILO's 500");
 
-    // The refund is exactly 150 (SILO cost) * 50% (default refund) = 75 credits
-    // — unrelated to the 1500 stored tiberium.
-    assert_eq!(
-        w.house_credits(1),
-        credits_before + 75,
-        "sell refund is cost-based only, not tiberium-based"
-    );
-
-    // FINDING part 1: the stored tiberium is untouched by the sell itself,
-    // even though it now exceeds the new capacity.
-    assert_eq!(
-        w.houses[1].tiberium, 1500,
-        "FINDING: stale over-cap tiberium is not clamped or refunded at sell time"
-    );
-
-    // FINDING part 2: the very next harvest booking (even a zero-income one)
-    // silently clamps the stale pool down to the new cap, and the difference
-    // (500) simply vanishes — no credit conversion, no waste counter exposed.
-    w.houses[1].add_harvest(0, cap_after);
+    // The over-cap tiberium (1500) is clamped down to the new capacity (1000) at
+    // sell time — the excess 500 is wasted, NOT converted to credits.
     assert_eq!(
         w.houses[1].tiberium, 1000,
-        "FINDING: the next harvest tick quietly deletes the excess 500 with no compensation"
+        "carried fix a: stored tiberium reconciled to the new cap immediately"
+    );
+
+    // The refund is exactly 150 (SILO cost) * 50% (default refund) = 75 credits
+    // — cost-based only, entirely independent of the 500 wasted tiberium.
+    assert_eq!(
+        w.house_credits(1),
+        credits_before + 75 - 500,
+        "sell refund (+75) is cost-based; the 500 over-cap tiberium is lost, not refunded"
+    );
+    // available() == credits(1000-derived) + tiberium(1000): the 500 is gone.
+    assert_eq!(w.houses[1].tiberium, 1000);
+
+    // A subsequent zero-income harvest is now a true no-op — nothing left to
+    // clamp (the reconcile already happened at sell time, not here).
+    let before = w.houses[1].tiberium;
+    w.houses[1].add_harvest(0, cap_after);
+    assert_eq!(
+        w.houses[1].tiberium, before,
+        "no deferred clamp: reconcile is immediate, so the next harvest changes nothing"
     );
 }
 
@@ -648,22 +647,22 @@ fn engineer_damage_only_removes_exactly_one_third_of_max_strength() {
     assert!(!w.units.contains(eng));
 }
 
-/// An engineer ordered onto its **own house's** building is a no-op: no
-/// capture, no damage, and — the notable pin here — the engineer is **not**
-/// consumed (`world.rs:1733-1739`: the friendly-house branch drops the target
-/// and `continue`s *before* reaching the unconditional `world.units.remove`
-/// at the end of the function, which only the capture/damage branches reach).
-/// This directly contradicts the "always consumed" reading a surface glance
-/// at "the engineer is consumed on use either way" (the function's own doc
-/// comment) would suggest — "either way" only covers capture vs. damage, not
-/// the friendly no-op, which is a third, earlier-return path.
+/// Carried fix (b): an engineer ordered onto its **own house's** *damaged*
+/// building **renovates** it — heals it to full strength — and is **consumed**
+/// (`TechnoClass::Renovate`, `techno.cpp:3988`; deletion at the shared terminal
+/// `infantry.cpp:782`). This corrects the earlier no-op-and-survive behavior:
+/// the reference source shows the original engineer *does* mega-repair friendly
+/// buildings (the classic RA mechanic) and is single-use, contradicting the
+/// brief's hypothesis that RA engineers refuse friendly buildings.
 #[test]
-fn engineer_walking_into_a_friendly_building_is_a_no_op_and_survives() {
+fn engineer_renovates_a_damaged_friendly_building_and_is_consumed() {
     let mut w = world(0);
     let bldg = w
         .spawn_building(B_TARGET, 1, CellCoord::new(20, 20))
         .unwrap();
-    let health_before = w.buildings.get(bldg).unwrap().health;
+    let max = w.buildings.get(bldg).unwrap().max_health;
+    // Wound the friendly building so the renovation is observable.
+    w.buildings.get_mut(bldg).unwrap().health = max / 3;
     let eng = spawn_infantry(&mut w, 1, CellCoord::new(19, 20), Facing(0), 25, None);
 
     w.tick(&[Command::Attack {
@@ -673,39 +672,32 @@ fn engineer_walking_into_a_friendly_building_is_a_no_op_and_survives() {
     }]);
     assert_eq!(
         w.buildings.get(bldg).map(|b| b.health),
-        Some(health_before),
-        "friendly building must be untouched"
+        Some(max),
+        "friendly building must be healed to full strength (Renovate)"
     );
-    assert_eq!(w.buildings.get(bldg).map(|b| b.house), Some(1));
-    assert!(
-        w.units.contains(eng),
-        "PIN: the engineer survives a friendly-building no-op (not consumed)"
+    assert_eq!(
+        w.buildings.get(bldg).map(|b| b.house),
+        Some(1),
+        "ownership is unchanged — renovation, not capture"
     );
-
-    // Stays that way indefinitely — no delayed consumption, no delayed effect.
-    for _ in 0..10 {
-        w.tick(&[]);
-    }
-    assert!(w.units.contains(eng), "still alive many ticks later");
-    assert_eq!(w.buildings.get(bldg).unwrap().health, health_before);
     assert!(
-        !w.units.get(eng).unwrap().has_target(),
-        "the dropped order should not silently linger as a target"
+        !w.units.contains(eng),
+        "PIN: the engineer is consumed on a friendly renovation, same as capture/damage"
     );
 }
 
-/// FINDING (design gap, not a crash): a wall (`is_wall = true`) is captured
-/// exactly like any ordinary building — `run_engineers`/`capture_building`
-/// never inspect `is_wall` at all. Whether that's intended (walls are
-/// legitimately "just 1x1 buildings" per the M7.7 Chunk B QUIRKS Q9 model) or
-/// an oversight (capturing a wall segment has no real-RA analogue — engineers
-/// can't capture walls in the original), this pins the actual, current
-/// behavior rather than assuming either way.
+/// Carried fix (c): a wall (`is_wall = true`) is **never** a valid engineer
+/// target. Walls are `OverlayType`s in the original, not `BuildingClass`es, so
+/// `Can_Capture` never applies (it requires `RTTI_BUILDING` + `IsCaptureable`,
+/// `building.cpp:3537`; `object.cpp:421` returns false; wall stubs default
+/// `IsCaptureable=false`, `bdata.cpp:2746`). We model walls as 1×1 buildings
+/// (Q9), so `run_engineers` gates `is_wall` out explicitly: the order is refused
+/// — no capture, no damage — and the engineer is **not** consumed.
 #[test]
-fn engineer_captures_a_wall_exactly_like_any_other_building() {
+fn engineer_cannot_capture_a_wall_and_is_not_consumed() {
     let mut w = world(0);
     let wall = w.spawn_building(B_WALL, 2, CellCoord::new(20, 20)).unwrap();
-    w.buildings.get_mut(wall).unwrap().health = 100; // == max_health/4 exactly, capturable
+    w.buildings.get_mut(wall).unwrap().health = 100; // would be capturable if a building
     let eng = spawn_infantry(&mut w, 1, CellCoord::new(19, 20), Facing(0), 25, None);
 
     w.tick(&[Command::Attack {
@@ -716,12 +708,21 @@ fn engineer_captures_a_wall_exactly_like_any_other_building() {
 
     assert_eq!(
         w.buildings.get(wall).map(|b| b.house),
-        Some(1),
-        "FINDING: a wall flips ownership on capture, no special-casing for is_wall"
+        Some(2),
+        "a wall must NOT flip ownership — engineers can't capture walls"
+    );
+    assert_eq!(
+        w.buildings.get(wall).unwrap().health,
+        100,
+        "wall untouched — no capture, no damage"
     );
     assert!(
-        !w.units.contains(eng),
-        "consumed on capture, same as any building"
+        w.units.contains(eng),
+        "PIN: the engineer is not consumed by a refused wall order"
+    );
+    assert!(
+        !w.units.get(eng).unwrap().has_target(),
+        "the refused order is dropped, not left lingering"
     );
 }
 
@@ -771,22 +772,17 @@ fn medic_heal_clamps_exactly_at_max_health_and_stays_there() {
     assert_eq!(w.units.get(patient).unwrap().health, hp);
 }
 
-/// MEDI never **auto-acquires** a vehicle as a heal target — `is_infantry()`
-/// gates `maybe_acquire_heal_target`'s fresh-acquisition scan (`world.rs:1676`).
-///
-/// FINDING (design gap): that filter only runs on *fresh* acquisition. The
-/// function's "keep the current target" fast path (`world.rs:1662-1669`)
-/// checks only `is_alive() && house == house && health < max_health` — no
-/// `is_infantry()` re-check. So once an explicit `Command::Attack` has set the
-/// medic's target to a friendly, damaged vehicle for one tick, every
-/// subsequent tick's "keep" check happily re-validates that same target
-/// forever (a vehicle is exactly as "keepable" as a wounded infantryman), and
-/// `modify_damage`'s heal branch (`combat.rs:165-169`) itself only checks
-/// `armor == 0` and point-blank distance — it has no infantry-vs-vehicle
-/// concept either. Net effect: a vehicle can never be *acquired* as a heal
-/// target, but once explicitly assigned, it heals exactly like infantry would.
+/// Carried fix (d): a MEDI can neither auto-acquire nor be explicitly ordered to
+/// heal a **vehicle**. Auto-acquire's fresh scan gates on `is_infantry()`
+/// (`world.rs`), and the "keep the current target" fast path now applies the
+/// *same* `is_infantry()` test (the symmetric guard added in fix d). So an
+/// explicit `Command::Attack` onto a friendly vehicle is clobbered back to
+/// `None` the very same tick — identical to the enemy case below. This mirrors
+/// the original, where a medic's scan is `THREAT_INFANTRY`-only and its heal is
+/// nullified against any non-`ARMOR_NONE` (vehicle) target (`techno.cpp:2154`,
+/// `combat.cpp:84`); healing armored units is the separate MECHANIC unit.
 #[test]
-fn medic_never_auto_targets_a_vehicle_but_an_explicit_order_can_still_heal_one() {
+fn medic_never_heals_a_vehicle_even_when_explicitly_ordered() {
     let mut w = world(0);
     let medic = spawn_infantry(
         &mut w,
@@ -814,39 +810,45 @@ fn medic_never_auto_targets_a_vehicle_but_an_explicit_order_can_still_heal_one()
         "the medic should be sitting idle, having found no valid auto target"
     );
 
-    // FINDING: once explicitly assigned, the "keep" fast path lets a
-    // friendly vehicle target survive indefinitely (it is never re-subjected
-    // to the is_infantry() acquisition filter), so it genuinely heals.
+    // An explicit friendly-vehicle order is now clobbered the same tick (fix d):
+    // the "keep" check requires `is_infantry`, fails, falls through to a fresh
+    // scan that finds no infantry, and clears the order to None — no heal.
     w.tick(&[Command::Attack {
         unit: medic,
         target: Target::Unit(vehicle),
         house: 1,
     }]);
-    let hp_after = w.units.get(vehicle).unwrap().health;
-    assert!(
-        hp_after > 10,
-        "FINDING: an explicitly-ordered heal on a friendly vehicle (armor 0) IS effective — \
-         the is_infantry() filter only gates fresh acquisition, not the 'keep the current \
-         target' fast path (hp: 10 -> {hp_after})"
+    assert_eq!(
+        w.units.get(vehicle).unwrap().health,
+        10,
+        "an explicitly-ordered heal on a friendly vehicle must NOT heal it (fix d)"
     );
+    assert!(
+        !w.units.get(medic).unwrap().has_target(),
+        "PIN: the explicit vehicle target is cleared the same tick, symmetric with the enemy case"
+    );
+    // Persists — no delayed heal.
+    for _ in 0..20 {
+        w.tick(&[]);
+    }
+    assert_eq!(w.units.get(vehicle).unwrap().health, 10);
 }
 
 /// MEDI never **auto-acquires** an enemy unit — the house filter in
 /// `maybe_acquire_heal_target`'s acquisition scan (`world.rs:1676`,
 /// `u.house != house`).
 ///
-/// Unlike the vehicle case above, an explicit `Command::Attack` ordering the
-/// medic onto an **enemy** unit does NOT work, and the reason is subtle: the
-/// "keep the current target" fast path (`world.rs:1662-1669`) *does* check
-/// `tu.house == house`, so a just-assigned enemy target fails that check on
-/// the very same tick, falls through to a fresh acquisition scan (which also
-/// excludes non-friendly candidates), finds nothing, and **clobbers the
-/// explicit order back to `None`** before `run_combat` ever gets a chance to
-/// fire — all within the tick the command was issued. So the "no enemy
-/// heals" rule holds, but only as an accidental side effect of the
-/// friendly-only re-validation, not as a deliberate guard on the explicit
-/// order path (contrast with the vehicle case, where the equivalent
-/// re-validation is looser and doesn't catch it).
+/// Symmetric with the vehicle case above (post fix d): an explicit
+/// `Command::Attack` ordering the medic onto an **enemy** unit does NOT heal it.
+/// The "keep the current target" fast path checks `is_infantry` **and**
+/// `tu.house == house` (and alive + wounded), so a just-assigned enemy target
+/// fails on the very same tick, falls through to a fresh acquisition scan (which
+/// also excludes non-friendly / non-infantry candidates), finds nothing, and
+/// **clobbers the explicit order back to `None`** before `run_combat` can fire.
+/// Both invalid explicit orders (friendly vehicle, enemy unit) now behave
+/// identically — a deliberate, symmetric friendly-infantry-only guard, matching
+/// the original medic's `THREAT_INFANTRY`-only, ally-only heal logic
+/// (`techno.cpp:1606`, `techno.cpp:2154`).
 #[test]
 fn medic_explicit_order_to_heal_an_enemy_is_silently_clobbered_back_to_a_no_op() {
     let mut w = world(0);

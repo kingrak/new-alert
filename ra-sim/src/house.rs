@@ -160,6 +160,22 @@ impl House {
         }
     }
 
+    /// Reconcile stored `tiberium` against a (possibly reduced) storage
+    /// `capacity`, discarding any excess. Mirrors the original recomputing
+    /// `House->Capacity` the moment a storage building is added or removed and
+    /// clamping `House->Tiberium` to it (`HouseClass::Silo_Redraw` /
+    /// `Adjust_Capacity`): the over-cap remainder is **lost**, never refunded to
+    /// credits. Returns the amount wasted. No-op when nothing overflows.
+    pub fn reconcile_capacity(&mut self, capacity: i32) -> i32 {
+        if capacity >= 0 && self.tiberium > capacity {
+            let wasted = self.tiberium - capacity;
+            self.tiberium = capacity;
+            wasted
+        } else {
+            0
+        }
+    }
+
     /// Whether the house owns at least one live building of type `id`.
     pub fn owns_building(&self, id: u32) -> bool {
         self.building_counts
