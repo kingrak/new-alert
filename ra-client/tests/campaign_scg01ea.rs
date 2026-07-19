@@ -66,10 +66,10 @@ fn scg01ea_inventory_and_playthrough_to_victory() {
     assert_eq!(mission.triggers, 19, "19 [Trigs] entries");
     assert_eq!(mission.teamtypes, 12, "12 [TeamTypes] entries");
     assert_eq!(mission.infantry_placed, 22, "22 [INFANTRY]");
-    // 25 [STRUCTURES] declared; 18 are real buildings. The other 7 are barrel /
-    // oil-pump props (BARL/BRL3/V19) that have no rules.ini building section, so
-    // they are skipped (documented deferral) rather than placed.
-    assert_eq!(mission.structures_placed, 18, "18 placeable [STRUCTURES]");
+    // All 25 [STRUCTURES] place (18 real buildings + 7 barrel/oil-pump props —
+    // BARL/BRL3/V19, which carry a rules.ini section but no `Cost=`; a cost-less
+    // civilian structure now resolves, M7.5-A audit fix).
+    assert_eq!(mission.structures_placed, 25, "all 25 [STRUCTURES] place");
     assert_eq!(mission.units_placed, 4, "4 [UNITS] (3 jeeps + harvester)");
     assert!(mission.terrain_placed > 0, "some [TERRAIN] trees");
 

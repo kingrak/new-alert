@@ -70,10 +70,12 @@ pub fn footprint(name: &str) -> Option<(u8, u8)> {
         "TSLA" => (1, 2), // tesla coil,          BSIZE_12
         // --- Walls (M7.7 Chunk B) — 1×1 buildable segments ---
         "SBAG" | "CYCL" | "BRIK" => (1, 1),
-        // --- Campaign scenery / neutral structures (M7.5), all BSIZE_11 ---
+        // --- Campaign scenery / neutral structures (M7.5) ---
         "KENN" => (1, 1),          // kennel (BSIZE_11, bdata.cpp)
         "BARL" | "BRL3" => (1, 1), // explosive barrels
         "V19" => (1, 1),           // oil pump / derrick (misc civilian structure)
+        "FCOM" => (2, 2),          // forward command post (BSIZE_22, bdata.cpp:304)
+        "MISS" => (3, 2),          // (tech/missile) mission structure (BSIZE_32, bdata.cpp:2409)
         _ => return None,
     };
     Some((w, h))
@@ -89,14 +91,16 @@ fn parse_prereq(s: &str) -> Vec<String> {
 }
 
 /// Resolve a building type's stats from `rules` by its short name (e.g.
-/// `"POWR"`). Returns `None` if the section is absent, has no `Cost=`, or the
-/// building has no modelled footprint.
+/// `"POWR"`). Returns `None` if the section is absent or the building has no
+/// modelled footprint. A missing `Cost=` defaults to `0` — civilian/scenario
+/// structures (e.g. `MISS`, the chain-link mission) legitimately carry no cost
+/// (they are placed by scenarios, never built), so they must still resolve.
 pub fn building_stats(rules: &Ini, name: &str) -> Option<BuildingStats> {
     if !rules.has_section(name) {
         return None;
     }
     let (foot_w, foot_h) = footprint(name)?;
-    let cost = rules.get_int(name, "Cost")? as i32;
+    let cost = rules.get_int(name, "Cost").unwrap_or(0) as i32;
     let strength = rules
         .get_int(name, "Strength")
         .unwrap_or(1)

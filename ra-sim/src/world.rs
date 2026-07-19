@@ -927,6 +927,11 @@ fn maybe_spring(
         let t = &camp.triggers[i];
         (t.persist, t.event_ctrl, t.action_ctrl)
     };
+    // Destroyed by DESTROY_TRIGGER: suppress ALL evaluation, regardless of
+    // persistence (taction.cpp:568-578 deletes the instance outright).
+    if camp.state[i].destroyed {
+        return;
+    }
     // Already sprung (and not persistent, not a forced re-spring): skip.
     if camp.state[i].sprung && persist != campaign::persist::PERSISTANT && !forced {
         return;
@@ -953,9 +958,13 @@ fn maybe_spring(
         return;
     }
 
-    // Which actions run (trigger.cpp:304-323).
-    let (run_a1, run_a2) = if !forced && ectrl == campaign::multi::LINKED {
-        (e1, e2)
+    // Which actions run (trigger.cpp:301-323). For LINKED, action1 runs iff its
+    // event fired *or the spring was forced*, and action2 iff its event fired
+    // *and it was not forced* — so a **forced** LINKED trigger runs action1 only,
+    // regardless of `action_ctrl` (`if (e1 || forced) Action1; if (e2 && !forced)
+    // Action2;`). Non-LINKED runs action1 always + action2 unless MULTI_ONLY.
+    let (run_a1, run_a2) = if ectrl == campaign::multi::LINKED {
+        (e1 || forced, e2 && !forced)
     } else {
         (true, actctrl != campaign::multi::ONLY)
     };
@@ -974,6 +983,28 @@ fn maybe_spring(
 
     if persist != campaign::persist::PERSISTANT {
         camp.state[i].sprung = true;
+    } else {
+        // A PERSISTANT (or SEMI-with-survivors) trigger is not deleted after
+        // firing; the reference re-arms its events (`Class->Event1.Reset(...)`,
+        // trigger.cpp:355-360 → tevent.cpp:181-187), which for a TIME event resets
+        // its countdown to `Data.Value * (TICKS_PER_MINUTE/10)`. Without this a
+        // PERSISTANT TIME trigger would sit at timer 0 and re-fire every tick;
+        // with it, it fires once per interval.
+        let (e1_time, e1_data, e2_time, e2_data) = {
+            let t = &camp.triggers[i];
+            (
+                t.e1.code == campaign::tevent::TIME,
+                t.e1.data,
+                t.e2.code == campaign::tevent::TIME,
+                t.e2.data,
+            )
+        };
+        if e1_time {
+            camp.state[i].e1_timer = e1_data.max(0) * ticks_per_tenth;
+        }
+        if e2_time {
+            camp.state[i].e2_timer = e2_data.max(0) * ticks_per_tenth;
+        }
     }
 }
 
@@ -1121,7 +1152,10 @@ fn run_action(
         DESTROY_TRIGGER => {
             if a.trigger >= 0 {
                 if let Some(s) = camp.state.get_mut(a.trigger as usize) {
-                    s.sprung = true;
+                    // Delete the target outright (taction.cpp:568-578): stops it
+                    // firing regardless of persistence, unlike setting `sprung`
+                    // (which PERSISTANT triggers ignore).
+                    s.destroyed = true;
                 }
             }
         }

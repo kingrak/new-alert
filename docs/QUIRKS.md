@@ -808,10 +808,12 @@ golden is byte-identical (verified: full suite green, 593→ tests).
    ground movers route around them, but the theater terrain SHP is **not drawn**
    yet (coordinator-sanctioned "occupy + note it"). Occupancy is the must-have
    (movement correctness); the sprite layer is a follow-up.
-5. **Barrel / oil-pump props skipped.** `[STRUCTURES]` entries `BARL`/`BRL3`/`V19`
-   have no rules.ini building section, so they are not placed (7 of scg01ea's 25
-   structure lines; the 18 real buildings all place). `TACTION_DESTROY_OBJECT` on
-   an absent prop is a harmless no-op.
+5. **Cost-less civilian structures.** `[STRUCTURES]` props (`BARL`/`BRL3`/`V19`,
+   and the `MISS`/`FCOM` mission-3 structures) carry a rules.ini section but no
+   `Cost=`; `building_stats` now defaults a missing cost to `0` (a scenario-placed
+   civilian structure is never built, so cost 0 is correct) so they resolve and
+   place with a footprint. All 25 of scg01ea's `[STRUCTURES]` lines now place.
+   (Fixed in the M7.5-A audit; before, the 7 cost-less props were skipped.)
 6. **Alliances are symmetric + collapse extra houses.** `[Basic]/house Allies=`
    builds a symmetric alliance bitmask (`build_alliances`); `World::are_allies`
    gates enemy auto-acquisition (hunt + defense buildings) so allied civilians

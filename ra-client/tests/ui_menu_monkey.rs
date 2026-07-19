@@ -29,8 +29,13 @@ mod support;
 
 use proptest::prelude::*;
 
+use ra_client::compositor::IndexedImage;
 use ra_client::input::{InputEvent, Key, MouseButton};
-use ra_client::menu::AppState;
+use ra_client::menu::{App, AppState, BuiltMission, CampaignEntry, CampaignFactory};
+use ra_client::AppCore;
+use ra_sim::campaign::{taction, tevent};
+use ra_sim::coords::{CellCoord, Facing};
+use ra_sim::{Campaign, MoveStats, Passability, TActionDef, TEventDef, TriggerType, World};
 
 /// One fuzzed operation: either an `InputEvent` or a virtual-time tick, same
 /// shape as `ui_monkey.rs`'s `MonkeyOp` (`AppCore::update`/`App::update`
@@ -105,7 +110,8 @@ fn ops_strategy(len: std::ops::Range<usize>) -> impl Strategy<Value = Vec<Monkey
 }
 
 /// The state-transition graph documented in `menu.rs`'s module doc comment,
-/// as concrete (before, after) edges — see the `menu.rs` ASCII diagram:
+/// as concrete (before, after) edges — see the `menu.rs` ASCII diagram for the
+/// original (pre-campaign) skirmish half:
 ///
 /// ```text
 ///   MainMenu ──Skirmish──▶ SkirmishSetup ──Start──▶ InGame ──Esc──▶ Paused
@@ -120,6 +126,24 @@ fn ops_strategy(len: std::ops::Range<usize>) -> impl Strategy<Value = Vec<Monkey
 /// automatic `InGame -> GameOver` transition in `App::update`. A self-loop
 /// (`before == after`) is always valid and handled by the caller before this
 /// is consulted.
+///
+/// The campaign-flow edges (added for M7.5-A coverage, `menu.rs` line refs as
+/// of this writing):
+/// - `(MainMenu, CampaignList)` — `Action::GotoCampaign` (`activate`, ~line 550).
+/// - `(CampaignList, MainMenu)` — `Action::BackToMenu`, or `Key::Menu` backing
+///   out of `CampaignList` (`handle_menu`, ~line 493).
+/// - `(CampaignList, Briefing)` — `Action::SelectMission(i)` ->
+///   `goto_briefing` (~line 560/575).
+/// - `(Briefing, CampaignList)` — `Action::GotoCampaign` ("BACK" item in
+///   `items_briefing`, ~line 1023), or `Key::Menu` backing out of `Briefing`
+///   (`handle_menu`, ~line 496).
+/// - `(Briefing, InGame)` — `Action::StartMission` -> `start_mission` (~line
+///   561/601).
+/// - `(GameOver, InGame)` — `Action::RetryMission` -> `start_mission(campaign_
+///   current)` (~line 562), only offered on a campaign Defeat (`items_
+///   gameover`, ~line 1194).
+/// - `(GameOver, Briefing)` — `Action::Continue` -> `on_continue`, when
+///   `in_campaign && victory` and another mission remains (~line 645-663).
 fn valid_transition(before: AppState, after: AppState) -> bool {
     use AppState::*;
     matches!(
@@ -131,7 +155,15 @@ fn valid_transition(before: AppState, after: AppState) -> bool {
             | (InGame, GameOver)        // automatic, inside App::update, when core.game_over() != Ongoing
             | (Paused, InGame)          // Resume, or Esc backing out
             | (Paused, MainMenu)        // QuitToMenu
-            | (GameOver, MainMenu) // Continue
+            | (GameOver, MainMenu) // Continue (defeat, or victory + campaign complete, or skirmish)
+            // --- Campaign flow (M7.5-A) ---
+            | (MainMenu, CampaignList)  // GotoCampaign
+            | (CampaignList, MainMenu)  // BackToMenu, or Esc backing out
+            | (CampaignList, Briefing)  // SelectMission(i)
+            | (Briefing, CampaignList)  // GotoCampaign ("BACK"), or Esc backing out
+            | (Briefing, InGame)        // StartMission
+            | (GameOver, InGame)        // RetryMission (campaign defeat only)
+            | (GameOver, Briefing) // Continue after a campaign victory, more missions remain
     )
 }
 
@@ -215,6 +247,156 @@ proptest! {
     #[test]
     fn menu_monkey_never_panics_or_transitions_invalidly(ops in ops_strategy(150..500)) {
         let mut a = support::menu_app();
+        apply_ops(&mut a, &ops);
+    }
+}
+
+// ===========================================================================
+// M7.5-A: monkey coverage extended into CampaignList/Briefing.
+//
+// `support::menu_app()` never installs a `CampaignFactory`, so the CAMPAIGN
+// button is disabled (`items_main_menu`, `menu.rs` ~line 972-976) and the
+// monkey above can never reach `CampaignList`/`Briefing`/the campaign-flavored
+// `GameOver` items (`RetryMission`). This second monkey attaches a tiny
+// 2-mission synthetic campaign so the SAME fuzzed-op machinery above also
+// walks the campaign states — asserting the identical invariants (no panic,
+// `valid_transition`-only state changes, `core().is_some()` gating,
+// `compose()` never zero-sized).
+// ===========================================================================
+
+fn win_lose_trigger(win: bool) -> TriggerType {
+    TriggerType {
+        name: if win { "win" } else { "lose" }.into(),
+        persist: 0, // VOLATILE
+        house: 1,
+        event_ctrl: 0, // ONLY
+        action_ctrl: 0,
+        e1: TEventDef {
+            code: tevent::TIME,
+            team: -1,
+            data: 0,
+        },
+        e2: TEventDef {
+            code: tevent::NONE,
+            team: -1,
+            data: 0,
+        },
+        a1: TActionDef {
+            code: if win { taction::WIN } else { taction::LOSE },
+            team: -1,
+            trigger: -1,
+            data: -1,
+        },
+        a2: TActionDef {
+            code: taction::NONE,
+            team: -1,
+            trigger: -1,
+            data: -1,
+        },
+    }
+}
+
+/// A world that resolves on tick 0: victory (mission 1) or defeat (mission 2)
+/// — see [`MonkeyCampaign`]. Mirrors `ui_campaign_flow.rs`'s
+/// `synth_campaign_world`.
+fn monkey_campaign_world(win: bool) -> World {
+    let mut world = World::new(Passability::all_passable(), 0x5EED_1234);
+    world.init_houses(8, 0);
+    world.set_player_house(1);
+    world.spawn_unit(
+        0,
+        1,
+        CellCoord::new(10, 10),
+        Facing(0),
+        100,
+        MoveStats {
+            max_speed: 20,
+            rot: 8,
+        },
+    );
+    let t = win_lose_trigger(win);
+    let camp = Campaign {
+        triggers: vec![t],
+        teamtypes: Vec::new(),
+        waypoints: vec![-1; 101],
+        globals: vec![false; 8],
+        cell_triggers: Vec::new(),
+        state: vec![ra_sim::campaign::TriggerState::default()],
+        started: false,
+        mission_timer: None,
+        evac_cells: Vec::new(),
+        civ_evacuated: vec![false; 8],
+        reveal_all: false,
+        reveal_cells: Vec::new(),
+        pending_texts: Vec::new(),
+        pending_speech: Vec::new(),
+    };
+    world.set_campaign(camp);
+    world
+}
+
+/// Mission 1 always wins on tick 0 (exercises the victory->next-briefing
+/// `GameOver -> Briefing` edge); mission 2 always loses on tick 0 (exercises
+/// the defeat `RETRY MISSION` -> `GameOver -> InGame` edge). Deterministic by
+/// design so the monkey's random `Update` timings don't matter — one
+/// `update()` past `dt=0` is enough for either trigger to resolve.
+struct MonkeyCampaign;
+impl CampaignFactory for MonkeyCampaign {
+    fn missions(&self) -> Vec<CampaignEntry> {
+        vec![
+            CampaignEntry {
+                scenario: "m1".into(),
+                name: "Monkey One".into(),
+            },
+            CampaignEntry {
+                scenario: "m2".into(),
+                name: "Monkey Two".into(),
+            },
+        ]
+    }
+    fn build(&self, scenario: &str) -> Result<BuiltMission, String> {
+        let win = scenario == "m1";
+        let raster = IndexedImage {
+            width: 8,
+            height: 8,
+            pixels: vec![0u8; 64],
+        };
+        let core = AppCore::with_sim(
+            raster,
+            [[0u8; 3]; 256],
+            monkey_campaign_world(win),
+            Vec::new(),
+            Vec::new(),
+        );
+        Ok(BuiltMission {
+            core,
+            start: CellCoord::new(10, 10),
+            name: if win { "Monkey One" } else { "Monkey Two" }.into(),
+            briefing: format!("Briefing for {scenario}."),
+        })
+    }
+}
+
+fn menu_app_with_campaign() -> App {
+    let mut a = App::new(Vec::new(), Box::new(support::MenuSynthFactory))
+        .with_campaign(Box::new(MonkeyCampaign));
+    a.handle(InputEvent::Resize {
+        width: 1024,
+        height: 768,
+    });
+    a
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(64))]
+
+    /// Same fuzzed-op machinery, campaign-enabled `App` — reaches
+    /// `CampaignList`/`Briefing` (and, when the randomly-focused mission is
+    /// "Monkey Two", the defeat `RetryMission` edge) with no panic and no
+    /// undocumented transition.
+    #[test]
+    fn campaign_menu_monkey_never_panics_or_transitions_invalidly(ops in ops_strategy(150..500)) {
+        let mut a = menu_app_with_campaign();
         apply_ops(&mut a, &ops);
     }
 }

@@ -223,6 +223,11 @@ pub struct TeamType {
 pub struct TriggerState {
     /// Already sprung (a VOLATILE/SEMI trigger fires once). PERSISTANT resets.
     pub sprung: bool,
+    /// Destroyed by `TACTION_DESTROY_TRIGGER` (`taction.cpp:568-578` deletes the
+    /// `TriggerClass` instance outright). Unlike `sprung`, this suppresses **all**
+    /// future evaluation regardless of persistence — a destroyed PERSISTANT
+    /// trigger stops firing.
+    pub destroyed: bool,
     /// Countdown timer for a `TEVENT_TIME` event1 (ticks), `-1` if not a timer.
     pub e1_timer: i32,
     /// Countdown timer for a `TEVENT_TIME` event2.
@@ -309,6 +314,7 @@ impl Campaign {
         }
         for s in &self.state {
             h.write_u8(s.sprung as u8);
+            h.write_u8(s.destroyed as u8);
             h.write_i32(s.e1_timer);
             h.write_i32(s.e2_timer);
             h.write_i32(s.carriers);
