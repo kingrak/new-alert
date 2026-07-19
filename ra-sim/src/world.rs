@@ -1766,10 +1766,20 @@ fn finish_or_retry(world: &mut World, house_idx: usize, kind: ProdKind, prod: Op
         }
         BuildItem::Unit(id) => {
             let house = house_idx as u8;
-            // Infantry exit the barracks; vehicles exit the war factory.
+            // Infantry exit the barracks; vehicles exit the war factory. The exit
+            // ring is searched with the **produced unit's own locomotor** (P0,
+            // M7.7) — a wheeled JEEP/APC/HARV must not be handed a Track-only exit
+            // cell, and the sub-cell-spot rule (not the whole-cell rule) governs a
+            // foot unit's exit — so the exit cell is guaranteed enterable by the
+            // unit that spawns there.
+            let loco = world
+                .catalog
+                .unit(id)
+                .map(|p| loco_from_index(p.locomotor))
+                .unwrap_or(Locomotor::Track);
             let exit = match kind {
                 ProdKind::Infantry => find_barracks_exit(world, house),
-                _ => find_factory_exit(world, house),
+                _ => find_factory_exit(world, house, loco),
             };
             match exit {
                 Some(exit) => {
@@ -1795,8 +1805,8 @@ fn finish_or_retry(world: &mut World, house_idx: usize, kind: ProdKind, prod: Op
 /// scans the footprint's adjacency ring. Deviation: the original exits at
 /// building-specific coordinates via `Exit_Coord`/`Exit_Object`
 /// (`building.cpp:2106`); we use the nearest free adjacent cell instead.
-fn find_factory_exit(world: &World, house: u8) -> Option<CellCoord> {
-    factory_exit_ring(world, house, |b| b.is_war_factory, Locomotor::Track)
+fn find_factory_exit(world: &World, house: u8, loco: Locomotor) -> Option<CellCoord> {
+    factory_exit_ring(world, house, |b| b.is_war_factory, loco)
 }
 
 /// A free passable cell adjacent to the house's barracks for a completed
@@ -1828,10 +1838,13 @@ fn factory_exit_ring(
         if !world.passable.is_passable_loco(c, loco) {
             return false;
         }
+        // Co-occupancy rule (QUIRKS Q5.3): the exit cell must be free of the
+        // *other* unit kind too — a foot unit needs a free spot and no vehicle;
+        // a vehicle needs no vehicle and no infantry at all.
         if loco == Locomotor::Foot {
-            !infantry_cell_full(world, c, None)
+            !infantry_cell_full(world, c, None) && !vehicle_in_cell(world, c, None)
         } else {
-            !vehicle_in_cell(world, c, None)
+            !vehicle_in_cell(world, c, None) && infantry_spot_bits(world, c, None) & 0x1F == 0
         }
     };
     // Preferred: straight south of centre.
@@ -1916,9 +1929,14 @@ fn dest_ok(
         return false;
     }
     if is_infantry {
+        // Co-occupancy (Q5.3): infantry cannot share a cell with a vehicle.
         infantry_load(world, cell, Some(unit)) < SUBCELL_COUNT as i32
+            && !vehicle_in_cell(world, cell, Some(unit))
     } else {
-        !vehicle_in_cell(world, cell, Some(unit)) && !vehicle_targeting(world, cell, Some(unit))
+        // Co-occupancy (Q5.3): a vehicle cannot share a cell with any infantry.
+        !vehicle_in_cell(world, cell, Some(unit))
+            && !vehicle_targeting(world, cell, Some(unit))
+            && infantry_spot_bits(world, cell, Some(unit)) & 0x1F == 0
     }
 }
 
@@ -2273,6 +2291,12 @@ fn move_units(world: &mut World) {
 
     // Units whose cell changed this tick, for shroud reveal after movement.
     let mut moved: Vec<(u8, CellCoord, u8)> = Vec::new();
+    // Vehicles that made real progress (coord changed) this tick, in processing
+    // order. Used by the head-on tie-break below: we only *yield* to a lower-index
+    // blocker that itself moved this tick — yielding to a stuck unit would just
+    // turn this unit into a permanent wall (the harvester-dock deadlock). Membership
+    // test only (no iteration), so it stays deterministic.
+    let mut moved_this_tick: Vec<Handle> = Vec::new();
     for handle in world.units.handles() {
         let (start_cell, is_inf, start_spot, loco) = match world.units.get(handle) {
             Some(u) if !u.path.is_empty() => (u.cell(), u.is_infantry(), u.sub_cell, u.locomotor),
@@ -2288,13 +2312,18 @@ fn move_units(world: &mut World) {
         }
 
         // Compute the tentative advance, then validate the **actual landing cell**
-        // it lands in against occupancy (a vehicle for a vehicle mover, a full
-        // sub-cell for infantry). Checking the true landing cell — not just the
-        // path's next cell — covers a diagonal step that *corner-clips* a
-        // neighbour. On a block, re-route around occupied cells once
+        // it lands in against occupancy. Checking the true landing cell — not just
+        // the path's next cell — covers a diagonal step that *corner-clips* a
+        // neighbour. Cell-ownership rules (QUIRKS Q5): one vehicle per cell, and —
+        // since M7.7 — vehicles and infantry do not co-occupy (`Can_Enter_Cell`,
+        // `unit.cpp:3400`: no crushing, so an occupied-by-the-other-kind cell is
+        // impassable-equivalent). On a block, re-route around occupied cells once
         // (`find_path_avoiding`, the `drive.cpp` reaction to a moving block); if
         // that still can't step, hold position this tick (a documented
         // simplification of the ask-the-blocker-to-scatter radio protocol).
+        //
+        // Returns `(new_coord, blocked, blocker)`, where `blocker` is the *vehicle*
+        // that caused the block (if any) — used for the head-on livelock tie-break.
         let is_blocked = |world: &World, coord: WorldCoord, path: &[CellCoord], grid: &UnitGrid| {
             let budget = world
                 .units
@@ -2304,31 +2333,55 @@ fn move_units(world: &mut World) {
             let (nc, _) = advance_along_path(coord, path, budget);
             let land = nc.cell();
             if land == start_cell {
-                (nc, false)
-            } else {
-                let terrain_block = !world.passable.is_passable_loco(land, loco);
-                let occ_block = if is_inf {
-                    !grid.has_free_spot(land)
-                } else {
-                    grid.vehicle_blocked_for(land, handle)
-                };
-                (nc, terrain_block || occ_block)
+                return (nc, false, None);
             }
+            let terrain_block = !world.passable.is_passable_loco(land, loco);
+            // The vehicle occupying `land`, if it belongs to someone else.
+            let veh_other = grid.vehicle_at(land).filter(|&h| h != handle);
+            let occ_block = if is_inf {
+                // Infantry: blocked by a full spot mask OR any vehicle in the cell.
+                !grid.has_free_spot(land) || veh_other.is_some()
+            } else {
+                // Vehicle: blocked by another vehicle OR any infantry in the cell.
+                veh_other.is_some() || (grid.spot_bits(land) & 0x1F) != 0
+            };
+            (nc, terrain_block || occ_block, veh_other)
         };
 
         let (coord, path) = match world.units.get(handle) {
             Some(u) => (u.coord, u.path.clone()),
             None => continue,
         };
-        let (mut new_coord, blocked) = is_blocked(world, coord, &path, &grid);
+        let (mut new_coord, blocked, blocker) = is_blocked(world, coord, &path, &grid);
         if blocked {
+            // Head-on livelock tie-break (P0, M7.7). Two vehicles of *identical*
+            // speed meeting head-on in a passable-width corridor used to re-route
+            // in lock-step forever (both detour, both return, repeat). Break the
+            // symmetry deterministically by slot order: when the blocker is a
+            // lower-index vehicle that **already advanced this tick**, this
+            // (higher-index) unit *yields* — it holds this tick instead of
+            // re-routing — so only the lower-index unit detours and the pair
+            // passes. The "already advanced" guard is essential: yielding to a
+            // *stuck* lower-index unit would just make this unit a permanent wall
+            // (the harvester-dock deadlock), so we only yield behind a unit that is
+            // genuinely making progress. A parked blocker (empty path, never in
+            // `moved_this_tick`) therefore never triggers a yield, and neither does
+            // a mutually-stuck pair — both fall through to their normal re-route.
+            let yield_to_lower = blocker.is_some_and(|b| {
+                b.index < handle.index
+                    && moved_this_tick.contains(&b)
+                    && world.units.get(b).is_some_and(|u| !u.path.is_empty())
+            });
+            if yield_to_lower {
+                continue; // hold this tick; the lower-index unit re-routes
+            }
             // Re-route around the occupied cells to our destination.
             let mut rerouted = false;
             if let Some(dest) = world.units.get(handle).and_then(|u| u.dest) {
                 if let Some(newpath) =
                     find_path_avoiding(&world.passable, start_cell, dest, loco, &grid, handle)
                 {
-                    let (nc2, blocked2) = is_blocked(world, coord, &newpath, &grid);
+                    let (nc2, blocked2, _) = is_blocked(world, coord, &newpath, &grid);
                     // Adopt the detour as long as it does not itself land on an
                     // occupied cell. Even a partial in-cell step counts — it turns
                     // the unit onto the detour heading and inches it off the
@@ -2354,6 +2407,12 @@ fn move_units(world: &mut World) {
         let (applied_coord, consumed) =
             advance_along_path(unit.coord, &unit.path, unit.stats.max_speed);
         debug_assert_eq!(applied_coord, new_coord);
+        // Record real progress (coord changed) for the head-on tie-break's
+        // "already advanced this tick" guard. Vehicles only — infantry never drive
+        // the vehicle tie-break.
+        if new_coord != unit.coord && !is_inf {
+            moved_this_tick.push(handle);
+        }
         unit.coord = new_coord;
         for _ in 0..consumed {
             unit.path.remove(0);

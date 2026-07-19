@@ -167,16 +167,35 @@ at its attacker (`FootClass::Take_Damage → Assign_Target(source)`,
    → `Do_Uncloak`/radio). A vehicle blocked by another vehicle re-routes **around**
    it (`find_path_avoiding` — our A* ignores units, so a blocker in the straight
    path is routed around at drive time); if no detour helps this tick it simply
-   **holds** and retries. A genuine head-on swap resolves because *both* units
-   re-route around each other. A true 1-wide corridor with no detour just waits
+   **holds** and retries. A true 1-wide corridor with no detour just waits
    (rare; benign).
+
+   **Head-on tie-break (M7.7 P0a).** Two vehicles of *exactly* identical speed
+   meeting head-on in a passable-width corridor used to re-route in lock-step
+   forever (both detour, both return, repeat) — the old `known_bug_symmetric…`
+   test. `move_units` now breaks the symmetry deterministically by slot order:
+   when the blocker is a *moving* vehicle with a **lower handle index**, the
+   higher-index unit **yields** (holds one tick) instead of re-routing, so only
+   the lower-index unit detours and the pair passes. This stands in for the
+   original's implicit asymmetry (one unit made passive by the scatter request).
+   A *parked* blocker never triggers a yield, so ordinary re-routing around
+   stationary obstacles is unchanged. No RNG is introduced (determinism intact).
 2. **Closest-free-spot centre fallback** uses the fixed `_sequence[0]` order rather
    than the RNG-picked `_alternate` row (`cell.cpp:1948`), avoiding a new sim-RNG
    draw in the movement path (determinism, and it keeps existing goldens' RNG
    sequence intact).
-3. **No crushing.** Heavy vehicles do not crush infantry (`unit.cpp:Overrun`);
-   a vehicle simply cannot enter a cell whose infantry spots leave it (for the
-   movement gate) impassable-equivalent. Deferred.
+3. **No crushing; co-occupancy forbidden (M7.7 P0b).** Heavy vehicles do not
+   crush infantry (`unit.cpp:Overrun`, deferred). Instead the cell-ownership
+   guard is now symmetric: a **vehicle** may not enter a cell holding *any*
+   infantry (`spot_bits & 0x1F != 0`), and an **infantryman** may not enter a
+   cell holding a vehicle (`veh_other.is_some()`) — the movement gate in
+   `move_units`, plus `dest_ok` at command/dispersal time. This is the
+   no-crush reading of `Can_Enter_Cell` (`unit.cpp:3400`): an
+   occupied-by-the-other-kind cell is impassable-equivalent, so the mover
+   re-routes around it or holds. (Previously the gate only checked same-kind
+   occupancy, so vehicles drove through infantry and vice versa; that gap —
+   pinned by `subcell_suite`'s two "currently…unblocked" tests — is now closed
+   and those tests assert the block.)
 
 **Hash impact.** This is a real movement behavior change and legitimately moves
 real-map movement goldens (re-pinned in `determinism.rs` / `ui_shroud_golden.rs`
@@ -252,5 +271,8 @@ independent of the war factory, matching the original's separate infantry queue.
    the projectile flies the straight flat-trajectory path (`bullet.rs` advance) —
    the arc is cosmetic and the impact point is the same. (`bullet.cpp:751` fires
    straight; the arc is a draw-time parabola we do not render.)
-5. **Vehicle/infantry cell coexistence simplified:** a vehicle blocks a whole cell
-   for *entry* but does not crush infantry already there (see Q5.3).
+5. **Vehicle/infantry cell coexistence forbidden (updated M7.7):** vehicles and
+   infantry no longer co-occupy a cell at all — the mover re-routes/holds rather
+   than crushing or stacking (see Q5.3). Turrets: infantry are correctly
+   turretless (`has_turret=false`, M7.7 P0c) — they aim by rotating their body,
+   matching `udata.cpp` (`is_turret_equipped=false` for every infantry type).

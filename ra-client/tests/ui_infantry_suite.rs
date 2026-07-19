@@ -18,23 +18,14 @@
 //!    extending this section).** `ra-client/src/appcore.rs` draws a smaller
 //!    selection ring/health-bar for infantry than for vehicles
 //!    (`marker_half = CELL_PIXELS/4` = 6px for infantry vs `CELL_PIXELS/2` =
-//!    12px for vehicles, in `draw_units`), but the **click hit-test does
-//!    not**: both `finish_selection`'s click path and `unit_at_map` (the
-//!    right-click attack-target picker) test the click point against a
-//!    single shared `PICK_RADIUS = CELL_PIXELS` = 24px constant, with no
-//!    `is_infantry` branch at all. So a click landing well outside an
-//!    infantry unit's drawn selection box (indeed, outside even a vehicle's
-//!    larger drawn box) still selects it, because the *click* tolerance
-//!    never shrinks — only the *visual marker* does. This is the opposite of
-//!    a "vehicle-sized hitbox on infantry" regression: infantry get a
-//!    **vehicle-sized click hitbox regardless of their small visual
-//!    marker**, which reads as a bug (surprising for anyone eyeballing the
-//!    tiny selection box and expecting the click tolerance to match it) even
-//!    though it happens to be `is_infantry`-independent rather than literally
-//!    "the old vehicle behavior with the new small marker". The tests below
-//!    assert what the code **actually does** today (so they pass and pin the
-//!    current behavior), while making the mismatch explicit and citing the
-//!    exact constants involved.
+//!    12px for vehicles, in `draw_units`), and as of **M7.7 P0d the click
+//!    hit-test now matches**: both `finish_selection`'s click path and
+//!    `unit_at_map` (the right-click attack-target picker) scale the pick
+//!    radius via `pick_radius(is_infantry)` — `CELL_PIXELS/2` = 12px for
+//!    infantry, the full `CELL_PIXELS` = 24px for vehicles/others. So a click
+//!    a whole cell away from a soldier no longer grabs it; the click tolerance
+//!    tracks the visible footprint. The tests below pin the post-P0d
+//!    behaviour, citing the exact constants involved.
 //! 4. Monkey testing (seeded proptest) over a mixed vehicle+infantry
 //!    fixture: no panic, every drained command well-formed (live unit,
 //!    correct owning house) — mirrors `ui_monkey.rs`'s units-variant
@@ -471,29 +462,39 @@ fn click_beyond_pick_radius_selects_nothing() {
     );
 }
 
-/// **Pins the Finding above.** A click at distance 20px from the infantry's
-/// true position — well outside its own drawn 6px marker half-width, and
-/// even outside a *vehicle's* larger 12px marker half-width — still selects
-/// it, because `PICK_RADIUS` (24px) is not scaled down for infantry. If a
-/// future change makes infantry click tolerance track the visual marker
-/// size, this assertion should flip to "does not select" and this comment
-/// should be updated/removed accordingly.
+/// **M7.7 P0d: infantry click tolerance now tracks the visual footprint.** A
+/// click at distance 20px from the infantry's true position — outside the new
+/// infantry pick radius (`CELL_PIXELS/2` = 12px) though still within the
+/// full-cell `PICK_RADIUS` (24px) — no longer selects the infantryman. (Before
+/// P0d a full-cell hitbox let a click a whole cell away grab a soldier; that
+/// old behaviour is what this test used to pin, now flipped.)
 #[test]
-fn click_within_pick_radius_but_outside_both_visual_markers_still_selects_infantry() {
+fn click_beyond_infantry_pick_radius_but_within_full_radius_no_longer_selects() {
     let (mut core, inf, _veh) = selection_core();
     let (x, y) = unit_screen_pos(&core, inf);
     let distance = 20;
     assert!(distance > INFANTRY_MARKER_HALF);
     assert!(distance > VEHICLE_MARKER_HALF);
     assert!(distance <= PICK_RADIUS);
+    assert!(distance > PICK_RADIUS / 2); // beyond the halved infantry radius
 
     click(&mut core, x + distance, y);
-    assert_eq!(
-        core.selected_handles(),
-        vec![inf],
-        "FINDING: infantry click tolerance is PICK_RADIUS-sized (24px), not \
-         marker_half-sized (6px) — see this file's module doc"
+    assert!(
+        core.selected_handles().is_empty(),
+        "P0d: an infantry click hitbox is now CELL_PIXELS/2 (12px), so a 20px-away \
+         click must not select the soldier"
     );
+}
+
+/// Companion to the above: a click *within* the halved infantry radius (12px)
+/// still selects — the tolerance shrank, it did not vanish.
+#[test]
+fn click_within_infantry_pick_radius_still_selects() {
+    let (mut core, inf, _veh) = selection_core();
+    let (x, y) = unit_screen_pos(&core, inf);
+    let distance = PICK_RADIUS / 2 - 2; // 10px, inside the 12px infantry radius
+    click(&mut core, x + distance, y);
+    assert_eq!(core.selected_handles(), vec![inf]);
 }
 
 /// Same shared-tolerance behaviour holds symmetrically for a vehicle: a

@@ -232,26 +232,17 @@ fn sixth_infantry_disperses_to_an_adjacent_cell() {
 //    `Can_Enter_Cell` (`unit.cpp:3400`) and QUIRKS.md's own Q5.3 wording.
 // ===========================================================================
 
-/// **Pinned current behavior — flagged divergence, not a fix.**
+/// **Co-occupancy guard (M7.7 P0b).**
 ///
-/// QUIRKS.md's Q5.3 ("No crushing") reads: "a vehicle simply cannot enter a
-/// cell whose infantry spots leave it (for the movement gate)
-/// impassable-equivalent." Reading the actual gate in `world.rs::move_units`
-/// (`is_blocked`'s `occ_block` computation), a **vehicle** mover's occupancy
-/// check is `grid.vehicle_blocked_for(land, handle)`, which only consults
-/// `UnitGrid`'s `veh` map — it never looks at `spots` at all. So as
-/// currently implemented, a vehicle is **not** blocked by infantry occupying
-/// a cell, fully packed or not; it can drive straight onto/through them. The
-/// original's `Can_Enter_Cell` (`unit.cpp:3400`, cited in QUIRKS Q5) *does*
-/// treat vehicle-vs-infantry interaction specially (crush eligibility /
-/// blockage depending on `IsCrushable` in the same function). This test
-/// pins **today's actual behavior** (vehicle passes through freely) so any
-/// future change to close this gap shows up here as an intentional,
-/// reviewed diff — and flags the QUIRKS.md wording as currently inaccurate
-/// for ra-coder to reconcile (either implement the guard the doc describes,
-/// or correct the doc to say vehicle/infantry co-occupancy is unblocked).
+/// QUIRKS.md's Q5.3 documents that a vehicle cannot enter an infantry-occupied
+/// cell (no crushing — an occupied-by-the-other-kind cell is
+/// impassable-equivalent, `Can_Enter_Cell`, `unit.cpp:3400`). The gate in
+/// `world.rs::move_units` now enforces this: a **vehicle** mover is blocked when
+/// its landing cell holds *any* infantry (`spot_bits & 0x1F != 0`), not just
+/// another vehicle. A vehicle driving into an infantry-packed cell therefore
+/// re-routes around it (or, if it cannot, holds) instead of passing through.
 #[test]
-fn vehicle_currently_passes_through_an_infantry_full_cell_unblocked() {
+fn vehicle_is_blocked_by_an_infantry_occupied_cell() {
     let mut world = World::new(Passability::all_passable(), 0xB0A6_0001);
     let target = CellCoord::new(20, 20);
     // Pack the cell with 5 infantry first.
@@ -276,35 +267,32 @@ fn vehicle_currently_passes_through_an_infantry_full_cell_unblocked() {
         "sanity: cell packed full"
     );
 
-    // Now drive a vehicle straight through the same cell.
+    // Drive a vehicle straight down the same column (a 1-wide passable strip
+    // would trap it; the map is all-passable so it may re-route around the
+    // infantry cell, but it must NOT pass *through* the packed cell).
     let vehicle = world.spawn_unit(9, 2, CellCoord::new(20, 10), Facing(128), 400, stats(24, 8));
     world.tick(&[Command::Move {
         unit: vehicle,
         dest: CellCoord::new(20, 30),
         house: 2,
     }]);
+    let mut ever_on_target = false;
     for _ in 0..250 {
         world.tick(&[]);
+        if world.units.get(vehicle).unwrap().cell() == target {
+            ever_on_target = true;
+        }
     }
-    let vu = world.units.get(vehicle).unwrap();
     assert!(
-        !vu.is_moving(),
-        "the vehicle should have completed its move"
-    );
-    assert_eq!(
-        vu.cell(),
-        CellCoord::new(20, 30),
-        "as currently implemented, the vehicle reaches its destination straight through the \
-         infantry-packed cell, unblocked"
+        !ever_on_target,
+        "the vehicle must never occupy the infantry-packed cell (no crushing / no pass-through)"
     );
 }
 
-/// Mirror of the above in the other direction: an infantry unit's occupancy
-/// gate (`!grid.has_free_spot(land)`) only checks the `spots` bitmask, never
-/// `veh` — so infantry are similarly **not** blocked from stepping onto a
-/// cell a vehicle already occupies, as currently implemented.
+/// Mirror of the above: an infantry mover is now blocked from stepping onto a
+/// cell a vehicle occupies (`veh_other.is_some()` in the gate), matching Q5.3.
 #[test]
-fn infantry_currently_enters_a_vehicle_occupied_cell_unblocked() {
+fn infantry_is_blocked_by_a_vehicle_occupied_cell() {
     let mut world = World::new(Passability::all_passable(), 0xB0A6_0002);
     let target = CellCoord::new(20, 20);
     let vehicle = world.spawn_unit(9, 2, target, Facing(0), 400, stats(24, 8));
@@ -316,18 +304,16 @@ fn infantry_currently_enters_a_vehicle_occupied_cell_unblocked() {
         dest: target,
         house: 1,
     }]);
+    let mut ever_on_target = false;
     for _ in 0..150 {
         world.tick(&[]);
+        if world.units.get(inf).unwrap().cell() == target {
+            ever_on_target = true;
+        }
     }
-    let iu = world.units.get(inf).unwrap();
     assert!(
-        !iu.is_moving(),
-        "the infantryman should have completed its move"
-    );
-    assert_eq!(
-        iu.cell(),
-        target,
-        "as currently implemented, infantry can step onto a vehicle-occupied cell unblocked"
+        !ever_on_target,
+        "infantry must never step onto the vehicle-occupied cell (co-occupancy guard)"
     );
 }
 
@@ -419,8 +405,11 @@ fn infantry_death_frees_its_spot_for_reuse() {
     }
 
     // A 6th infantryman ordered to the same cell should now take the freed
-    // spot (not disperse to a neighbour, since a spot is free again).
-    let sixth = spawn_infantry(&mut world, 50, 1, CellCoord::new(30, 24));
+    // spot (not disperse to a neighbour, since a spot is free again). Approach
+    // from the *south* — the attacker vehicle sits north at (30,29), and the
+    // M7.7 co-occupancy guard now (correctly) forbids infantry from walking
+    // through a vehicle-occupied cell, so a north approach would have to detour.
+    let sixth = spawn_infantry(&mut world, 50, 1, CellCoord::new(30, 34));
     world.tick(&[Command::Move {
         unit: sixth,
         dest: target,

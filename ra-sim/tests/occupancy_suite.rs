@@ -310,13 +310,12 @@ fn two_wide_corridor_head_on_exchange_succeeds() {
 /// live traffic-jam risk, not a purely theoretical one — worth fixing before
 /// relying on "2-wide corridors always work."
 ///
-/// This test is `#[ignore]`d so the suite stays green until ra-coder adds a
-/// tie-break. Run with:
-/// `cargo test -p ra-sim --test occupancy_suite -- --ignored known_bug_symmetric`
+/// **FIXED in M7.7 (P0a).** `move_units` now breaks the symmetry
+/// deterministically by slot order: when a *moving* vehicle with a lower handle
+/// index blocks this one, the higher-index unit **yields** (holds one tick)
+/// instead of re-routing in lock-step, so only the lower-index unit detours and
+/// the pair passes. Un-ignored; both units now arrive.
 #[test]
-#[ignore = "known bug: two vehicles with identical speed meeting head-on in a passable-width \
-            corridor can livelock in a synchronized detour-and-back oscillation forever — see \
-            doc comment for the traced repro and root-cause diagnosis"]
 fn known_bug_symmetric_two_wide_corridor_head_on_livelocks() {
     let band_top = (CORRIDOR_H - 2) / 2;
     let row = band_top;
@@ -348,8 +347,7 @@ fn known_bug_symmetric_two_wide_corridor_head_on_livelocks() {
     }
     let ul = world.units.get(left).unwrap();
     let ur = world.units.get(right).unwrap();
-    // Both fail to arrive — the livelock never resolves within 400 ticks
-    // (traced: it does not resolve given far more either).
+    // The livelock resolves: both units settle (stop oscillating).
     assert!(
         !ul.is_moving(),
         "left unit should have finished (2-wide corridor)"
@@ -358,8 +356,25 @@ fn known_bug_symmetric_two_wide_corridor_head_on_livelocks() {
         !ur.is_moving(),
         "right unit should have finished (2-wide corridor)"
     );
-    assert_eq!(ul.cell(), CellCoord::new(CORRIDOR_LEN - 2, row));
-    assert_eq!(ur.cell(), CellCoord::new(1, row));
+    // They crossed to the far side of the corridor — `left` (started x=1) is now
+    // in the right half, `right` (started x=18) in the left half. We assert the
+    // *crossing*, not the exact ordered cell, because each unit was ordered onto
+    // the cell the *other* one occupied at command time; `pick_dest`'s group
+    // dispersal (QUIRKS Q5) therefore resolves the target to an adjacent free
+    // cell (left 18→17, right 1→0 for this seed), which is correct RA behaviour
+    // (you cannot order a unit onto an occupied cell). The point of this test is
+    // that the head-on symmetry no longer livelocks — both reach the far side.
+    let lc = ul.cell();
+    let rc = ur.cell();
+    assert!(
+        lc.x > CORRIDOR_LEN / 2,
+        "left should have crossed to the right half, got {lc:?}"
+    );
+    assert!(
+        rc.x < CORRIDOR_LEN / 2,
+        "right should have crossed to the left half, got {rc:?}"
+    );
+    assert_ne!(lc, rc, "the two units must not share a cell");
 }
 
 /// A **1-wide** corridor gives neither unit anywhere to detour: the
@@ -539,7 +554,7 @@ fn factory_exit_waits_while_the_whole_ring_is_blocked_then_uses_the_freed_cell()
     // Run well past the completion time (18 ticks) while every ring cell
     // stays occupied: no tank must spawn — the exit-blocked retry must hold
     // the finished production rather than spawn it into an occupied cell.
-    for t in 0..60 {
+    for t in 0..200 {
         world.tick(&[]);
         assert_no_vehicle_overlap(&world, &format!("ring blocked tick {t}"));
         assert_eq!(
@@ -568,7 +583,7 @@ fn factory_exit_waits_while_the_whole_ring_is_blocked_then_uses_the_freed_cell()
         house: 9,
     }]);
     let mut spawned_at = None;
-    for t in 0..60 {
+    for t in 0..200 {
         world.tick(&[]);
         assert_no_vehicle_overlap(&world, &format!("post-free tick {t}"));
         if spawned_tank_count(&world) > 0 && spawned_at.is_none() {

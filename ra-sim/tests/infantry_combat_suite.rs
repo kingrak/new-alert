@@ -387,27 +387,19 @@ fn resolved_e1_e2_e3_combat_matches_hand_transcribed_tables() {
     }
 }
 
-/// Structural finding for ra-coder (**not** a M7.6 regression —
-/// `ra_data::combat::turret_equipped` predates M7.6 and was never made
-/// infantry-aware): it only special-cases named vehicles, defaulting every
-/// *other* armed unit (`_ => armed`) to `has_turret = true`. E1/E2/E3 aren't
-/// in either list, so an armed infantryman resolves as "independently
-/// rotating turret" even though no real infantry unit has one. This is
-/// currently harmless (nothing in `ra-sim` treats `has_turret` differently
-/// for infantry vs. vehicles — it only changes whether `turret_facing` tracks
-/// `facing` or rotates on its own, and no infantry rendering/animation reads
-/// that distinction yet), so this is recorded as a **passing** test that
-/// documents today's actual behavior, not a failing one — flagged here rather
-/// than "fixed" since `ra-data` is out of this file's scope.
+/// M7.7 P0c: `turret_equipped` was made authoritative from `udata.cpp` — only
+/// the four battle tanks, the jeep, and the phase transport carry a combat
+/// turret; **every infantry type aims by rotating its whole body**
+/// (`is_turret_equipped=false`). The old `_ => armed` default wrongly turreted
+/// E1/E2/E3; this test now pins the corrected value (`has_turret == false`).
 #[test]
-fn resolve_unit_combat_treats_armed_infantry_as_turreted_a_documented_gap() {
+fn resolve_unit_combat_treats_infantry_as_turretless() {
     let Some(rules) = load_rules() else { return };
     for name in ["E1", "E2", "E3"] {
         let c = resolve_unit_combat(&rules, name).unwrap();
         assert!(
-            c.has_turret,
-            "{name}: documenting current behavior (arguably wrong for infantry) — see this \
-             test's doc comment; flagged to ra-coder as a structural gap, not a regression"
+            !c.has_turret,
+            "{name}: infantry have no combat turret (udata.cpp is_turret_equipped=false)"
         );
     }
 }

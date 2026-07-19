@@ -647,17 +647,27 @@ fn real_scg01ea_hash_chain_prefix_golden() {
     // changes. This is the coordinator-authorised occupancy re-pin (see QUIRKS
     // Q5/Q6); the independent movement-only oracle chain in the companion audit is
     // re-pinned in the same pass. Re-derived deterministically (read back once).
+    //
+    // **Re-pinned again for M7.7 (P0a head-on tie-break) — another deliberate
+    // movement change.** The four units contend as they disperse to one cell; the
+    // new slot-order yield (a moving lower-index vehicle makes the higher-index one
+    // hold a tick, breaking the symmetric-head-on livelock) alters their movement
+    // from tick 5 onward. Ticks 0-4 are byte-identical to the M7.6 pin (the units
+    // are still apart), so the change is exactly the contention resolution. Not a
+    // hashing/formula change, not a single-unit regression (the synthetic
+    // single-unit oracle golden below is unaffected — the tie-break only fires on a
+    // vehicle-vehicle collision). QUIRKS Q5.
     let golden: [u64; 10] = [
         0xe6ce_37fb_c98b_9e8d,
         0x8f12_8151_a357_4fa6,
         0xedbc_01c3_1509_1f6b,
         0x443b_4be3_7df3_e8cc,
         0xebf9_01c4_2c38_fa89,
-        0xc8e1_58e8_d905_e6c9,
-        0x6e60_ee66_16b9_f6c7,
-        0x9cea_f6d1_10f9_4505,
-        0xa11d_bbc4_be5e_0bd3,
-        0x420e_84c6_f0d5_eb15,
+        0x94d8_1da3_c1b9_293a,
+        0x8962_63c5_57b9_4f07,
+        0x84e0_7a9e_9807_a639,
+        0x737b_9cab_ffc6_8e0f,
+        0x639b_2266_c1d2_ad01,
     ];
     assert_eq!(
         chain, golden,
@@ -1280,17 +1290,28 @@ mod repin_audit {
         // serves its purpose — proving the M4/M5 combat/economy hash-formula
         // additions do not perturb movement — now baselined on the M7.6 movement
         // behavior. (Coordinator-authorised occupancy re-pin; QUIRKS Q5/Q6.)
+        //
+        // Re-pinned again for M7.7 (P0a head-on tie-break): the four units
+        // contend while dispersing to one cell, and the new slot-order yield
+        // changes their movement from tick 5 onward (ticks 0-4 are byte-identical
+        // — the units are still apart). This is the *same* deliberate movement
+        // change as the occupancy re-pin, now including the tie-break. The
+        // per-tick combat-inertness asserts above still hold (armor/has_turret/
+        // arm/weapon/target untouched), so the audit's conclusion — combat fields
+        // do not perturb movement — is unchanged; only the movement baseline
+        // moved. The synthetic single-unit oracle golden is unaffected (the
+        // tie-break only fires on a vehicle-vehicle collision). QUIRKS Q5.
         let m3_shaped_golden: [u64; 10] = [
             0xcae7_fe64_e3cd_ae2d,
             0x1928_72a0_34f4_4186,
             0x6653_655a_b6a8_268b,
             0x8f06_f304_54b6_feec,
             0x5989_8d2f_e58b_6829,
-            0xf81f_1d18_e728_d5a9,
-            0x7279_54ba_4564_3647,
-            0xf3d8_8841_8016_23e5,
-            0x5dd4_fa64_d7cb_acd3,
-            0x5656_76e4_e86d_d635,
+            0x4faf_4f67_6f6a_219a,
+            0x8119_19c5_e2c7_ef07,
+            0x4b0a_f5b2_9d5d_8d19,
+            0x6c2c_6edc_260e_efcf,
+            0xd103_4520_70ca_aca1,
         ];
         assert_eq!(
             m3_shaped_chain, m3_shaped_golden,
@@ -1309,11 +1330,11 @@ mod repin_audit {
                 0xedbc_01c3_1509_1f6b,
                 0x443b_4be3_7df3_e8cc,
                 0xebf9_01c4_2c38_fa89,
-                0xc8e1_58e8_d905_e6c9,
-                0x6e60_ee66_16b9_f6c7,
-                0x9cea_f6d1_10f9_4505,
-                0xa11d_bbc4_be5e_0bd3,
-                0x420e_84c6_f0d5_eb15,
+                0x94d8_1da3_c1b9_293a,
+                0x8962_63c5_57b9_4f07,
+                0x84e0_7a9e_9807_a639,
+                0x737b_9cab_ffc6_8e0f,
+                0x639b_2266_c1d2_ad01,
             ],
             "this audit's script diverged from real_scg01ea_hash_chain_prefix_golden's script"
         );

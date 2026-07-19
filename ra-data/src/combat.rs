@@ -167,7 +167,7 @@ pub fn resolve_unit_combat(rules: &Ini, name: &str) -> Option<UnitCombat> {
         .and_then(|w| resolve_weapon(rules, w));
     Some(UnitCombat {
         armor,
-        has_turret: turret_equipped(name, weapon.is_some()),
+        has_turret: turret_equipped(name),
         weapon,
     })
 }
@@ -243,18 +243,23 @@ pub fn resolve_weapon(rules: &Ini, weapon_name: &str) -> Option<WeaponDef> {
 }
 
 /// Whether a unit type aims an independent turret. This flag is **not** in
-/// rules.ini in the original (it lives in `udata.cpp`'s type table), so per
-/// DESIGN.md §3.8 it is a small named-capability table here rather than 410
-/// scattered type checks. Starter units: the tanks and the armed jeep have
-/// turrets; the harvester does not. Unlisted armed units default to turreted
-/// (the common case), unlisted unarmed units to turretless.
-pub fn turret_equipped(name: &str, armed: bool) -> bool {
-    match name.trim().to_ascii_uppercase().as_str() {
-        "1TNK" | "2TNK" | "3TNK" | "4TNK" | "JEEP" | "APC" | "ARTY" | "MGG" | "MRJ" | "FTNK"
-        | "TTNK" | "HTNK" | "MTNK" => true,
-        "HARV" | "MCV" | "TRUK" | "MNLY" => false,
-        _ => armed,
-    }
+/// rules.ini in the original (it lives in `udata.cpp`'s `is_turret_equipped`
+/// ctor arg), so per DESIGN.md §3.8 it is a small named-capability table here
+/// rather than 410 scattered type checks.
+///
+/// The list is the **authoritative** set from `udata.cpp` (verified ctor arg):
+/// only the four battle tanks, the armed jeep, and the phase transport carry a
+/// combat turret. **Everything else aims by rotating its whole body** — this
+/// deliberately includes every infantry type, the V2/artillery launchers, the
+/// APC, the minelayer/truck, and the specialty tanks (Tesla/Chrono/MAD), each
+/// of which is `is_turret_equipped=false` in the original. The old `_ => armed`
+/// default was wrong (it turreted infantry and the ARTY/APC); this closes that
+/// gap (M7.7 P0c) so an infantryman correctly resolves `has_turret=false`.
+pub fn turret_equipped(name: &str) -> bool {
+    matches!(
+        name.trim().to_ascii_uppercase().as_str(),
+        "1TNK" | "2TNK" | "3TNK" | "4TNK" | "JEEP" | "STNK"
+    )
 }
 
 #[cfg(test)]

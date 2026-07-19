@@ -120,8 +120,22 @@ const DEFAULT_SCROLL_SPEED: f32 = 640.0;
 const EDGE_MARGIN: i32 = 16;
 /// Below this drag size (pixels) a left-release is treated as a click, not a box.
 const CLICK_SLOP: i32 = 3;
-/// Click-select pick radius, in map pixels.
+/// Click-select pick radius, in map pixels (full-cell — vehicles/buildings-sized).
 const PICK_RADIUS: i32 = CELL_PIXELS;
+
+/// Click pick radius scaled to a unit's on-screen footprint (M7.7 P0d). Infantry
+/// draw at roughly a sub-cell size (their selection marker half is
+/// `CELL_PIXELS/4` and health bar `CELL_PIXELS/2`), so a full-cell hitbox would
+/// let a click land a whole cell away and still grab an infantryman — and would
+/// out-prioritise a co-located vehicle by proximity fluke. Halve it so the pick
+/// area tracks the visible soldier.
+fn pick_radius(is_infantry: bool) -> i32 {
+    if is_infantry {
+        CELL_PIXELS / 2
+    } else {
+        PICK_RADIUS
+    }
+}
 
 /// Selection marker / drag-box colour (classic RA green).
 const SELECT_RGB: [u8; 3] = [0, 255, 0];
@@ -1287,9 +1301,8 @@ impl AppCore {
                 let px = leptons_to_pixel(unit.coord.x.0) as i64;
                 let py = leptons_to_pixel(unit.coord.y.0) as i64;
                 let d2 = (px - sx0) * (px - sx0) + (py - sy0) * (py - sy0);
-                if d2 <= (PICK_RADIUS as i64) * (PICK_RADIUS as i64)
-                    && best.map(|(bd, _)| d2 < bd).unwrap_or(true)
-                {
+                let r = pick_radius(unit.is_infantry()) as i64;
+                if d2 <= r * r && best.map(|(bd, _)| d2 < bd).unwrap_or(true) {
                     best = Some((d2, h));
                 }
             }
@@ -1411,9 +1424,8 @@ impl AppCore {
             let px = leptons_to_pixel(unit.coord.x.0) as i64;
             let py = leptons_to_pixel(unit.coord.y.0) as i64;
             let d2 = (px - mx) * (px - mx) + (py - my) * (py - my);
-            if d2 <= (PICK_RADIUS as i64) * (PICK_RADIUS as i64)
-                && best.map(|(bd, _)| d2 < bd).unwrap_or(true)
-            {
+            let r = pick_radius(unit.is_infantry()) as i64;
+            if d2 <= r * r && best.map(|(bd, _)| d2 < bd).unwrap_or(true) {
                 best = Some((d2, h));
             }
         }
