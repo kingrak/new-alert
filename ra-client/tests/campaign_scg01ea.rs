@@ -454,3 +454,154 @@ fn scg01ea_playthrough_is_deterministic() {
     };
     assert_eq!(run(), run(), "same script twice must hash-match");
 }
+
+/// Regression pin (ra-tester, M7.5-B audit): before this milestone, placed
+/// Soviet guards only *retaliated* — an unescorted Einstein could stroll past
+/// them untouched. `scg01ea_inventory_and_playthrough_to_victory` above works
+/// around the now-active guards by clearing the USSR base's units on
+/// Einstein's corridor (documented there as "the assault Tanya makes"). This
+/// test proves that workaround is load-bearing: with the Soviet *buildings*
+/// razed (removing the Tesla-coil threat, isolating the guards specifically)
+/// but the Soviet *units* left alive, walking Einstein through them must now
+/// end in DEFEAT — his `elos` (`DESTROYED` -> `LOSE`) trigger firing — pinned
+/// at the exact deterministic tick this reaches (a change from that tick would
+/// mean guard engagement timing shifted and this pin should be revisited).
+#[test]
+fn scg01ea_einstein_dies_to_active_guards_if_the_route_is_not_cleared() {
+    let dir = support::assets_dir();
+    if !dir.join("main.mix").is_file() || !dir.join("redalert.mix").is_file() {
+        eprintln!("SKIP: real assets not found under {}", dir.display());
+        return;
+    }
+    let mut mission = assets::load_campaign_from_bytes(
+        &std::fs::read(dir.join("main.mix")).unwrap(),
+        &std::fs::read(dir.join("redalert.mix")).unwrap(),
+        "scg01ea.ini",
+    )
+    .expect("load scg01ea");
+    let core = &mut mission.core;
+
+    core.world_mut().tick(&[]);
+    let eins_idx = core
+        .world()
+        .campaign()
+        .unwrap()
+        .triggers
+        .iter()
+        .position(|t| t.name == "eins")
+        .unwrap() as u16;
+    let guards: Vec<ra_sim::Handle> = core
+        .world()
+        .units
+        .iter()
+        .filter(|(_, u)| u.trigger == Some(eins_idx))
+        .map(|(h, _)| h)
+        .collect();
+    for h in &guards {
+        core.world_mut().units.remove(*h);
+    }
+    core.world_mut().tick(&[]);
+    core.world_mut().tick(&[]);
+    let einstein = core
+        .world()
+        .units
+        .iter()
+        .find(|(_, u)| u.is_civ_evac)
+        .map(|(h, _)| h)
+        .expect("eins should have reinforced Einstein");
+
+    // Raze the USSR *buildings* only (removes the Tesla coil so the DEFEAT
+    // below is attributable to the guards, not a base defense structure) —
+    // the Soviet *units* are deliberately left alive and un-alerted.
+    let ussr_buildings: Vec<ra_sim::Handle> = core
+        .world()
+        .buildings
+        .iter()
+        .filter(|(_, b)| b.house == 2)
+        .map(|(h, _)| h)
+        .collect();
+    for h in ussr_buildings {
+        core.world_mut().buildings.remove(h);
+    }
+
+    // Same spawn-cell foot-passability nudge the victory playthrough performs
+    // (Q6: our simplified land mask marks Einstein's landing waypoint
+    // Foot-impassable) — orthogonal to the guard behaviour under test.
+    {
+        let ecell = core.world().units.get(einstein).unwrap().cell();
+        if !core
+            .world()
+            .passability()
+            .is_passable_loco(ecell, ra_sim::Locomotor::Foot)
+        {
+            'find: for r in 1..12 {
+                for dy in -r..=r {
+                    for dx in -r..=r {
+                        let c = ra_sim::CellCoord::new(ecell.x + dx, ecell.y + dy);
+                        if core
+                            .world()
+                            .passability()
+                            .is_passable_loco(c, ra_sim::Locomotor::Foot)
+                        {
+                            core.world_mut().units.get_mut(einstein).unwrap().coord = c.center();
+                            break 'find;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let evac_cell = core.world().campaign().unwrap().evac_cells[0];
+    core.world_mut().tick(&[Command::Move {
+        unit: einstein,
+        dest: evac_cell,
+        house: 1,
+    }]);
+
+    let mut outcome = None;
+    for _ in 0..2000 {
+        core.world_mut().tick(&[]);
+        let go = core.world().game_over();
+        if go != GameOver::Ongoing {
+            outcome = Some((go, core.world().tick_count()));
+            break;
+        }
+    }
+    let (go, tick) = outcome.expect("the escort must resolve (win or lose) within budget");
+    assert_eq!(
+        go,
+        GameOver::Defeat,
+        "with active Soviet guards left un-cleared on his route, Einstein must \
+         be caught and killed — DEFEAT, not VICTORY (the M7.5-B behaviour \
+         change this suite guards against silently reverting)"
+    );
+    let camp = core.world().campaign().unwrap();
+    let sprung: Vec<&str> = camp
+        .triggers
+        .iter()
+        .zip(&camp.state)
+        .filter(|(t, s)| s.sprung && (t.a1.code == taction::LOSE || t.a2.code == taction::LOSE))
+        .map(|(t, _)| t.name.as_str())
+        .collect();
+    assert_eq!(
+        sprung,
+        vec!["elos"],
+        "the DEFEAT must come from Einstein's own DESTROYED->LOSE trigger, not \
+         some other loss condition"
+    );
+    assert!(
+        core.world().units.get(einstein).is_none(),
+        "Einstein must actually have been killed, not merely have the trigger \
+         fire around a survivor"
+    );
+    // Deterministic tick pin: this scenario, this scripted route, this seed —
+    // the guards must catch and kill him at exactly this tick. A drift here
+    // means guard reaction/engagement timing changed; re-derive, don't just
+    // bump the number.
+    assert_eq!(
+        tick, 63,
+        "Einstein's death-to-active-guards must land on the same deterministic \
+         tick every run"
+    );
+}
