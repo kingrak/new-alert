@@ -759,3 +759,80 @@ scenarios at every difficulty, Hard still reliably beats Easy (both sides), and
 same-seed determinism holds (`ai_suite`). Showcase:
 `ai_suite::showcase_composed_team_lifecycle_and_repair` logs a full team lifecycle
 (compose → stage → attack → dissolve) and a repair reflex.
+
+---
+
+## Q17 — Campaign scripting: trigger/teamtype engine, simplified evac, and deferred placements (M7.5 Chunk A)
+
+**Milestone:** M7.5 Chunk A (campaign foundations — Allied mission 1 `scg01ea`
+playable start-to-victory through its real scenario data).
+
+**What we ported (faithfully).** The RA `TriggerTypeClass`/`TeamTypeClass` tables
+and their evaluation (`trigtype.cpp`/`tevent.cpp`/`taction.cpp`/`teamtype.cpp`/
+`trigger.cpp`/`reinf.cpp`). Events/actions keep the original raw `(code, team,
+trigger, data)` form (`ra-sim/src/campaign.rs`); `run_campaign` (world.rs)
+evaluates them each tick in INI order with the real `MultiStyleType` event/action
+mapping (ONLY/AND/OR/LINKED) and persistence (VOLATILE/SEMI/PERSISTANT). The
+implemented **event** subset (what scg01–03ea use): `TIME`, `DESTROYED`,
+`GLOBAL_SET/CLEAR`, `EVAC_CIVILIAN`, `PLAYER_ENTERED`/`CROSS_*` (cell triggers),
+`LOW_POWER`, `BUILDING_EXISTS`, `ALL_/UNITS_/BUILDINGS_DESTROYED`. The **action**
+subset: `WIN`, `LOSE`, `TEXT_TRIGGER`, `PLAY_SPEECH`, `REINFORCEMENTS`,
+`CREATE_TEAM`, `DZ`, `SET/CLEAR_GLOBAL`, `FORCE_TRIGGER`, `DESTROY_TRIGGER`,
+`DESTROY_OBJECT`, `REVEAL_ALL/SOME`, `ALL_HUNT`, `START/STOP/SET_TIMER`. Team
+mission lists implement Attack/Move-to-waypoint/Patrol/Guard minimally. All state
+(globals, per-trigger spring/timer/carrier, mission timer, evac latches, alliance
+matrix) is hashed **only when a campaign is present** — every skirmish/combat/AI
+golden is byte-identical (verified: full suite green, 593→ tests).
+
+**Deviations / deferrals (documented).**
+1. **`TEVENT_EVAC_CIVILIAN` — reach-the-LZ stand-in, not aircraft-leaves-map.** In
+   RA the flag latches when a transport *aircraft* carrying the VIP flies off the
+   radar edge on `MISSION_RETREAT` (`aircraft.cpp:4280` `Edge_Of_World_AI`). We
+   have no aircraft/transport sim, so a friendly civ-evac VIP standing on (or
+   adjacent to) a `TACTION_DZ` flare cell is counted as evacuated and removed
+   (`process_evac`, world.rs). The win *condition* (Greece's `IsCivEvacuated` →
+   `win` trigger → Victory) is the real engine; only the physical evac vehicle is
+   simplified. Evac-removal is pardoned against the VIP's own `DESTROYED` trigger
+   (Einstein carries `elos` = "he died → LOSE"; leaving the map must not trip it).
+2. **`TACTION_CREATE_TEAM` recruits existing units (no per-class type match).** The
+   reference recruits eligible on-map units of the team's house; we take up to the
+   team's total count of idle house units and apply its mission — no naval/air or
+   per-class matching. `REINFORCEMENTS` **does** spawn (from resolved protos).
+3. **Naval + aircraft teamtype classes are dropped.** `CA` (cruiser), `TRAN`
+   (Chinook), etc. have no sim, so those team members are skipped (logged in the
+   loader's `skipped` list). Ground reinforcements (Tanya's `E7`, Einstein) spawn
+   normally, so the rescue chain runs; the naval bombardment + evac chopper are
+   cosmetic and deferred.
+4. **`[TERRAIN]` = occupancy only, render deferred.** Trees/rocks stamp the
+   passability grid (`World::block_cell`, port of `TerrainClass::Occupy_List`) so
+   ground movers route around them, but the theater terrain SHP is **not drawn**
+   yet (coordinator-sanctioned "occupy + note it"). Occupancy is the must-have
+   (movement correctness); the sprite layer is a follow-up.
+5. **Barrel / oil-pump props skipped.** `[STRUCTURES]` entries `BARL`/`BRL3`/`V19`
+   have no rules.ini building section, so they are not placed (7 of scg01ea's 25
+   structure lines; the 18 real buildings all place). `TACTION_DESTROY_OBJECT` on
+   an absent prop is a harmless no-op.
+6. **Alliances are symmetric + collapse extra houses.** `[Basic]/house Allies=`
+   builds a symmetric alliance bitmask (`build_alliances`); `World::are_allies`
+   gates enemy auto-acquisition (hunt + defense buildings) so allied civilians
+   aren't targeted. Non-country houses (GoodGuy=8..Special=11) have no CPS colour
+   row and render in unremapped (native) art.
+7. **Win/lose ignore the action's `Data.House`.** `WIN`/`LOSE` resolve to the
+   player's Victory/Defeat directly (single-player campaign), not the reference's
+   `Data.House == PlayerPtr` player-vs-computer distinction — correct for a
+   one-player mission, and it sidesteps the `-255` sentinel these lines carry.
+8. **Reinforcement lands on a mask-impassable waypoint.** A team's origin waypoint
+   can sit on a tile our simplified land mask (Q6: only impassability modelled,
+   `<100%` costs collapsed) marks Foot-impassable, so a spawned VIP may need a
+   one-cell nudge to a passable cell before it can path (done in the verification
+   harness). This is a land-cost-fidelity limitation (Q6), not a campaign bug.
+
+**Verification.** `ra-client/tests/campaign_scg01ea.rs` loads the real
+`scg01ea.ini`, reports the full inventory, drives a scripted playthrough to
+VICTORY through the real triggers (`set1` TIME-0 reinforces Tanya at tick 0 →
+destroying the two `eins`-carrier guards springs `eins` → `REINFORCEMENTS einst`
+[Einstein] + `FORCE_TRIGGER ein2` → `DZ` flare + `SET_GLOBAL 1` → escort Einstein
+to the LZ → `EVAC_CIVILIAN` → `win`/Victory), asserts same-script-twice hash
+equality, and dumps start/briefing/victory PNGs. The menu campaign flow (Campaign
+button → 14-mission Allied list → briefing text → play → Victory advances / Defeat
+retries) is covered asset-free by `ui_campaign_flow.rs`.

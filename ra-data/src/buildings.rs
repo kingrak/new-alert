@@ -70,6 +70,10 @@ pub fn footprint(name: &str) -> Option<(u8, u8)> {
         "TSLA" => (1, 2), // tesla coil,          BSIZE_12
         // --- Walls (M7.7 Chunk B) — 1×1 buildable segments ---
         "SBAG" | "CYCL" | "BRIK" => (1, 1),
+        // --- Campaign scenery / neutral structures (M7.5), all BSIZE_11 ---
+        "KENN" => (1, 1),          // kennel (BSIZE_11, bdata.cpp)
+        "BARL" | "BRL3" => (1, 1), // explosive barrels
+        "V19" => (1, 1),           // oil pump / derrick (misc civilian structure)
         _ => return None,
     };
     Some((w, h))

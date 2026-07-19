@@ -60,6 +60,29 @@ pub struct EconRules {
     /// `Catalog { … }` literals across the test suites.) The label→section mapping
     /// is in [`Catalog::difficulty_handicap`] (a "Hard" AI is the *strong* one).
     pub difficulty: [crate::house::Handicap; 3],
+    /// Building self-repair HP restored per step (`Rule.RepairStep`, from
+    /// `[General] RepairStep`). Reference **compile-time** default is `5`
+    /// (`rules.cpp:221`), but the stock `redalert.mix` rules.ini overrides it to
+    /// `7`; we keep the *stock-rules.ini* value as our default (matching the
+    /// module constant this replaced — M7.9.1 audit / Q14) so every synthetic
+    /// catalog's repair behaviour stays byte-identical, and the real-asset loader
+    /// re-reads it from rules.ini. Promoted here (M7.5 P0) so the four repair
+    /// numbers can't silently drift in code the way they did once already.
+    pub brepair_step: i32,
+    /// Building repair cost fraction (`Rule.RepairPercent`) as `num/den`. Stock
+    /// rules.ini `20%` (= `1/5`); reference compile-time default `1/4`.
+    pub brepair_percent_num: i32,
+    /// Denominator for [`EconRules::brepair_percent_num`].
+    pub brepair_percent_den: i32,
+    /// Service-depot (FIX) **unit** repair HP per step (`Rule.URepairStep`, from
+    /// `[General] URepairStep`). Stock rules.ini `10`; reference compile-time
+    /// default `5`.
+    pub urepair_step: i32,
+    /// Unit repair cost fraction (`Rule.URepairPercent`) as `num/den`. Stock
+    /// rules.ini `20%` (= `20/100`); reference compile-time default `1/4`.
+    pub urepair_percent_num: i32,
+    /// Denominator for [`EconRules::urepair_percent_num`].
+    pub urepair_percent_den: i32,
 }
 
 impl Default for EconRules {
@@ -77,6 +100,16 @@ impl Default for EconRules {
             refund_percent: 50,
             growth_rate: 2,
             difficulty: [crate::house::Handicap::default(); 3],
+            // Stock-rules.ini repair values (not the reference compile-time
+            // 5/25% defaults) — see the field docs. Kept equal to the module
+            // constants this promotion replaced so synthetic-catalog repair is
+            // byte-identical.
+            brepair_step: 7,
+            brepair_percent_num: 1,
+            brepair_percent_den: 5,
+            urepair_step: 10,
+            urepair_percent_num: 20,
+            urepair_percent_den: 100,
         }
     }
 }

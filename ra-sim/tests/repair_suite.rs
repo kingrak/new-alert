@@ -81,6 +81,28 @@ const REPAIR_INTERVAL: u32 = 15;
 //   total credits = 58 * 5 = 290
 // ===========================================================================
 
+/// M7.5 P0: the four repair magnitudes are no longer world.rs module constants —
+/// they live in `EconRules` (loaded from rules.ini in the real client). This guard
+/// pins the *source of truth* these hand-computed expectations depend on, so a
+/// future edit to the defaults (the exact drift the promotion guards against) trips
+/// here instead of silently shifting the numbers below.
+#[test]
+fn repair_constants_come_from_econrules_not_a_module_const() {
+    let e = EconRules::default();
+    assert_eq!(e.brepair_step, 7, "RepairStep (stock rules.ini)");
+    assert_eq!(
+        (e.brepair_percent_num, e.brepair_percent_den),
+        (1, 5),
+        "RepairPercent 20%"
+    );
+    assert_eq!(e.urepair_step, 10, "URepairStep (stock rules.ini)");
+    assert_eq!(
+        (e.urepair_percent_num, e.urepair_percent_den),
+        (20, 100),
+        "URepairPercent 20%"
+    );
+}
+
 #[test]
 fn repair_full_cycle_heals_to_max_at_exact_hand_computed_cost() {
     let mut w = world(10_000);

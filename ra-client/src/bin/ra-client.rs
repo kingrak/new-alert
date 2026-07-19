@@ -216,6 +216,15 @@ fn cmd_window(mut args: Vec<String>) -> Result<(), BoxErr> {
         platform::user_maps_dir()
     );
     let app = ra_client::menu::App::new(maps, Box::new(factory));
+    // Enable the single-player Allied campaign (scg*ea.ini) if the archives are
+    // readable — the factory scans/builds missions on demand.
+    let app = match (
+        std::fs::read(dir.join("main.mix")),
+        std::fs::read(dir.join("redalert.mix")),
+    ) {
+        (Ok(m), Ok(r)) => app.with_campaign(Box::new(assets::ArchiveCampaignFactory::new(m, r))),
+        _ => app,
+    };
 
     let sounds = if muted {
         Vec::new()

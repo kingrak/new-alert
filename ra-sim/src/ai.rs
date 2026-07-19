@@ -1209,6 +1209,12 @@ impl AiPlayer {
     }
 
     /// Whether the house owns a live building of the given role.
+    ///
+    /// **Cache invariant.** This resolves through [`crate::House::owns_building`],
+    /// i.e. the `building_counts` cache — see that method's warning. The cache is
+    /// only correct when every building add/remove goes through the command/sim
+    /// paths (`spawn_building` / `remove_building` / `capture_building`), which
+    /// keep [`crate::House::adjust_building_count`] in step; do not bypass them.
     fn owns_role(&self, world: &World, role: Role) -> bool {
         self.role_building(&world.catalog, role)
             .map(|id| {

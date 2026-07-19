@@ -73,6 +73,12 @@ pub struct Building {
     /// health or when the house can't pay. Defaults `false` (M7.9 P1). Hashed only
     /// when `true`, so no non-repairing building perturbs an existing golden.
     pub is_repairing: bool,
+    /// Campaign trigger attached to this structure (index into
+    /// [`crate::campaign::Campaign::triggers`]), or `None`. A `TEVENT_DESTROYED`/
+    /// `ATTACKED` on this trigger latches when this building dies / is hit. Set
+    /// only by the campaign loader; hashed **only when `Some`** so no
+    /// non-campaign world perturbs an existing golden (M7.5).
+    pub trigger: Option<u16>,
 }
 
 impl Building {
@@ -173,6 +179,12 @@ impl Building {
                     h.write_i32(c.y);
                 }
             }
+        }
+        // Campaign attachment (M7.5): folded ONLY when set, appending no bytes
+        // otherwise (every non-campaign golden unchanged).
+        if let Some(t) = self.trigger {
+            h.write_u8(0x2A);
+            h.write_u16(t);
         }
     }
 }

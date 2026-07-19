@@ -532,6 +532,11 @@ becomes a failing script committed with its fix.
    TeamTypeClass action+event tables, scenario win/lose triggers, reinforcements,
    so the single-player *missions* (not just skirmish) run. Prereq for a campaign
    release; independent of the M8 net work.
+   *Chunk A landed:* Allied mission 1 (`scg01ea`) is playable start-to-victory
+   through its real scenario data — the trigger/teamtype engine (`ra-sim/campaign`
+   + `run_campaign`), full `[INFANTRY]`/`[STRUCTURES]`/`[TERRAIN]` placement,
+   house credits/alliances, and the client campaign flow (menu → mission list →
+   briefing → play → Victory/Defeat). Deviations logged in QUIRKS Q17.
 8. **M8 — LAN multiplayer**: `LanTransport` peer lockstep + snapshot resync
    (stage 2). Single-player releases happen well before this.
 9. **M9 — Server play**: relay/sequencer server, lobby, server-held replays

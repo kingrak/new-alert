@@ -27,6 +27,7 @@ pub mod ai;
 pub mod arena;
 pub mod building;
 pub mod bullet;
+pub mod campaign;
 pub mod catalog;
 pub mod combat;
 pub mod coords;
@@ -45,6 +46,9 @@ pub use ai::{AiPlayer, Difficulty};
 pub use arena::{Arena, Handle};
 pub use building::Building;
 pub use bullet::Bullet;
+pub use campaign::{
+    Campaign, SpawnProto, TActionDef, TEventDef, TeamClass, TeamMission, TeamType, TriggerType,
+};
 pub use catalog::{BuildingProto, Catalog, EconRules, UnitProto};
 pub use combat::{modify_damage, Target, WarheadProfile, WeaponProfile, ARMOR_COUNT};
 pub use coords::{

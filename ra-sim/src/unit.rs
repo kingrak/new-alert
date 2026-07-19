@@ -182,6 +182,22 @@ pub struct Unit {
     /// `kind == Infantry`; 0 for vehicles. Hashed for infantry (it changes as
     /// they repack), gated so vehicle-only worlds hash byte-identically.
     pub sub_cell: u8,
+
+    // --- Campaign scripting (M7.5) ---
+    /// Campaign trigger attached to this object (index into
+    /// [`crate::campaign::Campaign::triggers`]), or `None`. Set only by the
+    /// campaign loader / reinforcement spawns; a `TEVENT_DESTROYED`/`ATTACKED`
+    /// on this trigger latches when this unit dies / is hit. Hashed **only when
+    /// `Some`**, so every non-campaign world is byte-identical.
+    pub trigger: Option<u16>,
+    /// Whether this unit counts as an evacuable civilian VIP (Einstein/Delphi/…)
+    /// for `TEVENT_EVAC_CIVILIAN` (`_Counts_As_Civ_Evac`, `aircraft.cpp:112`).
+    /// Set by the campaign loader. Hashed only when `true`.
+    pub is_civ_evac: bool,
+    /// Auto-hunt: when idle (no target, no path) this unit acquires the nearest
+    /// enemy and attacks it (`MISSION_HUNT`). Set by `TACTION_ALL_HUNT` and by
+    /// campaign attack-teams (M7.5). Hashed only when `true`.
+    pub hunt: bool,
 }
 
 impl Unit {
@@ -217,6 +233,9 @@ impl Unit {
             kind: UnitKind::Vehicle,
             locomotor: Locomotor::Track,
             sub_cell: 0,
+            trigger: None,
+            is_civ_evac: false,
+            hunt: false,
         }
     }
 
@@ -377,6 +396,19 @@ impl Unit {
         if self.kind == UnitKind::Infantry {
             h.write_u8(0x1F);
             h.write_u8(self.sub_cell);
+        }
+
+        // Campaign attachment (M7.5). Folded ONLY when set, appending no bytes
+        // otherwise, so every non-campaign world (all prior goldens) is identical.
+        if let Some(t) = self.trigger {
+            h.write_u8(0x2A);
+            h.write_u16(t);
+        }
+        if self.is_civ_evac {
+            h.write_u8(0x2B);
+        }
+        if self.hunt {
+            h.write_u8(0x2C);
         }
     }
 }

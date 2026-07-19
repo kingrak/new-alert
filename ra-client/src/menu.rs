@@ -119,6 +119,38 @@ pub trait GameFactory {
     fn build(&self, res: &ResolvedSkirmish) -> Result<(AppCore, CellCoord), String>;
 }
 
+/// One selectable campaign mission (from `general.mix`'s `scg*ea.ini` set).
+#[derive(Clone, Debug)]
+pub struct CampaignEntry {
+    /// Scenario key (e.g. `"scg01ea.ini"`).
+    pub scenario: String,
+    /// Mission display name (`[Basic] Name`).
+    pub name: String,
+}
+
+/// A fully-built campaign mission: the core, its start camera cell, and the
+/// briefing text to show before play.
+pub struct BuiltMission {
+    /// The ready-to-drive core.
+    pub core: AppCore,
+    /// Initial camera cell.
+    pub start: CellCoord,
+    /// Mission name.
+    pub name: String,
+    /// Briefing text.
+    pub briefing: String,
+}
+
+/// Enumerates and builds single-player campaign missions. Kept separate from
+/// [`GameFactory`] so the skirmish flow is unaffected; tests inject a synthetic
+/// one (or `None`, disabling the Campaign button).
+pub trait CampaignFactory {
+    /// The ordered Allied mission list (those that resolve in the archives).
+    fn missions(&self) -> Vec<CampaignEntry>;
+    /// Build one mission by scenario key, or an error string.
+    fn build(&self, scenario: &str) -> Result<BuiltMission, String>;
+}
+
 /// The current top-level UI state.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AppState {
@@ -126,6 +158,10 @@ pub enum AppState {
     MainMenu,
     /// Skirmish map + options selection.
     SkirmishSetup,
+    /// Campaign mission list.
+    CampaignList,
+    /// Mission briefing text screen (before play).
+    Briefing,
     /// A running game (delegates to [`AppCore`]).
     InGame,
     /// In-game pause overlay (sim frozen).
@@ -168,6 +204,7 @@ impl Default for SkirmishConfig {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Action {
     GotoSkirmish,
+    GotoCampaign,
     Quit,
     SelectMap(usize),
     ScrollMaps(i32),
@@ -178,6 +215,12 @@ enum Action {
     Resume,
     QuitToMenu,
     Continue,
+    /// Select campaign mission `idx` (go to its briefing).
+    SelectMission(usize),
+    /// Start the currently-briefed mission.
+    StartMission,
+    /// Retry the current mission after a defeat.
+    RetryMission,
     Disabled,
 }
 
@@ -206,6 +249,16 @@ pub struct App {
     config: SkirmishConfig,
     map_scroll: usize,
     factory: Box<dyn GameFactory>,
+    campaign_factory: Option<Box<dyn CampaignFactory>>,
+    campaign_missions: Vec<CampaignEntry>,
+    /// Index of the mission currently briefed / playing.
+    campaign_current: usize,
+    /// Briefing text for the current mission.
+    briefing_text: String,
+    /// Whether the running game is a campaign mission (vs. skirmish).
+    in_campaign: bool,
+    /// A mission core built eagerly by the briefing screen, ready to play.
+    pending_core: Option<(AppCore, CellCoord)>,
     core: Option<AppCore>,
     viewport_w: u32,
     viewport_h: u32,
@@ -232,6 +285,12 @@ impl App {
             config: SkirmishConfig::default(),
             map_scroll: 0,
             factory,
+            campaign_factory: None,
+            campaign_missions: Vec::new(),
+            campaign_current: 0,
+            briefing_text: String::new(),
+            in_campaign: false,
+            pending_core: None,
             core: None,
             viewport_w: 1024,
             viewport_h: 768,
@@ -242,6 +301,24 @@ impl App {
             last_error: None,
             focus: 0,
         }
+    }
+
+    /// Install the campaign factory, enabling the Campaign button and pre-scanning
+    /// the mission list. Chainable after [`App::new`].
+    pub fn with_campaign(mut self, factory: Box<dyn CampaignFactory>) -> App {
+        self.campaign_missions = factory.missions();
+        self.campaign_factory = Some(factory);
+        self
+    }
+
+    /// The scanned campaign mission list (for tests / the shell).
+    pub fn campaign_missions(&self) -> &[CampaignEntry] {
+        &self.campaign_missions
+    }
+
+    /// The current briefing text (for tests).
+    pub fn briefing_text(&self) -> &str {
+        &self.briefing_text
     }
 
     /// The current UI state (for the shell + tests).
@@ -366,6 +443,8 @@ impl App {
             AppState::InGame => self.handle_ingame(ev),
             AppState::MainMenu
             | AppState::SkirmishSetup
+            | AppState::CampaignList
+            | AppState::Briefing
             | AppState::Paused
             | AppState::GameOver => self.handle_menu(ev),
         }
@@ -411,7 +490,10 @@ impl App {
             InputEvent::KeyDown(Key::Menu) => {
                 // Back out one level.
                 match self.state {
-                    AppState::SkirmishSetup => self.state = AppState::MainMenu,
+                    AppState::SkirmishSetup | AppState::CampaignList => {
+                        self.state = AppState::MainMenu
+                    }
+                    AppState::Briefing => self.state = AppState::CampaignList,
                     AppState::Paused => self.state = AppState::InGame,
                     _ => {}
                 }
@@ -465,20 +547,119 @@ impl App {
                 self.state = AppState::SkirmishSetup;
                 self.focus = 0;
             }
+            Action::GotoCampaign => {
+                self.state = AppState::CampaignList;
+                self.focus = 0;
+            }
             Action::Quit => self.quit = true,
             Action::SelectMap(i) => self.select_map(i),
             Action::ScrollMaps(d) => self.scroll_maps(d),
             Action::Cycle(field, d) => self.cycle(field, d),
             Action::ToggleRadar => self.config.classic_radar = !self.config.classic_radar,
             Action::StartGame => self.start_game(),
+            Action::SelectMission(i) => self.goto_briefing(i),
+            Action::StartMission => self.start_mission(self.campaign_current),
+            Action::RetryMission => self.start_mission(self.campaign_current),
             Action::BackToMenu => {
                 self.state = AppState::MainMenu;
                 self.focus = 0;
             }
             Action::Resume => self.state = AppState::InGame,
             Action::QuitToMenu => self.quit_to_menu(),
-            Action::Continue => self.quit_to_menu(),
+            Action::Continue => self.on_continue(),
             Action::Disabled => {}
+        }
+    }
+
+    /// Show the briefing for mission `idx` (loads its text from the factory).
+    fn goto_briefing(&mut self, idx: usize) {
+        self.campaign_current = idx;
+        self.focus = 0;
+        // Fetch the briefing text by building nothing — the factory carries it in
+        // the built mission, so we read it at start; here we show the list-known
+        // briefing lazily by attempting a build for text only would be wasteful,
+        // so we defer text to `start_mission`. Show a placeholder until then.
+        self.briefing_text = self
+            .campaign_missions
+            .get(idx)
+            .map(|m| format!("MISSION: {}", m.name))
+            .unwrap_or_default();
+        // Build eagerly so the real briefing text is available on the screen.
+        if let Some(f) = &self.campaign_factory {
+            if let Some(entry) = self.campaign_missions.get(idx) {
+                if let Ok(built) = f.build(&entry.scenario) {
+                    self.briefing_text = built.briefing;
+                    // Stash the built core for immediate play (avoids a second load).
+                    self.pending_core = Some((built.core, built.start));
+                }
+            }
+        }
+        self.state = AppState::Briefing;
+    }
+
+    /// Start (or restart) campaign mission `idx`.
+    fn start_mission(&mut self, idx: usize) {
+        self.campaign_current = idx;
+        // Prefer the core stashed by the briefing build; else build fresh (retry).
+        let built = self.pending_core.take();
+        let (mut core, start) = match built {
+            Some(cs) => cs,
+            None => {
+                let Some(f) = &self.campaign_factory else {
+                    self.last_error = Some("no campaign factory".into());
+                    return;
+                };
+                let Some(entry) = self.campaign_missions.get(idx) else {
+                    return;
+                };
+                match f.build(&entry.scenario) {
+                    Ok(b) => {
+                        self.briefing_text = b.briefing;
+                        (b.core, b.start)
+                    }
+                    Err(e) => {
+                        self.last_error = Some(e);
+                        return;
+                    }
+                }
+            }
+        };
+        core.handle(InputEvent::Resize {
+            width: self.viewport_w,
+            height: self.viewport_h,
+        });
+        let tw = core.tactical_width();
+        core.set_camera(
+            (start.x * crate::appcore::CELL_PIXELS) as f32 - tw as f32 / 2.0,
+            (start.y * crate::appcore::CELL_PIXELS) as f32 - self.viewport_h as f32 / 2.0,
+        );
+        self.core = Some(core);
+        self.in_campaign = true;
+        self.last_error = None;
+        self.state = AppState::InGame;
+    }
+
+    /// The game-over "Continue" button: in a campaign, a Victory advances to the
+    /// next mission's briefing (or the menu if the campaign is complete); a Defeat
+    /// (or a skirmish) returns to the menu.
+    fn on_continue(&mut self) {
+        let victory = self
+            .core
+            .as_ref()
+            .map(|c| c.game_over() == ra_sim::GameOver::Victory)
+            .unwrap_or(false);
+        if self.in_campaign && victory {
+            let next = self.campaign_current + 1;
+            self.core = None;
+            self.in_campaign = false;
+            if next < self.campaign_missions.len() {
+                self.goto_briefing(next);
+            } else {
+                self.quit_to_menu();
+            }
+        } else {
+            self.in_campaign = false;
+            self.quit_to_menu();
         }
     }
 
@@ -557,6 +738,8 @@ impl App {
         match self.state {
             AppState::MainMenu => self.compose_main_menu(),
             AppState::SkirmishSetup => self.compose_setup(),
+            AppState::CampaignList => self.compose_campaign_list(),
+            AppState::Briefing => self.compose_briefing(),
             AppState::InGame => self.compose_ingame(),
             AppState::Paused => self.compose_paused(),
             AppState::GameOver => self.compose_gameover(),
@@ -684,6 +867,47 @@ impl App {
         frame
     }
 
+    fn compose_campaign_list(&self) -> Frame {
+        let mut frame = self.blank();
+        fill_background(&mut frame, [10, 14, 26]);
+        font::draw_text_scaled(&mut frame, 40, 24, "ALLIED CAMPAIGN", [220, 200, 120], 3);
+        if self.campaign_missions.is_empty() {
+            font::draw_text(&mut frame, 40, 90, "NO MISSIONS FOUND", [200, 120, 120]);
+        }
+        self.draw_items(&mut frame);
+        frame
+    }
+
+    fn compose_briefing(&self) -> Frame {
+        let mut frame = self.blank();
+        fill_background(&mut frame, [8, 12, 20]);
+        let title = self
+            .campaign_missions
+            .get(self.campaign_current)
+            .map(|m| m.name.as_str())
+            .unwrap_or("MISSION");
+        font::draw_text_scaled(&mut frame, 40, 30, "BRIEFING", [220, 200, 120], 3);
+        font::draw_text_scaled(
+            &mut frame,
+            40,
+            70,
+            &title.to_uppercase(),
+            [180, 200, 230],
+            2,
+        );
+        // Word-wrap the briefing text into the content area.
+        let margin = 40;
+        let max_w = (self.viewport_w as i32 - margin * 2).max(80);
+        let cols = (max_w / font::text_width("M").max(1)).max(10) as usize;
+        let mut y = 120;
+        for line in wrap_text(&self.briefing_text, cols) {
+            font::draw_text(&mut frame, margin, y, &line, [210, 214, 222]);
+            y += font::GLYPH_H + 6;
+        }
+        self.draw_items(&mut frame);
+        frame
+    }
+
     fn compose_paused(&self) -> Frame {
         // The frozen game frame, dimmed, with a pause panel over it.
         let mut frame = self.compose_ingame();
@@ -718,6 +942,8 @@ impl App {
         match self.state {
             AppState::MainMenu => self.items_main_menu(),
             AppState::SkirmishSetup => self.items_setup(),
+            AppState::CampaignList => self.items_campaign_list(),
+            AppState::Briefing => self.items_briefing(),
             AppState::Paused => self.items_paused(),
             AppState::GameOver => self.items_gameover(),
             AppState::InGame => Vec::new(),
@@ -741,10 +967,64 @@ impl App {
         };
         items.push(push("SKIRMISH", Action::GotoSkirmish, true, y));
         y += gap;
-        items.push(push("CAMPAIGN - COMING SOON", Action::Disabled, false, y));
+        let has_campaign = self.campaign_factory.is_some() && !self.campaign_missions.is_empty();
+        if has_campaign {
+            items.push(push("CAMPAIGN", Action::GotoCampaign, true, y));
+        } else {
+            // No campaign factory (asset-free menu goldens) keeps the original
+            // disabled label + geometry, so the main-menu golden is unchanged.
+            items.push(push("CAMPAIGN - COMING SOON", Action::Disabled, false, y));
+        }
         y += gap;
         items.push(push("QUIT", Action::Quit, true, y));
         items
+    }
+
+    fn items_campaign_list(&self) -> Vec<Item> {
+        let mut items = Vec::new();
+        let x0 = 40;
+        let w = (self.viewport_w as i32 - 80).min(560);
+        let mut y = 90;
+        for (i, m) in self.campaign_missions.iter().enumerate() {
+            items.push(Item {
+                rect: (x0, y, x0 + w, y + 24),
+                label: format!("MISSION {} - {}", i + 1, trunc(&m.name, 40)),
+                action: Action::SelectMission(i),
+                enabled: true,
+                selected: i == self.campaign_current,
+            });
+            y += 28;
+        }
+        y += 12;
+        items.push(Item {
+            rect: (x0, y, x0 + 140, y + 32),
+            label: "BACK".to_string(),
+            action: Action::BackToMenu,
+            enabled: true,
+            selected: false,
+        });
+        items
+    }
+
+    fn items_briefing(&self) -> Vec<Item> {
+        let cx = self.viewport_w as i32 / 2;
+        let y = self.viewport_h as i32 - 80;
+        vec![
+            Item {
+                rect: (cx - 260, y, cx - 20, y + 34),
+                label: "START MISSION".to_string(),
+                action: Action::StartMission,
+                enabled: true,
+                selected: false,
+            },
+            Item {
+                rect: (cx + 20, y, cx + 200, y + 34),
+                label: "BACK".to_string(),
+                action: Action::GotoCampaign, // return to the mission list
+                enabled: true,
+                selected: false,
+            },
+        ]
     }
 
     fn items_setup(&self) -> Vec<Item> {
@@ -891,15 +1171,66 @@ impl App {
         let bw = 240;
         let bh = 36;
         let x0 = cx - bw / 2;
-        let y = self.viewport_h as i32 - 120;
-        vec![Item {
+        // Skirmish (non-campaign) keeps the *exact* original single-CONTINUE
+        // layout at `vh - 120`, so the game-over golden is byte-identical.
+        if !self.in_campaign {
+            let y = self.viewport_h as i32 - 120;
+            return vec![Item {
+                rect: (x0, y, x0 + bw, y + bh),
+                label: "CONTINUE".to_string(),
+                action: Action::Continue,
+                enabled: true,
+                selected: false,
+            }];
+        }
+        // Campaign: a defeat offers RETRY above the CONTINUE (advance / retry).
+        let defeat = self
+            .core
+            .as_ref()
+            .map(|c| c.game_over() == ra_sim::GameOver::Defeat)
+            .unwrap_or(false);
+        let mut y = self.viewport_h as i32 - 130;
+        let mut items = Vec::new();
+        if defeat {
+            items.push(Item {
+                rect: (x0, y, x0 + bw, y + bh),
+                label: "RETRY MISSION".to_string(),
+                action: Action::RetryMission,
+                enabled: true,
+                selected: false,
+            });
+            y += bh + 14;
+        }
+        items.push(Item {
             rect: (x0, y, x0 + bw, y + bh),
-            label: "CONTINUE".to_string(),
+            label: if defeat { "CONTINUE" } else { "NEXT MISSION" }.to_string(),
             action: Action::Continue,
             enabled: true,
             selected: false,
-        }]
+        });
+        items
     }
+}
+
+/// Greedy word-wrap `text` into lines of at most `cols` characters.
+fn wrap_text(text: &str, cols: usize) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut cur = String::new();
+    for word in text.split_whitespace() {
+        if cur.is_empty() {
+            cur = word.to_string();
+        } else if cur.len() + 1 + word.len() <= cols {
+            cur.push(' ');
+            cur.push_str(word);
+        } else {
+            lines.push(std::mem::take(&mut cur));
+            cur = word.to_string();
+        }
+    }
+    if !cur.is_empty() {
+        lines.push(cur);
+    }
+    lines
 }
 
 /// Truncate a string to `max` chars for a fixed-width row.

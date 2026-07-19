@@ -11,6 +11,7 @@ use crate::ai::{AiPlayer, Difficulty};
 use crate::arena::{Arena, Handle};
 use crate::building::Building;
 use crate::bullet::Bullet;
+use crate::campaign::{self, Campaign};
 use crate::catalog::Catalog;
 use crate::combat::{aligned_to_fire, modify_damage, Target, WeaponProfile};
 use crate::coords::{
@@ -160,6 +161,14 @@ pub struct World {
     rng: RandomLcg,
     /// The current tick number (advances once per [`World::tick`]).
     tick_count: u32,
+    /// Campaign scenario-scripting state (triggers/teamtypes/waypoints/globals),
+    /// or `None` for a skirmish. Evaluated by `run_campaign`; hashed only when
+    /// present, so every skirmish world is byte-identical (M7.5).
+    campaign: Option<Campaign>,
+    /// House alliance matrix: `alliances[a]` has bit `b` set when house `a` is
+    /// allied with house `b` (`HouseClass::Is_Ally`, `house.cpp`). `None` in a
+    /// skirmish (where "ally" means "same house"). Hashed only when present.
+    alliances: Option<Vec<u64>>,
 }
 
 /// Terminal outcome of a skirmish, from the player's point of view (M6, item 4).
@@ -222,12 +231,70 @@ impl World {
             game_over: GameOver::Ongoing,
             rng: RandomLcg::new(seed),
             tick_count: 0,
+            campaign: None,
+            alliances: None,
+        }
+    }
+
+    /// Install a campaign's scenario-scripting state (M7.5). Presence flips
+    /// win/lose from "eliminate every AI" to trigger-driven (see
+    /// `update_game_over`).
+    pub fn set_campaign(&mut self, campaign: Campaign) {
+        self.campaign = Some(campaign);
+    }
+
+    /// Borrow the campaign scripting state, if this is a mission.
+    pub fn campaign(&self) -> Option<&Campaign> {
+        self.campaign.as_ref()
+    }
+
+    /// Mutable campaign state (the client drains cosmetic outputs — text/speech/
+    /// reveal — through this).
+    pub fn campaign_mut(&mut self) -> Option<&mut Campaign> {
+        self.campaign.as_mut()
+    }
+
+    /// Install the house alliance matrix (bitmask per house). See
+    /// [`World::are_allies`].
+    pub fn set_alliances(&mut self, alliances: Vec<u64>) {
+        self.alliances = Some(alliances);
+    }
+
+    /// Whether house `a` treats house `b` as an ally (never a target). A house is
+    /// always its own ally; with no alliance matrix (skirmish) only same-house
+    /// counts, so skirmish targeting is byte-identical to before.
+    pub fn are_allies(&self, a: u8, b: u8) -> bool {
+        if a == b {
+            return true;
+        }
+        match &self.alliances {
+            Some(m) => m
+                .get(a as usize)
+                .map(|&bits| bits & (1u64 << (b as u64 & 63)) != 0)
+                .unwrap_or(false),
+            None => false,
+        }
+    }
+
+    /// Force the terminal game state (used by campaign WIN/LOSE trigger actions).
+    /// First terminal state sticks.
+    pub fn set_game_over(&mut self, over: GameOver) {
+        if self.game_over == GameOver::Ongoing {
+            self.game_over = over;
         }
     }
 
     /// Install the build catalog (footprints, costs, prerequisites, protos).
     pub fn set_catalog(&mut self, catalog: Catalog) {
         self.catalog = catalog;
+    }
+
+    /// Mark a cell as a static movement obstacle (campaign `[TERRAIN]` trees etc.
+    /// — a render-only object with occupancy, `TerrainClass::Occupy_List`,
+    /// `terrain.cpp`). Ground movers route around it or hold, exactly like a
+    /// building footprint (M7.5 P1).
+    pub fn block_cell(&mut self, cell: CellCoord) {
+        self.passable.set_occupied(cell, true);
     }
 
     /// Install the ore overlay.
@@ -488,6 +555,7 @@ impl World {
             is_wall: proto.is_wall,
             storage: proto.storage,
             is_repairing: false,
+            trigger: None,
         };
         let handle = self.buildings.insert(building);
         // Stamp occupancy.
@@ -589,6 +657,18 @@ impl World {
             h.write_u8(0x60);
             h.write_u8(self.game_over as u8);
         }
+        // Campaign scripting + alliance matrix fold in ONLY when present, so every
+        // skirmish/combat/movement golden is byte-identical (M7.5).
+        if let Some(c) = &self.campaign {
+            c.hash_into(&mut h);
+        }
+        if let Some(a) = &self.alliances {
+            h.write_u8(0xAA);
+            for &bits in a {
+                h.write_u32((bits & 0xFFFF_FFFF) as u32);
+                h.write_u32((bits >> 32) as u32);
+            }
+        }
         h.finish()
     }
 }
@@ -656,6 +736,12 @@ pub fn apply(world: &mut World, tick: u32, commands: &[Command]) {
     // System 7: ore growth/spread (draws sync RNG when enabled) — deferred M5 item.
     run_ore_growth(world);
 
+    // System 7.5: campaign scenario-scripting (M7.5) — evaluate triggers, fire
+    // actions (reinforcements/reveal/globals/win-lose). After combat/movement so
+    // this tick's deaths are visible to DESTROYED events; before win/lose so a
+    // WIN/LOSE action resolves this same tick.
+    run_campaign(world);
+
     // System 8: house-elimination / win-lose resolution.
     update_game_over(world);
 
@@ -700,9 +786,607 @@ fn update_game_over(world: &mut World) {
         world.game_over = GameOver::Defeat;
         return;
     }
-    // Victory once every AI-controlled house has been eliminated.
+    // In a campaign, victory is **trigger-driven** (a `TACTION_WIN` fires
+    // `set_game_over(Victory)`); the "every AI eliminated" auto-win does not
+    // apply (a mission can leave neutral/enemy houses standing). Defeat on player
+    // elimination still holds above.
+    if world.campaign.is_some() {
+        return;
+    }
+    // Skirmish: victory once every AI-controlled house has been eliminated.
     if !world.ai.is_empty() && world.ai.iter().all(|a| !world.house_alive(a.house)) {
         world.game_over = GameOver::Victory;
+    }
+}
+
+// ===========================================================================
+// Campaign scenario-scripting engine (M7.5). Ports trigger.cpp `Spring`,
+// tevent.cpp `operator()`, taction.cpp `operator()`, reinf.cpp `Do_Reinforcements`.
+// ===========================================================================
+
+/// System 7.5: evaluate the campaign triggers and fire their actions.
+fn run_campaign(world: &mut World) {
+    let Some(mut camp) = world.campaign.take() else {
+        return;
+    };
+    let tpm = world.catalog.econ.ticks_per_minute.max(1);
+    let ticks_per_tenth = (tpm / 10).max(1);
+
+    // First-tick init: seed each TIME event's countdown + carrier baselines.
+    if !camp.started {
+        for i in 0..camp.triggers.len() {
+            let (e1_time, e2_time) = {
+                let t = &camp.triggers[i];
+                (
+                    if t.e1.code == campaign::tevent::TIME {
+                        t.e1.data.max(0) * ticks_per_tenth
+                    } else {
+                        -1
+                    },
+                    if t.e2.code == campaign::tevent::TIME {
+                        t.e2.data.max(0) * ticks_per_tenth
+                    } else {
+                        -1
+                    },
+                )
+            };
+            camp.state[i].e1_timer = e1_time;
+            camp.state[i].e2_timer = e2_time;
+        }
+        let counts = carrier_counts(world, camp.triggers.len());
+        for (i, st) in camp.state.iter_mut().enumerate() {
+            st.carriers = counts[i];
+            st.carriers_init = counts[i];
+        }
+        camp.started = true;
+    }
+
+    // Update carriers + latch VOLATILE `DESTROYED` when a carrier count drops.
+    let counts = carrier_counts(world, camp.triggers.len());
+    for (i, st) in camp.state.iter_mut().enumerate() {
+        if counts[i] < st.carriers {
+            st.any_destroyed = true;
+        }
+        st.carriers = counts[i];
+    }
+
+    // Advance timers.
+    for st in camp.state.iter_mut() {
+        if st.e1_timer > 0 {
+            st.e1_timer -= 1;
+        }
+        if st.e2_timer > 0 {
+            st.e2_timer -= 1;
+        }
+    }
+    if let Some(t) = camp.mission_timer.as_mut() {
+        if *t > 0 {
+            *t -= 1;
+        }
+    }
+
+    // Evacuation: a friendly civilian VIP on a DZ cell is evacuated (our simplified
+    // stand-in for the aircraft-leaves-map path — see QUIRKS).
+    process_evac(world, &mut camp);
+
+    // Evaluate every trigger in INI order.
+    let mut forced: Vec<usize> = Vec::new();
+    for i in 0..camp.triggers.len() {
+        maybe_spring(world, &mut camp, i, false, ticks_per_tenth, &mut forced);
+    }
+    // Resolve FORCE_TRIGGER chains (bounded).
+    let mut guard = 0;
+    while let Some(idx) = forced.pop() {
+        guard += 1;
+        if guard > 512 {
+            break;
+        }
+        maybe_spring(world, &mut camp, idx, true, ticks_per_tenth, &mut forced);
+    }
+
+    world.campaign = Some(camp);
+}
+
+/// Count live object carriers (units + buildings) per trigger index.
+fn carrier_counts(world: &World, n: usize) -> Vec<i32> {
+    let mut counts = vec![0i32; n];
+    for (_, u) in world.units.iter() {
+        if !u.is_alive() {
+            continue;
+        }
+        if let Some(t) = u.trigger {
+            if let Some(c) = counts.get_mut(t as usize) {
+                *c += 1;
+            }
+        }
+    }
+    for (_, b) in world.buildings.iter() {
+        if !b.is_alive() {
+            continue;
+        }
+        if let Some(t) = b.trigger {
+            if let Some(c) = counts.get_mut(t as usize) {
+                *c += 1;
+            }
+        }
+    }
+    counts
+}
+
+/// Try to spring trigger `i`. `forced` means a `FORCE_TRIGGER` bypassing the event
+/// checks (`TriggerClass::Spring(..., forced=true)`).
+fn maybe_spring(
+    world: &mut World,
+    camp: &mut Campaign,
+    i: usize,
+    forced: bool,
+    ticks_per_tenth: i32,
+    forced_out: &mut Vec<usize>,
+) {
+    let (persist, ectrl, actctrl) = {
+        let t = &camp.triggers[i];
+        (t.persist, t.event_ctrl, t.action_ctrl)
+    };
+    // Already sprung (and not persistent, not a forced re-spring): skip.
+    if camp.state[i].sprung && persist != campaign::persist::PERSISTANT && !forced {
+        return;
+    }
+
+    let (e1, e2) = if forced {
+        (true, false)
+    } else {
+        (
+            eval_event(world, camp, i, true),
+            eval_event(world, camp, i, false),
+        )
+    };
+    let satisfied = if forced {
+        true
+    } else {
+        match ectrl {
+            campaign::multi::ONLY => e1,
+            campaign::multi::AND => e1 && e2,
+            _ => e1 || e2, // OR + LINKED both spring on either event
+        }
+    };
+    if !satisfied {
+        return;
+    }
+
+    // Which actions run (trigger.cpp:304-323).
+    let (run_a1, run_a2) = if !forced && ectrl == campaign::multi::LINKED {
+        (e1, e2)
+    } else {
+        (true, actctrl != campaign::multi::ONLY)
+    };
+
+    // Clone the actions so we can mutate `camp`/`world` without holding a borrow.
+    let (a1, a2) = {
+        let t = &camp.triggers[i];
+        (t.a1.clone(), t.a2.clone())
+    };
+    if run_a1 {
+        run_action(world, camp, &a1, i, ticks_per_tenth, forced_out);
+    }
+    if run_a2 {
+        run_action(world, camp, &a2, i, ticks_per_tenth, forced_out);
+    }
+
+    if persist != campaign::persist::PERSISTANT {
+        camp.state[i].sprung = true;
+    }
+}
+
+/// Evaluate one event (`TEventClass::operator()`). `is_e1` selects event1/event2.
+fn eval_event(world: &World, camp: &Campaign, i: usize, is_e1: bool) -> bool {
+    use campaign::tevent::*;
+    let t = &camp.triggers[i];
+    let ev = if is_e1 { &t.e1 } else { &t.e2 };
+    let st = &camp.state[i];
+    match ev.code {
+        NONE => false,
+        // Countdown reached zero (tevent.cpp:256).
+        TIME => (if is_e1 { st.e1_timer } else { st.e2_timer }) == 0,
+        // Object-attached destruction. SEMIPERSISTANT springs only when *all*
+        // attached carriers are gone; VOLATILE/PERSISTANT on the first death.
+        DESTROYED => {
+            if t.persist == campaign::persist::SEMI {
+                st.carriers == 0 && st.carriers_init > 0
+            } else {
+                st.any_destroyed
+            }
+        }
+        ATTACKED => st.any_attacked,
+        GLOBAL_SET => camp.globals.get(ev.data as usize).copied().unwrap_or(false),
+        GLOBAL_CLEAR => !camp.globals.get(ev.data as usize).copied().unwrap_or(false),
+        EVAC_CIVILIAN => camp.is_civ_evacuated(t.house.max(0) as u8),
+        LOW_POWER => world
+            .houses
+            .get(ev.data.max(0) as usize)
+            .map(|h| h.low_power())
+            .unwrap_or(false),
+        PLAYER_ENTERED | CROSS_HORIZONTAL | CROSS_VERTICAL => {
+            player_entered(world, camp, i as u16, ev.data.max(0) as u8)
+        }
+        // House-scan "all destroyed" family (tevent.cpp:463-483).
+        ALL_DESTROYED => {
+            let h = ev.data.max(0) as u8;
+            !house_has_any(world, h, true, true)
+        }
+        UNITS_DESTROYED => {
+            let h = ev.data.max(0) as u8;
+            !house_has_any(world, h, true, false)
+        }
+        BUILDINGS_DESTROYED => {
+            let h = ev.data.max(0) as u8;
+            !house_has_any(world, h, false, true)
+        }
+        BUILDING_EXISTS => {
+            let h = t.house.max(0) as u8;
+            world
+                .buildings
+                .iter()
+                .any(|(_, b)| b.house == h && b.is_alive() && !b.is_wall)
+        }
+        _ => false,
+    }
+}
+
+/// Whether house `h` has any live unit and/or building (the `Active*Scan` test).
+fn house_has_any(world: &World, h: u8, units: bool, buildings: bool) -> bool {
+    if units
+        && world
+            .units
+            .iter()
+            .any(|(_, u)| u.house == h && u.is_alive())
+    {
+        return true;
+    }
+    if buildings
+        && world
+            .buildings
+            .iter()
+            .any(|(_, b)| b.house == h && b.is_alive() && !b.is_wall)
+    {
+        return true;
+    }
+    false
+}
+
+/// Whether a unit of house `house` occupies a cell carrying trigger `trig`.
+fn player_entered(world: &World, camp: &Campaign, trig: u16, house: u8) -> bool {
+    for &(cell, t) in &camp.cell_triggers {
+        if t != trig {
+            continue;
+        }
+        let cc = CellCoord::from_index(cell);
+        if world
+            .units
+            .iter()
+            .any(|(_, u)| u.house == house && u.is_alive() && u.cell() == cc)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Execute one action (`TActionClass::operator()`).
+fn run_action(
+    world: &mut World,
+    camp: &mut Campaign,
+    a: &crate::campaign::TActionDef,
+    trig: usize,
+    ticks_per_tenth: i32,
+    forced_out: &mut Vec<usize>,
+) {
+    use campaign::taction::*;
+    match a.code {
+        WIN => world.set_game_over(GameOver::Victory),
+        LOSE => world.set_game_over(GameOver::Defeat),
+        TEXT_TRIGGER => camp.pending_texts.push(a.data),
+        PLAY_SPEECH => camp.pending_speech.push(a.data),
+        SET_GLOBAL => set_global(camp, a.data, true),
+        CLEAR_GLOBAL => set_global(camp, a.data, false),
+        DZ => {
+            if let Some(c) = camp.waypoint_cell(a.data) {
+                if !camp.evac_cells.contains(&c) {
+                    camp.evac_cells.push(c);
+                }
+            }
+        }
+        REVEAL_ALL => {
+            camp.reveal_all = true;
+            reveal_whole_map(world);
+        }
+        REVEAL_SOME => {
+            if let Some(c) = camp.waypoint_cell(a.data) {
+                if let Some(idx) = c.to_index() {
+                    camp.reveal_cells.push(idx);
+                }
+                if let Some(p) = world.player_house() {
+                    world.reveal_shroud(p, c, 6);
+                }
+            }
+        }
+        REINFORCEMENTS => spawn_team(world, camp, a.team, true),
+        CREATE_TEAM => spawn_team(world, camp, a.team, false),
+        ALL_HUNT => set_all_hunt(world, a.data.max(0) as u8),
+        DESTROY_OBJECT => destroy_trigger_object(world, trig as u16),
+        FORCE_TRIGGER => {
+            if a.trigger >= 0 && (a.trigger as usize) < camp.triggers.len() {
+                forced_out.push(a.trigger as usize);
+            }
+        }
+        DESTROY_TRIGGER => {
+            if a.trigger >= 0 {
+                if let Some(s) = camp.state.get_mut(a.trigger as usize) {
+                    s.sprung = true;
+                }
+            }
+        }
+        START_TIMER | SET_TIMER => {
+            camp.mission_timer = Some(a.data.max(0) * ticks_per_tenth);
+        }
+        STOP_TIMER => camp.mission_timer = None,
+        // BEGIN_PRODUCTION / FIRE_SALE / AUTOCREATE / ALLOWWIN / DESTROY_TEAM /
+        // PLAY_MOVIE / etc. — inert or deferred (documented in QUIRKS).
+        _ => {}
+    }
+}
+
+fn set_global(camp: &mut Campaign, idx: i32, val: bool) {
+    if idx < 0 {
+        return;
+    }
+    let i = idx as usize;
+    if camp.globals.len() <= i {
+        camp.globals.resize(i + 1, false);
+    }
+    camp.globals[i] = val;
+}
+
+/// Reveal the whole map for the player house (`TACTION_REVEAL_ALL`).
+fn reveal_whole_map(world: &mut World) {
+    let Some(p) = world.player_house() else {
+        return;
+    };
+    let (w, h) = (world.passable.width(), world.passable.height());
+    for y in 0..h {
+        for x in 0..w {
+            world.reveal_shroud(p, CellCoord::new(x, y), 1);
+        }
+    }
+}
+
+/// Set every live unit of house `h` to auto-hunt (`TACTION_ALL_HUNT`).
+fn set_all_hunt(world: &mut World, h: u8) {
+    let handles: Vec<Handle> = world
+        .units
+        .iter()
+        .filter(|(_, u)| u.house == h && u.is_alive())
+        .map(|(hd, _)| hd)
+        .collect();
+    for hd in handles {
+        if let Some(u) = world.units.get_mut(hd) {
+            u.hunt = true;
+        }
+    }
+}
+
+/// Kill whatever object currently carries trigger `trig` (`TACTION_DESTROY_OBJECT`).
+fn destroy_trigger_object(world: &mut World, trig: u16) {
+    let bh: Vec<Handle> = world
+        .buildings
+        .iter()
+        .filter(|(_, b)| b.trigger == Some(trig) && b.is_alive())
+        .map(|(h, _)| h)
+        .collect();
+    for h in bh {
+        remove_building(world, h);
+    }
+    let uh: Vec<Handle> = world
+        .units
+        .iter()
+        .filter(|(_, u)| u.trigger == Some(trig) && u.is_alive())
+        .map(|(h, _)| h)
+        .collect();
+    for h in uh {
+        world.units.remove(h);
+    }
+}
+
+/// Evacuate any friendly civilian VIP standing on a DZ/evac cell: latch its
+/// house's `IsCivEvacuated` and remove it from the map.
+fn process_evac(world: &mut World, camp: &mut Campaign) {
+    if camp.evac_cells.is_empty() {
+        return;
+    }
+    // A VIP standing on, or orthogonally/diagonally adjacent to, a DZ cell counts
+    // as reaching the landing zone (the flare marks an area, not a single tile —
+    // this also frees the evac from an exact-cell match if the flare tile itself
+    // is impassable).
+    let near_lz = |c: CellCoord| -> bool {
+        camp.evac_cells
+            .iter()
+            .any(|e| (e.x - c.x).abs() <= 1 && (e.y - c.y).abs() <= 1)
+    };
+    let evac: Vec<(Handle, u8, Option<u16>)> = world
+        .units
+        .iter()
+        .filter(|(_, u)| u.is_civ_evac && u.is_alive() && near_lz(u.cell()))
+        .map(|(h, u)| (h, u.house, u.trigger))
+        .collect();
+    for (h, house, trig) in evac {
+        let i = house as usize;
+        if camp.civ_evacuated.len() <= i {
+            camp.civ_evacuated.resize(i + 1, false);
+        }
+        camp.civ_evacuated[i] = true;
+        // An evacuated VIP *left the map* — he is not "destroyed". Lower his
+        // trigger's carrier baseline so the removal below is not mistaken for a
+        // death by a `TEVENT_DESTROYED` on that trigger (e.g. Einstein carries
+        // the "he died -> LOSE" trigger; evac must not trip it).
+        if let Some(t) = trig {
+            if let Some(st) = camp.state.get_mut(t as usize) {
+                st.carriers = (st.carriers - 1).max(0);
+                st.carriers_init = (st.carriers_init - 1).max(0);
+            }
+        }
+        world.units.remove(h);
+    }
+}
+
+/// The team's primary movement target + whether it should auto-hunt, from its
+/// first actionable mission (`TeamMissionClass`).
+fn team_objective(tt: &crate::campaign::TeamType, camp: &Campaign) -> (Option<CellCoord>, bool) {
+    use campaign::tmission::*;
+    for m in &tt.missions {
+        match m.code {
+            ATT_WAYPT | PATROL => return (camp.waypoint_cell(m.arg), true),
+            MOVE => return (camp.waypoint_cell(m.arg), false),
+            MOVECELL => return (Some(CellCoord::from_index(m.arg.max(0) as u32)), false),
+            ATTACK => return (None, true),
+            GUARD => return (None, false),
+            _ => {}
+        }
+    }
+    (None, false)
+}
+
+/// Spawn (`REINFORCEMENTS`) or recruit (`CREATE_TEAM`) a team and set its mission.
+fn spawn_team(world: &mut World, camp: &mut Campaign, team_idx: i32, spawn: bool) {
+    if team_idx < 0 {
+        return;
+    }
+    let tt = match camp.teamtypes.get(team_idx as usize) {
+        Some(t) => t.clone(),
+        None => return,
+    };
+    let house = tt.house.clamp(0, 255) as u8;
+    let (move_target, hunt) = team_objective(&tt, camp);
+    let assigned_trigger = if tt.trigger >= 0 {
+        Some(tt.trigger as u16)
+    } else {
+        None
+    };
+
+    let mut members: Vec<Handle> = Vec::new();
+    if spawn {
+        let base = camp
+            .waypoint_cell(tt.origin)
+            .unwrap_or_else(|| CellCoord::new(1, 1));
+        let mut slot = 0i32;
+        for cls in &tt.classes {
+            let Some(proto) = &cls.proto else {
+                continue; // naval/air/unspawnable — deferred
+            };
+            for _ in 0..cls.count {
+                let cell = disperse_cell(world, base, slot);
+                slot += 1;
+                let spot = (slot as usize % SUBCELL_COUNT) as u8;
+                let h = spawn_from_proto(world, proto, house, cell, spot);
+                if let Some(u) = world.units.get_mut(h) {
+                    u.trigger = assigned_trigger;
+                    u.hunt = hunt;
+                }
+                members.push(h);
+            }
+        }
+    } else {
+        // CREATE_TEAM: recruit existing idle house units (no spawn), taking up to
+        // the team's total class count. Simplified — no per-class type match.
+        let want: u32 = tt
+            .classes
+            .iter()
+            .map(|c| c.count as u32)
+            .sum::<u32>()
+            .max(1);
+        let handles: Vec<Handle> = world
+            .units
+            .iter()
+            .filter(|(_, u)| {
+                u.house == house && u.is_alive() && !u.hunt && !u.is_harvester && !u.is_civ_evac
+            })
+            .map(|(h, _)| h)
+            .take(want as usize)
+            .collect();
+        for h in handles {
+            if let Some(u) = world.units.get_mut(h) {
+                u.hunt = hunt;
+            }
+            members.push(h);
+        }
+    }
+
+    // Issue the movement order (attack-move if hunt).
+    if let Some(target) = move_target {
+        for h in members {
+            apply_command(
+                world,
+                Command::Move {
+                    unit: h,
+                    dest: target,
+                    house,
+                },
+            );
+        }
+    }
+}
+
+/// Spawn one unit from a resolved [`crate::campaign::SpawnProto`].
+fn spawn_from_proto(
+    world: &mut World,
+    proto: &crate::campaign::SpawnProto,
+    house: u8,
+    cell: CellCoord,
+    spot: u8,
+) -> Handle {
+    let h = world.spawn_unit(
+        proto.type_id,
+        house,
+        cell,
+        Facing(0),
+        proto.max_health,
+        proto.stats,
+    );
+    world.set_unit_max_health(h, proto.max_health);
+    world.set_unit_sight(h, proto.sight);
+    world.set_unit_combat(h, proto.armor, proto.weapon, proto.has_turret);
+    world.set_unit_secondary(h, proto.secondary);
+    world.set_unit_harvester(h, proto.is_harvester);
+    if let Some(u) = world.units.get_mut(h) {
+        if proto.is_infantry {
+            u.make_infantry(spot);
+        }
+        u.is_civ_evac = proto.is_civ_evac;
+    }
+    h
+}
+
+/// Pick a spawn cell near `base`, spiralling out to avoid stacking every member on
+/// one cell. Falls back to `base` if nothing better is on-map.
+fn disperse_cell(world: &World, base: CellCoord, slot: i32) -> CellCoord {
+    // A fixed spiral of offsets (deterministic, no RNG).
+    const OFFS: [(i32, i32); 9] = [
+        (0, 0),
+        (1, 0),
+        (-1, 0),
+        (0, 1),
+        (0, -1),
+        (1, 1),
+        (-1, -1),
+        (1, -1),
+        (-1, 1),
+    ];
+    let (w, h) = (world.passable.width(), world.passable.height());
+    let (dx, dy) = OFFS[(slot as usize) % OFFS.len()];
+    let ring = (slot as usize / OFFS.len()) as i32 + 1;
+    let c = CellCoord::new(base.x + dx * ring, base.y + dy * ring);
+    if c.x >= 0 && c.y >= 0 && c.x < w && c.y < h {
+        c
+    } else {
+        base
     }
 }
 
@@ -1230,18 +1914,15 @@ fn run_building_repair(world: &mut World) {
             continue;
         }
         // Repair_Cost = (Cost / (MaxStrength / RepairStep)) * RepairPercent, ≥ 1.
-        // RepairStep = 7 HP, RepairPercent = 20% (1/5) — the *stock rules.ini*
-        // overrides (`[General] RepairStep=7` / `RepairPercent=20%`), NOT the
-        // reference's compile-time defaults (`rules.cpp:221-222`: RepairStep(5),
-        // RepairPercent(1,4)), which rules.ini overwrites at load
-        // (`rules.cpp:487-488`). Verified against the real `redalert.mix`
-        // rules.ini (M7.9.1 audit fix — the constants below previously used the
-        // compile-time defaults, undercharging/underhealing buildings by the
-        // same category of bug M7.9 P0 fixed for BuildSpeedBias). The unit
-        // (service-depot) repair constants below (`UREPAIR_STEP`/`UREPAIR_PERCENT`)
-        // already matched the rules.ini override and are unchanged.
-        let denom = (max_health / BREPAIR_STEP).max(1);
-        let step_cost = ((cost / denom) * BREPAIR_PERCENT_NUM / BREPAIR_PERCENT_DEN).max(1);
+        // RepairStep / RepairPercent now come from `EconRules` (loaded from
+        // rules.ini `[General] RepairStep`/`RepairPercent`; stock values 7 HP and
+        // 20% = 1/5, which rules.ini overrides the reference compile-time
+        // 5 / 1/4 with — M7.9.1 audit / M7.5 P0 promotion).
+        let brepair_step = world.catalog.econ.brepair_step;
+        let denom = (max_health / brepair_step.max(1)).max(1);
+        let step_cost = ((cost / denom) * world.catalog.econ.brepair_percent_num
+            / world.catalog.econ.brepair_percent_den.max(1))
+        .max(1);
         if world.house_credits(house) < step_cost {
             // Can't afford this step: stop repairing (building.cpp:5877).
             if let Some(b) = world.buildings.get_mut(h) {
@@ -1253,7 +1934,7 @@ fn run_building_repair(world: &mut World) {
             hh.deduct(step_cost);
         }
         if let Some(b) = world.buildings.get_mut(h) {
-            b.health = (b.health + BREPAIR_STEP as u16).min(b.max_health);
+            b.health = (b.health + brepair_step as u16).min(b.max_health);
             if b.health >= b.max_health {
                 b.is_repairing = false;
             }
@@ -1536,6 +2217,11 @@ fn run_combat(world: &mut World) {
         // `modify_damage` applies the negative damage as healing at point-blank on
         // unarmored targets (`combat.cpp:83`).
         maybe_acquire_heal_target(world, handle);
+
+        // Campaign auto-hunt (`MISSION_HUNT`): a hunting unit with no target and no
+        // path acquires the nearest enemy anywhere on the map and attacks it. Set
+        // by `TACTION_ALL_HUNT` and campaign attack-teams (M7.5).
+        maybe_acquire_hunt_target(world, handle);
 
         // Snapshot what we need without holding a borrow across the RNG draw.
         let (primary, secondary, coord, turret, body, has_turret, rot, target) =
@@ -2048,24 +2734,13 @@ fn capture_building(world: &mut World, building: Handle, new_house: u8) {
 
 /// Ticks between repair steps at a service depot (`Rule.RepairRate = .016` min ≈
 /// 0.96 s ≈ 14 ticks; we use 15 ≈ 1 s). A global cadence (no per-building timer).
+///
+/// The four repair magnitudes (`URepairStep`/`URepairPercent`/`RepairStep`/
+/// `RepairPercent`) are **no longer module constants** — they were promoted into
+/// [`crate::EconRules`] (M7.5 P0) so they load from rules.ini like
+/// `BuildSpeedBias` and cannot silently drift in code (they had already drifted
+/// once, the M7.9.1 audit). Read them from `world.catalog.econ.*repair_*`.
 const REPAIR_INTERVAL: u32 = 15;
-/// Hit points restored per repair step for a unit (`Rule.URepairStep = 10`).
-const UREPAIR_STEP: i32 = 10;
-/// Percent of a unit's build cost to fully repair it (`Rule.URepairPercent = 20%`).
-/// Cost is charged per step, proportional to the HP restored.
-const UREPAIR_PERCENT_NUM: i32 = 20;
-
-/// Hit points a **building** self-repair restores per step (`Rule.RepairStep`).
-/// The reference's compile-time default is `5` (rules.cpp:221), but the real
-/// `redalert.mix` rules.ini overrides `[General] RepairStep=7` — ground truth
-/// (M7.9.1 audit fix; the code previously pinned the stale compile-time `5`).
-const BREPAIR_STEP: i32 = 7;
-/// Building repair cost fraction (`Rule.RepairPercent`) as a `num/den` ratio.
-/// The reference's compile-time default is `1/4` (rules.cpp:222), but the real
-/// rules.ini overrides `[General] RepairPercent=20%` = `1/5` — ground truth
-/// (M7.9.1 audit fix).
-const BREPAIR_PERCENT_NUM: i32 = 1;
-const BREPAIR_PERCENT_DEN: i32 = 5;
 
 /// System 3.5: **service depot (FIX)** unit repair. On the global repair cadence,
 /// each FIX heals one friendly, damaged **vehicle** parked on/adjacent to its
@@ -2124,13 +2799,16 @@ fn run_repair(world: &mut World) {
             ),
             None => continue,
         };
-        let step = UREPAIR_STEP.min(missing);
+        let step = world.catalog.econ.urepair_step.min(missing);
         if step <= 0 {
             continue;
         }
         // Cost of one step = URepairPercent * unit_cost * step_hp / max_health.
         let unit_cost = world.catalog.unit(type_id).map(|p| p.cost).unwrap_or(0);
-        let step_cost = (unit_cost * UREPAIR_PERCENT_NUM * step / 100 / max_health.max(1)).max(0);
+        let step_cost = (unit_cost * world.catalog.econ.urepair_percent_num * step
+            / world.catalog.econ.urepair_percent_den.max(1)
+            / max_health.max(1))
+        .max(0);
         // Only repair if the house can pay (`CreditReserve` simplified to "has it").
         if world.house_credits(house) < step_cost {
             continue;
@@ -2200,7 +2878,61 @@ fn acquire_nearest_enemy(
             best = Some((d, h));
         }
     }
-    best.map(|(_, h)| Target::Unit(h))
+    best.filter(|&(_, h)| {
+        !world.are_allies(house, world.units.get(h).map(|u| u.house).unwrap_or(house))
+    })
+    .map(|(_, h)| Target::Unit(h))
+}
+
+/// Auto-hunt acquisition: if `handle` is a live, armed, hunting unit with no
+/// target and no path, target the nearest enemy unit (else the nearest enemy
+/// building) anywhere on the map. Alliance-aware via [`World::are_allies`].
+fn maybe_acquire_hunt_target(world: &mut World, handle: Handle) {
+    let (house, coord, armed, idle) = match world.units.get(handle) {
+        Some(u) => (
+            u.house,
+            u.coord,
+            u.weapon.is_some(),
+            u.hunt && u.is_alive() && u.target.is_none() && u.path.is_empty(),
+        ),
+        None => return,
+    };
+    if !armed || !idle {
+        return;
+    }
+    // Nearest enemy unit.
+    let mut best_u: Option<(i32, Handle)> = None;
+    for (h, u) in world.units.iter() {
+        if !u.is_alive() || world.are_allies(house, u.house) {
+            continue;
+        }
+        let d = leptons_distance(coord, u.coord);
+        if best_u.map(|(bd, _)| d < bd).unwrap_or(true) {
+            best_u = Some((d, h));
+        }
+    }
+    if let Some((_, h)) = best_u {
+        if let Some(u) = world.units.get_mut(handle) {
+            u.target = Some(Target::Unit(h));
+        }
+        return;
+    }
+    // Else nearest enemy (non-wall) building.
+    let mut best_b: Option<(i32, Handle)> = None;
+    for (h, b) in world.buildings.iter() {
+        if !b.is_alive() || b.is_wall || world.are_allies(house, b.house) {
+            continue;
+        }
+        let d = leptons_distance(coord, b.center_cell().center());
+        if best_b.map(|(bd, _)| d < bd).unwrap_or(true) {
+            best_b = Some((d, h));
+        }
+    }
+    if let Some((_, h)) = best_b {
+        if let Some(u) = world.units.get_mut(handle) {
+            u.target = Some(Target::Building(h));
+        }
+    }
 }
 
 /// The passable cell in a building's one-cell footprint ring that is nearest to

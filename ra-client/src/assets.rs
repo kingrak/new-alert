@@ -27,8 +27,9 @@ use ra_formats::tmpl::Template;
 
 use ra_sim::coords::{CellCoord, Facing};
 use ra_sim::{
-    BuildItem, BuildingProto, Catalog, EconRules, Handicap, Handle, MoveStats, OreField,
-    Passability, UnitProto, World,
+    BuildItem, BuildingProto, Campaign, Catalog, EconRules, Handicap, Handle, MoveStats, OreField,
+    Passability, SpawnProto, TActionDef, TEventDef, TeamClass, TeamMission, TeamType, TriggerType,
+    UnitProto, World,
 };
 
 use crate::appcore::AppCore;
@@ -333,6 +334,675 @@ pub fn load_game_from_bytes(
     })
 }
 
+// ===========================================================================
+// M7.5 campaign loader — place everything a mission INI declares and wire the
+// trigger/teamtype engine.
+// ===========================================================================
+
+/// A fully-loaded single-player mission: the ready-to-drive core plus the
+/// scenario metadata the campaign flow needs (briefing, player house, start
+/// camera) and an inventory of what was placed (for verification/reporting).
+pub struct CampaignMission {
+    /// The ready-to-drive core (terrain, placements, campaign engine installed).
+    pub core: AppCore,
+    /// Forced player house (`[Basic] Player`).
+    pub player_house: u8,
+    /// Initial camera cell (waypoint 98 "home", else a placed player unit).
+    pub start: CellCoord,
+    /// Mission display name (`[Basic] Name`).
+    pub name: String,
+    /// Briefing text (`[Briefing]`).
+    pub briefing: String,
+    /// Counts of each placement kind actually spawned.
+    pub units_placed: usize,
+    /// Infantry placed.
+    pub infantry_placed: usize,
+    /// Structures placed.
+    pub structures_placed: usize,
+    /// Terrain obstacles placed.
+    pub terrain_placed: usize,
+    /// Trigger count.
+    pub triggers: usize,
+    /// TeamType count.
+    pub teamtypes: usize,
+    /// Names of placements/classes skipped (unresolved stats/sprite, naval/air).
+    pub skipped: Vec<String>,
+}
+
+/// One resolved `[INFANTRY]` spawn: `(type_id, house, cell, sub_cell, facing,
+/// strength, trigger, is_civ_evac)`.
+type InfantrySpawn = (u32, u8, CellCoord, u8, u8, u16, Option<u16>, bool);
+
+/// Whether a type name is a naval or aircraft unit we do not simulate yet (so a
+/// team member of this class is dropped, documented — M7.5 deferral).
+fn is_naval_or_air(name: &str) -> bool {
+    matches!(
+        name.to_ascii_uppercase().as_str(),
+        "CA" | "PT" | "DD" | "SS" | "LST" | "MSUB" | "CARR" | "PTBOAT" // naval
+            | "TRAN" | "HELI" | "HIND" | "MIG" | "YAK" | "U2" | "BADR" | "MH60" | "ORCA" // air
+    )
+}
+
+/// Whether a type name is infantry (sub-cell), by RA naming convention — enough
+/// for the campaign roster (E-series soldiers, civilians, VIPs, the dog).
+fn is_campaign_infantry(name: &str) -> bool {
+    let n = name.to_ascii_uppercase();
+    n.starts_with('E') && n[1..].chars().all(|c| c.is_ascii_digit()) && n.len() >= 2
+        || n.starts_with('C') && n[1..].chars().all(|c| c.is_ascii_digit()) && n.len() >= 2
+        || matches!(
+            n.as_str(),
+            "EINSTEIN"
+                | "DELPHI"
+                | "CHAN"
+                | "GNRL"
+                | "GENERAL"
+                | "SPY"
+                | "THF"
+                | "MEDI"
+                | "MECH"
+                | "SHOK"
+                | "DOG"
+                | "TANYA"
+        )
+}
+
+/// Whether a type name is an evacuable civilian VIP (`_Counts_As_Civ_Evac`
+/// scripted set — `aircraft.cpp:142`).
+fn is_civ_vip(name: &str) -> bool {
+    matches!(
+        name.to_ascii_uppercase().as_str(),
+        "EINSTEIN" | "DELPHI" | "CHAN" | "GNRL" | "GENERAL"
+    )
+}
+
+/// Resolve or lazily register a unit/infantry type by name, extending the
+/// catalog + sprite tables. Returns the type id (== sprite index), or `None` if
+/// the type has no rules stats / sprite / is naval-air (deferred).
+#[allow(clippy::too_many_arguments)]
+fn register_campaign_unit(
+    catalog: &mut Catalog,
+    unit_sprites: &mut Vec<UnitSprite>,
+    infantry_anim: &mut Vec<Option<InfantryAnim>>,
+    id_by_name: &mut std::collections::BTreeMap<String, u32>,
+    rules: &Ini,
+    conquer: &MixArchive,
+    inf_archives: &[&MixArchive],
+    name: &str,
+) -> Option<u32> {
+    let key = name.to_ascii_uppercase();
+    if let Some(&id) = id_by_name.get(&key) {
+        return Some(id);
+    }
+    if is_naval_or_air(&key) {
+        return None;
+    }
+    let ustats = unit_stats(rules, &key)?;
+    let is_inf = is_campaign_infantry(&key);
+    // Infantry art lives in lores.mix; vehicle art in conquer.mix. A missing
+    // sprite degrades to a frameless sprite (the unit still simulates).
+    let sprite = if is_inf {
+        load_unit_sprite_from(inf_archives, &key)
+    } else {
+        load_unit_sprite(conquer, &key)
+    }
+    .unwrap_or(UnitSprite { frames: Vec::new() });
+    let combat = resolve_unit_combat(rules, &key);
+    let id = catalog.units.len() as u32;
+    debug_assert_eq!(id as usize, unit_sprites.len());
+    catalog.units.push(UnitProto {
+        name: key.clone(),
+        sprite_id: id,
+        max_health: ustats.strength.clamp(1, u16::MAX as i32) as u16,
+        stats: MoveStats {
+            max_speed: ustats.max_speed_leptons(),
+            rot: ustats.rot,
+        },
+        armor: combat.as_ref().map(|c| c.armor).unwrap_or(0),
+        weapon: combat
+            .as_ref()
+            .and_then(|c| c.weapon.as_ref().map(weapon_to_profile)),
+        secondary: combat
+            .as_ref()
+            .and_then(|c| c.secondary.as_ref().map(weapon_to_profile)),
+        has_turret: combat.as_ref().map(|c| c.has_turret).unwrap_or(false),
+        is_harvester: key == "HARV",
+        is_infantry: is_inf,
+        locomotor: if is_inf {
+            LOCO_FOOT as u8
+        } else {
+            LOCO_WHEEL as u8
+        },
+        deploys_to: None,
+        cost: rules.get_int(&key, "Cost").unwrap_or(0) as i32,
+        prereq: Vec::new(),
+        sight: ustats.sight,
+    });
+    unit_sprites.push(sprite);
+    infantry_anim.push(if is_inf {
+        Some(InfantryAnim::for_name(&key))
+    } else {
+        None
+    });
+    id_by_name.insert(key, id);
+    Some(id)
+}
+
+/// Resolve or lazily register a building type by name, extending the catalog.
+#[allow(clippy::too_many_arguments)]
+fn register_campaign_building(
+    catalog: &mut Catalog,
+    building_sprites: &mut Vec<UnitSprite>,
+    building_overlays: &mut Vec<Option<UnitSprite>>,
+    id_by_name: &mut std::collections::BTreeMap<String, u32>,
+    rules: &Ini,
+    conquer: &MixArchive,
+    name: &str,
+) -> Option<u32> {
+    let key = name.to_ascii_uppercase();
+    if let Some(&id) = id_by_name.get(&key) {
+        return Some(id);
+    }
+    let stats = building_stats(rules, &key)?;
+    let id = catalog.buildings.len() as u32;
+    debug_assert_eq!(id as usize, building_sprites.len());
+    let is_wall = matches!(key.as_str(), "SBAG" | "CYCL" | "BRIK");
+    catalog.buildings.push(BuildingProto {
+        name: key.clone(),
+        foot_w: stats.foot_w,
+        foot_h: stats.foot_h,
+        max_health: stats.strength,
+        armor: stats.armor,
+        power: stats.power,
+        cost: stats.cost,
+        prereq: Vec::new(),
+        is_refinery: false,
+        is_construction_yard: false,
+        is_war_factory: false,
+        is_barracks: false,
+        free_harvester_unit: None,
+        sight: stats.sight,
+        sprite_id: id,
+        weapon: rules
+            .get(&key, "Primary")
+            .and_then(|w| resolve_weapon(rules, w))
+            .as_ref()
+            .map(weapon_to_profile),
+        has_turret: key == "GUN",
+        charges: key == "TSLA",
+        is_wall,
+        storage: stats.storage,
+    });
+    building_sprites
+        .push(load_unit_sprite(conquer, &key).unwrap_or(UnitSprite { frames: Vec::new() }));
+    building_overlays.push(None);
+    id_by_name.insert(key, id);
+    Some(id)
+}
+
+/// Load and read the archives under `dir`, then a fully-playable campaign mission.
+pub fn load_campaign_from_dir(
+    dir: &Path,
+    scenario_name: &str,
+) -> Result<CampaignMission, Box<dyn Error>> {
+    let main_bytes =
+        std::fs::read(dir.join("main.mix")).map_err(|e| format!("reading main.mix: {e}"))?;
+    let redalert_bytes = std::fs::read(dir.join("redalert.mix"))
+        .map_err(|e| format!("reading redalert.mix: {e}"))?;
+    load_campaign_from_bytes(&main_bytes, &redalert_bytes, scenario_name)
+}
+
+/// Load a fully-playable single-player mission from in-memory archives: terrain,
+/// every `[UNITS]`/`[INFANTRY]`/`[STRUCTURES]`/`[TERRAIN]` placement, house
+/// credits + alliances, and the `[Trigs]`/`[TeamTypes]` scripting engine.
+pub fn load_campaign_from_bytes(
+    main_bytes: &[u8],
+    redalert_bytes: &[u8],
+    scenario_name: &str,
+) -> Result<CampaignMission, Box<dyn Error>> {
+    use ra_data::campaign as camp;
+
+    let main = MixArchive::parse(main_bytes)?;
+    let redalert = MixArchive::parse(redalert_bytes)?;
+
+    // Scenario INI text (archive name or already-resolved).
+    let ini_text = scenario_text_from_archive(main_bytes, scenario_name)?;
+    let ini = Ini::parse(&ini_text);
+
+    // Terrain raster + palette + tiles.
+    let loaded = load_from_bytes(main_bytes, redalert_bytes, scenario_name)?;
+    let raster = rasterize(&loaded.scenario, &loaded.tiles);
+    let palette = loaded.palette;
+    let scenario = loaded.scenario;
+
+    // rules.ini + remaps + art archives.
+    let local = redalert.open_nested("local.mix")?;
+    let rules = Ini::parse(&String::from_utf8_lossy(
+        local.get("rules.ini").ok_or("rules.ini not found")?,
+    ));
+    let mut remaps: Vec<RemapTable> = match local.get("palette.cps") {
+        Some(cps_bytes) => match Cps::parse(cps_bytes) {
+            Ok(cps) => build_house_remaps(&cps).to_vec(),
+            Err(_) => vec![identity_remap(); HOUSE_COUNT],
+        },
+        None => vec![identity_remap(); HOUSE_COUNT],
+    };
+    // Pad the remap table to cover every campaign house index (GoodGuy=8..Special
+    // =11 have no CPS colour row — they render in their native/unremapped art).
+    remaps.resize(camp::CAMPAIGN_HOUSE_COUNT, identity_remap());
+
+    let conquer = main.open_nested("conquer.mix")?;
+    let lores = redalert.open_nested("lores.mix").ok();
+    let content = build_content(&rules, &conquer, lores.as_ref())?;
+
+    // Mutable catalog + sprite tables we extend with scenario-specific types.
+    let mut catalog = content.catalog;
+    let mut unit_sprites = content.unit_sprites;
+    let mut building_sprites = content.building_sprites;
+    let mut building_overlays = content.building_overlays;
+    let mut infantry_anim = content.infantry_anim;
+    let inf_archives: Vec<&MixArchive> = match lores.as_ref() {
+        Some(l) => vec![&conquer, l],
+        None => vec![&conquer],
+    };
+    let mut unit_ids: std::collections::BTreeMap<String, u32> = catalog
+        .units
+        .iter()
+        .map(|p| (p.name.to_ascii_uppercase(), p.sprite_id))
+        .collect();
+    let mut bldg_ids: std::collections::BTreeMap<String, u32> = catalog
+        .buildings
+        .iter()
+        .enumerate()
+        .map(|(i, p)| (p.name.to_ascii_uppercase(), i as u32))
+        .collect();
+
+    let mut skipped: Vec<String> = Vec::new();
+
+    // --- World shell ---
+    let grid = make_passability(&scenario, &loaded.tiles, &rules);
+    let mut world = World::new(grid, 0x1234_5678);
+    world.init_houses(camp::CAMPAIGN_HOUSE_COUNT, 0);
+    world.set_ore(OreField::from_overlay(128, 128, &scenario.overlay));
+    world.enable_shroud();
+
+    // House credits + player + alliances.
+    let house_defs = camp::parse_house_defs(&ini);
+    for hd in &house_defs {
+        world.set_house_credits(hd.index, hd.credits);
+    }
+    let player_house = camp::parse_player_house(&ini).unwrap_or(1);
+    world.set_player_house(player_house);
+    world.set_alliances(build_alliances(&house_defs));
+
+    // --- Placements ---
+    let placements = parse_units(&ini);
+    let infantry = camp::parse_infantry(&ini);
+    let structures = camp::parse_structures(&ini);
+    let terrain = camp::parse_terrain(&ini);
+    let raw_triggers = camp::parse_triggers(&ini);
+    let raw_teams = camp::parse_teamtypes(&ini);
+    let cell_trigs = camp::parse_cell_triggers(&ini);
+    let waypoints = camp::parse_waypoints(&ini);
+
+    // trigger name -> index (for object/cell attachments).
+    let trig_idx: std::collections::BTreeMap<String, u16> = raw_triggers
+        .iter()
+        .enumerate()
+        .map(|(i, t)| (t.name.clone(), i as u16))
+        .collect();
+
+    // We must register every type BEFORE building the World's catalog snapshot,
+    // so collect all placements first, then set the catalog, then spawn.
+    // Vehicles from [UNITS].
+    let mut vehicle_spawns: Vec<(u32, u8, CellCoord, u8, u16)> = Vec::new();
+    for p in &placements {
+        match register_campaign_unit(
+            &mut catalog,
+            &mut unit_sprites,
+            &mut infantry_anim,
+            &mut unit_ids,
+            &rules,
+            &conquer,
+            &inf_archives,
+            &p.unit_type,
+        ) {
+            Some(id) => vehicle_spawns.push((
+                id,
+                p.house,
+                CellCoord::from_index(p.cell),
+                p.facing,
+                p.strength,
+            )),
+            None => skipped.push(p.unit_type.clone()),
+        }
+    }
+    // Infantry from [INFANTRY]:
+    // (type_id, house, cell, sub_cell, facing, strength, trigger, is_civ_evac).
+    let mut infantry_spawns: Vec<InfantrySpawn> = Vec::new();
+    for p in &infantry {
+        match register_campaign_unit(
+            &mut catalog,
+            &mut unit_sprites,
+            &mut infantry_anim,
+            &mut unit_ids,
+            &rules,
+            &conquer,
+            &inf_archives,
+            &p.unit_type,
+        ) {
+            Some(id) => infantry_spawns.push((
+                id,
+                p.house,
+                CellCoord::from_index(p.cell),
+                p.sub_cell,
+                p.facing,
+                p.strength,
+                trig_idx.get(&p.trigger).copied(),
+                is_civ_vip(&p.unit_type),
+            )),
+            None => skipped.push(p.unit_type.clone()),
+        }
+    }
+    // Structures from [STRUCTURES].
+    let mut structure_spawns: Vec<(u32, u8, CellCoord, u16, Option<u16>)> = Vec::new();
+    for p in &structures {
+        match register_campaign_building(
+            &mut catalog,
+            &mut building_sprites,
+            &mut building_overlays,
+            &mut bldg_ids,
+            &rules,
+            &conquer,
+            &p.building_type,
+        ) {
+            Some(id) => structure_spawns.push((
+                id,
+                p.house,
+                CellCoord::from_index(p.cell),
+                p.strength,
+                trig_idx.get(&p.trigger).copied(),
+            )),
+            None => skipped.push(p.building_type.clone()),
+        }
+    }
+
+    // TeamType SpawnProtos (resolve every class name).
+    let teamtypes: Vec<TeamType> = raw_teams
+        .iter()
+        .map(|t| TeamType {
+            name: t.name.clone(),
+            house: t.house,
+            flags: t.flags,
+            recruit: t.recruit,
+            init_num: t.init_num,
+            max_allowed: t.max_allowed,
+            origin: t.origin,
+            trigger: t.trigger,
+            classes: t
+                .classes
+                .iter()
+                .map(|(cname, count)| {
+                    let proto = register_campaign_unit(
+                        &mut catalog,
+                        &mut unit_sprites,
+                        &mut infantry_anim,
+                        &mut unit_ids,
+                        &rules,
+                        &conquer,
+                        &inf_archives,
+                        cname,
+                    )
+                    .map(|id| spawnproto_from_catalog(&catalog, id, cname));
+                    if proto.is_none() {
+                        skipped.push(format!("team:{cname}"));
+                    }
+                    TeamClass {
+                        proto,
+                        count: *count,
+                    }
+                })
+                .collect(),
+            missions: t
+                .missions
+                .iter()
+                .map(|(code, arg)| TeamMission {
+                    code: *code,
+                    arg: *arg,
+                })
+                .collect(),
+        })
+        .collect();
+
+    // Now the catalog is complete — install it.
+    world.set_catalog(catalog.clone());
+
+    // Spawn vehicles.
+    let mut units_placed = 0;
+    for (id, house, cell, facing, strength) in vehicle_spawns {
+        spawn_placed_unit(
+            &mut world, &catalog, id, house, cell, facing, strength, false, 0, None, false,
+        );
+        units_placed += 1;
+    }
+    // Spawn infantry.
+    let mut infantry_placed = 0;
+    for (id, house, cell, sub, facing, strength, trig, vip) in infantry_spawns {
+        spawn_placed_unit(
+            &mut world, &catalog, id, house, cell, facing, strength, true, sub, trig, vip,
+        );
+        infantry_placed += 1;
+    }
+    // Spawn structures.
+    let mut structures_placed = 0;
+    for (id, house, cell, strength, trig) in structure_spawns {
+        if let Some(h) = world.spawn_building(id, house, cell) {
+            let maxh = catalog.buildings[id as usize].max_health as i32;
+            if let Some(b) = world.buildings.get_mut(h) {
+                b.health = ((strength as i32) * maxh / 256).clamp(1, maxh) as u16;
+                b.trigger = trig;
+            }
+            structures_placed += 1;
+        }
+    }
+    // Terrain occupancy (render deferred — see QUIRKS).
+    let mut terrain_placed = 0;
+    for t in &terrain {
+        world.block_cell(CellCoord::from_index(t.cell));
+        terrain_placed += 1;
+    }
+
+    // --- Build + install the campaign scripting state ---
+    let triggers: Vec<TriggerType> = raw_triggers
+        .iter()
+        .map(|r| TriggerType {
+            name: r.name.clone(),
+            persist: r.persist,
+            house: r.house,
+            event_ctrl: r.event_ctrl,
+            action_ctrl: r.action_ctrl,
+            e1: TEventDef {
+                code: r.e1.0,
+                team: r.e1.1,
+                data: r.e1.2,
+            },
+            e2: TEventDef {
+                code: r.e2.0,
+                team: r.e2.1,
+                data: r.e2.2,
+            },
+            a1: TActionDef {
+                code: r.a1.0,
+                team: r.a1.1,
+                trigger: r.a1.2,
+                data: r.a1.3,
+            },
+            a2: TActionDef {
+                code: r.a2.0,
+                team: r.a2.1,
+                trigger: r.a2.2,
+                data: r.a2.3,
+            },
+        })
+        .collect();
+    let state = vec![ra_sim::campaign::TriggerState::default(); triggers.len()];
+    let cell_triggers: Vec<(u32, u16)> = cell_trigs
+        .iter()
+        .filter_map(|(cell, name)| trig_idx.get(name).map(|&i| (*cell, i)))
+        .collect();
+    let triggers_n = triggers.len();
+    let teamtypes_n = teamtypes.len();
+    let campaign = Campaign {
+        triggers,
+        teamtypes,
+        waypoints: waypoints.clone(),
+        globals: vec![false; 64],
+        cell_triggers,
+        state,
+        started: false,
+        mission_timer: None,
+        evac_cells: Vec::new(),
+        civ_evacuated: vec![false; camp::CAMPAIGN_HOUSE_COUNT],
+        reveal_all: false,
+        reveal_cells: Vec::new(),
+        pending_texts: Vec::new(),
+        pending_speech: Vec::new(),
+    };
+    world.set_campaign(campaign);
+
+    // --- Camera start: waypoint 98 (home), else a placed player unit, else centre.
+    let start = waypoints
+        .get(98)
+        .copied()
+        .filter(|&c| c >= 0)
+        .map(|c| CellCoord::from_index(c as u32))
+        .or_else(|| {
+            world
+                .units
+                .iter()
+                .find(|(_, u)| u.house == player_house)
+                .map(|(_, u)| u.cell())
+        })
+        .unwrap_or_else(|| {
+            CellCoord::new(
+                scenario.map_x as i32 + scenario.map_width as i32 / 2,
+                scenario.map_y as i32 + scenario.map_height as i32 / 2,
+            )
+        });
+
+    // --- Core + cosmetic wiring ---
+    let mut core = AppCore::with_sim(raster, palette, world, unit_sprites, remaps);
+    core.set_building_sprites(building_sprites);
+    core.set_building_overlays(building_overlays);
+    core.set_infantry_anim(infantry_anim);
+    // Sidebar with the standard buildables (mission 1 has no yard, so it is inert
+    // — authentic: you fight with what you're given).
+    core.enable_sidebar(player_house, content.buildables.clone());
+    core.set_classic_radar(true);
+    let theater_mix = main.open_nested(scenario.theater.mix_name()).ok();
+    let hires = redalert.open_nested("hires.mix").ok();
+    install_cosmetic_art(
+        &mut core,
+        &catalog,
+        &content.buildables,
+        &conquer,
+        theater_mix.as_ref(),
+        scenario.theater.suffix(),
+        hires.as_ref(),
+    );
+
+    Ok(CampaignMission {
+        core,
+        player_house,
+        start,
+        name: ini.get("Basic", "Name").unwrap_or("Mission").to_string(),
+        briefing: camp::parse_briefing(&ini),
+        units_placed,
+        infantry_placed,
+        structures_placed,
+        terrain_placed,
+        triggers: triggers_n,
+        teamtypes: teamtypes_n,
+        skipped,
+    })
+}
+
+/// Spawn one placed unit/infantry with resolved stats from the catalog.
+#[allow(clippy::too_many_arguments)]
+fn spawn_placed_unit(
+    world: &mut World,
+    catalog: &Catalog,
+    id: u32,
+    house: u8,
+    cell: CellCoord,
+    facing: u8,
+    strength: u16,
+    is_infantry: bool,
+    sub_cell: u8,
+    trigger: Option<u16>,
+    is_civ_evac: bool,
+) {
+    let proto = catalog.units[id as usize].clone();
+    let max_h = proto.max_health as i32;
+    let health = ((strength as i32) * max_h / 256).clamp(1, max_h) as u16;
+    let h = world.spawn_unit(id, house, cell, Facing(facing), health, proto.stats);
+    world.set_unit_max_health(h, proto.max_health);
+    world.set_unit_sight(h, proto.sight);
+    world.set_unit_combat(h, proto.armor, proto.weapon, proto.has_turret);
+    world.set_unit_secondary(h, proto.secondary);
+    world.set_unit_harvester(h, proto.is_harvester);
+    if let Some(u) = world.units.get_mut(h) {
+        if is_infantry {
+            u.make_infantry(sub_cell);
+        }
+        u.trigger = trigger;
+        u.is_civ_evac = is_civ_evac;
+    }
+}
+
+/// Build a [`SpawnProto`] from a registered catalog unit.
+fn spawnproto_from_catalog(catalog: &Catalog, id: u32, name: &str) -> SpawnProto {
+    let p = &catalog.units[id as usize];
+    SpawnProto {
+        type_id: p.sprite_id,
+        max_health: p.max_health,
+        stats: p.stats,
+        armor: p.armor,
+        weapon: p.weapon,
+        secondary: p.secondary,
+        has_turret: p.has_turret,
+        sight: p.sight,
+        is_infantry: p.is_infantry,
+        is_harvester: p.is_harvester,
+        is_civ_evac: is_civ_vip(name),
+    }
+}
+
+/// Build the house alliance bitmask matrix from the scenario house sections. A
+/// house is always allied with itself and every house it lists in `Allies=`
+/// (`HouseClass::Is_Ally`, `house.cpp`). Alliances are made **symmetric** (if A
+/// lists B, B is treated as allied to A too) so targeting is consistent.
+fn build_alliances(defs: &[ra_data::campaign::HouseDef]) -> Vec<u64> {
+    use ra_data::campaign::campaign_house_index;
+    let mut m = vec![0u64; ra_data::campaign::CAMPAIGN_HOUSE_COUNT];
+    for (i, bits) in m.iter_mut().enumerate() {
+        *bits |= 1u64 << (i as u64); // self-ally
+    }
+    for d in defs {
+        for ally in &d.allies {
+            if let Some(a) = campaign_house_index(ally) {
+                let (x, y) = (d.index as usize, a as usize);
+                if x < m.len() {
+                    m[x] |= 1u64 << (y as u64 & 63);
+                }
+                if y < m.len() {
+                    m[y] |= 1u64 << (x as u64 & 63);
+                }
+            }
+        }
+    }
+    m
+}
+
 /// A scripted 1-v-1 battle set up for the M4 verification path: a real 2TNK
 /// attacker and an enemy HARV, spawned adjacent on a real scenario's terrain,
 /// with real rules-driven weapon/armor stats. The bin drives the attack through
@@ -580,7 +1250,61 @@ fn econ_rules(rules: &Ini) -> EconRules {
             diff_handicap(rules, "Normal"),    // our Normal
             diff_handicap(rules, "Easy"),      // our Hard  -> strong
         ],
+        // Repair magnitudes from rules.ini `[General]` (M7.5 P0: promoted out of
+        // world.rs module consts so they load like `BuildSpeed` and can't drift).
+        // Stock redalert.mix: RepairStep=7, RepairPercent=20%, URepairStep=10,
+        // URepairPercent=20% — which override the reference compile-time defaults.
+        brepair_step: rules
+            .get_int("General", "RepairStep")
+            .unwrap_or(d.brepair_step as i64) as i32,
+        urepair_step: rules
+            .get_int("General", "URepairStep")
+            .unwrap_or(d.urepair_step as i64) as i32,
+        brepair_percent_num: percent_ratio(
+            rules,
+            "RepairPercent",
+            (d.brepair_percent_num, d.brepair_percent_den),
+        )
+        .0,
+        brepair_percent_den: percent_ratio(
+            rules,
+            "RepairPercent",
+            (d.brepair_percent_num, d.brepair_percent_den),
+        )
+        .1,
+        urepair_percent_num: percent_ratio(
+            rules,
+            "URepairPercent",
+            (d.urepair_percent_num, d.urepair_percent_den),
+        )
+        .0,
+        urepair_percent_den: percent_ratio(
+            rules,
+            "URepairPercent",
+            (d.urepair_percent_num, d.urepair_percent_den),
+        )
+        .1,
         ..d
+    }
+}
+
+/// Parse a rules.ini repair-percent key (`RepairPercent`/`URepairPercent`) into an
+/// integer `num/den` ratio. A `NN%` form maps to `NN/100` (the stock rules.ini
+/// form, exact); a fixed-point form (`.25`) maps to `raw/65536`. Missing → the
+/// caller-supplied default ratio.
+fn percent_ratio(rules: &Ini, key: &str, default: (i32, i32)) -> (i32, i32) {
+    match rules.get("General", key) {
+        Some(v) if v.contains('%') => {
+            let n: i32 = v
+                .trim()
+                .trim_end_matches('%')
+                .trim()
+                .parse()
+                .unwrap_or(default.0);
+            (n, 100)
+        }
+        Some(v) => (ra_data::combat::parse_fixed_raw(v) as i32, 65536),
+        None => default,
     }
 }
 
@@ -1834,6 +2558,53 @@ impl GameFactory for ArchiveFactory {
             load_skirmish_configured(&self.main_bytes, &self.redalert_bytes, &text, &settings)
                 .map_err(|e| e.to_string())?;
         Ok((game.core, game.player_start))
+    }
+}
+
+/// A [`crate::menu::CampaignFactory`] backed by the archives: enumerates the
+/// Allied single-player missions (`scg*ea.ini`) that resolve in `general.mix` and
+/// builds them via [`load_campaign_from_bytes`].
+pub struct ArchiveCampaignFactory {
+    main_bytes: Vec<u8>,
+    redalert_bytes: Vec<u8>,
+}
+
+impl ArchiveCampaignFactory {
+    /// Wrap already-read archive bytes.
+    pub fn new(main_bytes: Vec<u8>, redalert_bytes: Vec<u8>) -> ArchiveCampaignFactory {
+        ArchiveCampaignFactory {
+            main_bytes,
+            redalert_bytes,
+        }
+    }
+}
+
+impl crate::menu::CampaignFactory for ArchiveCampaignFactory {
+    fn missions(&self) -> Vec<crate::menu::CampaignEntry> {
+        // The Allied campaign is `scg{NN}ea.ini` (Greece/Allied, English). Probe
+        // the sequence and keep those that resolve + parse a `[Basic] Name`.
+        let mut out = Vec::new();
+        for n in 1..=30u32 {
+            let scenario = format!("scg{n:02}ea.ini");
+            let Ok(text) = scenario_text_from_archive(&self.main_bytes, &scenario) else {
+                continue;
+            };
+            let ini = Ini::parse(&text);
+            let name = ini.get("Basic", "Name").unwrap_or("Mission").to_string();
+            out.push(crate::menu::CampaignEntry { scenario, name });
+        }
+        out
+    }
+
+    fn build(&self, scenario: &str) -> Result<crate::menu::BuiltMission, String> {
+        let m = load_campaign_from_bytes(&self.main_bytes, &self.redalert_bytes, scenario)
+            .map_err(|e| e.to_string())?;
+        Ok(crate::menu::BuiltMission {
+            core: m.core,
+            start: m.start,
+            name: m.name,
+            briefing: m.briefing,
+        })
     }
 }
 

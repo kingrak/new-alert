@@ -303,6 +303,15 @@ impl House {
     }
 
     /// Whether the house owns at least one live building of type `id`.
+    ///
+    /// **Cache invariant (read before you trust this).** This reads the
+    /// [`House::building_counts`] cache, which is *only* kept in sync by the
+    /// building lifecycle paths that call [`House::adjust_building_count`]:
+    /// [`crate::World::spawn_building`] (+1), `remove_building`/sell/destroy (−1),
+    /// and `capture_building` (−1 old owner / +1 new). Mutating `buildings`
+    /// arena membership by any *other* route (e.g. a test poking the arena
+    /// directly) will desync this count from reality. Always add/remove buildings
+    /// through the command / sim paths so the cache stays correct.
     pub fn owns_building(&self, id: u32) -> bool {
         self.building_counts
             .get(id as usize)
