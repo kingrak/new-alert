@@ -28,6 +28,15 @@ pub struct EconRules {
     pub ticks_per_minute: i32,
     /// Production installment steps (`STEP_COUNT`, factory.h:118 = 54).
     pub step_count: i32,
+    /// Global build-speed bias as a raw 16.16 fixed value (`Rule.BuildSpeedBias`,
+    /// from `[General] BuildSpeed`, rules.cpp:464 — stock RA ships `.8`, so
+    /// `0.8 × 65536 = 52428`). This scales *every* item's build time (a value
+    /// below 1 makes everything build faster). The code default here is `1.0`
+    /// (`65536`), matching the reference's compile-time default (`rules.cpp:261
+    /// BuildSpeedBias(1)`) before rules.ini overrides it; the real-asset loader
+    /// reads the `.8` from rules.ini. **This was the missing multiplier that made
+    /// our builds run 25% too slow (M7.9 P0).**
+    pub build_speed_bias_raw: i32,
     /// Long ore-scan radius in cells (`TiberiumLongScan/CELL`, rules.cpp:267 =
     /// 0x2000 leptons = 32 cells).
     pub long_scan_cells: i32,
@@ -42,6 +51,15 @@ pub struct EconRules {
     /// default 2). One grow+spread wave fires per full 128×128 sweep, so the scan
     /// processes `MAP_CELL_TOTAL / (growth_rate · TICKS_PER_MINUTE)` cells/tick.
     pub growth_rate: i32,
+    /// Difficulty stat-handicap table (M7.9 P2a), indexed by
+    /// [`crate::ai::Difficulty`] `as usize` (`Easy=0, Normal=1, Hard=2`). Loaded
+    /// from rules.ini's `[Easy]/[Normal]/[Difficult]` sections by the client;
+    /// defaults to three **neutral** (all-`1.0`) handicaps, so every synthetic
+    /// catalog and its goldens are unaffected. (Kept here — flowing through
+    /// [`EconRules::default`] — so adding it did not disturb the ~20 hand-built
+    /// `Catalog { … }` literals across the test suites.) The label→section mapping
+    /// is in [`Catalog::difficulty_handicap`] (a "Hard" AI is the *strong* one).
+    pub difficulty: [crate::house::Handicap; 3],
 }
 
 impl Default for EconRules {
@@ -53,10 +71,12 @@ impl Default for EconRules {
             ore_dump_rate: 2,
             ticks_per_minute: 900,
             step_count: 54,
+            build_speed_bias_raw: 1 << 16, // 1.0 (reference compile-time default)
             long_scan_cells: 32,
             short_scan_cells: 6,
             refund_percent: 50,
             growth_rate: 2,
+            difficulty: [crate::house::Handicap::default(); 3],
         }
     }
 }
@@ -191,11 +211,76 @@ impl Catalog {
         self.units.get(id as usize)
     }
 
-    /// Time to build an item costing `cost` credits, in ticks. Port of
-    /// `TechnoTypeClass::Time_To_Build` (`techno.cpp:6777`) with the stock
-    /// `BuildSpeedBias = 1`: `time = Cost * TICKS_PER_MINUTE / 1000`, floored to
-    /// at least 1 tick.
-    pub fn time_to_build(&self, cost: i32) -> i32 {
-        ((cost as i64 * self.econ.ticks_per_minute as i64) / 1000).max(1) as i32
+    /// The stat handicap for an AI house at difficulty `d` (M7.9 P2a). The table
+    /// is indexed by our [`crate::ai::Difficulty`] and the client loads it so that
+    /// a **stronger label gets the buffs**: an AI at `Hard` receives rules.ini's
+    /// `[Easy]` biases (FirePower 1.2, ROF .8, Cost/BuildTime .8 — the "buffed"
+    /// handicap), while `Easy` receives `[Difficult]` (FirePower .8, ROF 1.2). See
+    /// QUIRKS for why the RA sections invert vs. their names for AI opponents.
+    pub fn difficulty_handicap(&self, d: crate::ai::Difficulty) -> crate::house::Handicap {
+        self.econ.difficulty[d as usize]
     }
+
+    /// Raw `TechnoTypeClass::Time_To_Build` result **T** in ticks, *before* the
+    /// factory's STEP_COUNT rate conversion (`techno.cpp:6777`):
+    ///
+    /// ```text
+    /// time = Cost * Rule.BuildSpeedBias * fixed(TICKS_PER_MINUTE, 1000)
+    /// ```
+    ///
+    /// The original evaluates this with the `fixed` class's `int * fixed`
+    /// operators, each of which **rounds to nearest** on the way back to `int`
+    /// (`common/fixed.h`, `operator unsigned`). We reproduce that exactly with
+    /// integer 16.16 math ([`fx_mul_round`]) so there is no float and no drift:
+    ///   * `t1 = round(Cost × BuildSpeedBias)`
+    ///   * `T  = round(t1 × (TICKS_PER_MINUTE / 1000))`
+    ///
+    /// The stock `.8` bias makes `T = Cost × 0.72` (0.8 × 0.9). The per-house
+    /// `BuildSpeedBias` (line 6790) and difficulty IQ slowdown (line 6815) are
+    /// `×1` for a normal human house and handled by the caller when they are not.
+    pub fn build_time_base(&self, cost: i32) -> i32 {
+        let bias = self.econ.build_speed_bias_raw as i64;
+        let t1 = fx_mul_round(cost, bias);
+        // fixed(TICKS_PER_MINUTE, 1000) as a raw 16.16 ratio (matches the
+        // reference's `fixed(int,int)` ctor: numerator·PRECISION/denominator).
+        let tpm = self.econ.ticks_per_minute as i64 * (1i64 << 16) / 1000;
+        fx_mul_round(t1, tpm)
+    }
+
+    /// Full build time in **sim ticks** for an item costing `cost`, applying the
+    /// low-power `scale` (`scale_n/scale_d`, [`crate::house::House::build_time_scale`])
+    /// and then the factory's STEP_COUNT rate conversion (`FactoryClass::Start`,
+    /// `factory.cpp:432`):
+    ///
+    /// ```text
+    /// time  = build_time_base × power_scale     // techno.cpp:6832 `time *= scale`
+    /// rate  = Bound(time / STEP_COUNT, 1, 255)   // factory.cpp:439-440
+    /// build = rate × STEP_COUNT
+    /// ```
+    ///
+    /// The original factory advances one of `STEP_COUNT (=54)` stages every
+    /// `rate` ticks (`StageClass`, `stage.h`), so it takes `rate × 54` ticks —
+    /// which is why even a trivially cheap item never builds in under 54 ticks
+    /// (`rate` floors to 1). Our production model advances one step per tick, so
+    /// the returned value is the number of ticks the build takes. Passing
+    /// `scale = (1, 1)` is the full-power case.
+    pub fn time_to_build(&self, cost: i32, scale_n: i32, scale_d: i32) -> i32 {
+        let t = self.build_time_base(cost) as i64;
+        let d = scale_d.max(1) as i64;
+        // `time *= scale`: `int *= fixed` rounds to nearest (fixed.h). For our
+        // rational scale that is round(t·n/d) = (t·n + d/2) / d.
+        let scaled = ((t * scale_n as i64 + d / 2) / d) as i32;
+        let steps = self.econ.step_count.max(1);
+        let rate = (scaled / steps).clamp(1, 255);
+        rate * steps
+    }
+}
+
+/// Multiply an integer `val` by a raw 16.16 fixed `fx_raw`, rounding the result
+/// to the nearest integer — the exact behaviour of the reference `fixed` class's
+/// `int * fixed` operators (`fixed(val) *= fx; (unsigned)result`), which round
+/// via `(raw + PRECISION/2) / PRECISION` (`common/fixed.h`). All inputs here are
+/// non-negative (costs, times), so this is a plain round-half-up.
+fn fx_mul_round(val: i32, fx_raw: i64) -> i32 {
+    ((val as i64 * fx_raw + (1i64 << 15)) >> 16) as i32
 }

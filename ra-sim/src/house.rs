@@ -83,6 +83,74 @@ impl Production {
     }
 }
 
+/// The whole number `1.0` in raw 16.16 fixed (a neutral, no-op bias).
+pub(crate) const FX_ONE: i32 = 1 << 16;
+
+/// Round `val × bias` to the nearest integer, `bias` being a raw 16.16 fixed —
+/// the reference `int * fixed` rounding (`common/fixed.h`). A `FX_ONE` bias is
+/// the exact identity, so a neutral-handicap house computes byte-identically.
+#[inline]
+pub(crate) fn fx_mul(val: i32, bias: i32) -> i32 {
+    ((val as i64 * bias as i64 + (1i64 << 15)) >> 16) as i32
+}
+
+/// A house's **difficulty stat handicap** — the `[Easy]/[Normal]/[Difficult]`
+/// bias multipliers (`Difficulty_Get`, rules.cpp:307) that
+/// `HouseClass::Assign_Handicap` (house.cpp:278) copies onto a house and every
+/// object applies at the relevant computation site. Stored as raw 16.16 fixed.
+/// All-`1.0` (the [`Default`]) is "no handicap" — a human on Normal and every
+/// synthetic catalog — and is a byte-exact no-op, so it never perturbs a golden.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Handicap {
+    /// Firepower bias: damage this house's weapons deal (`techno.cpp:3303`,
+    /// `firepower = Attack * House->FirepowerBias`).
+    pub firepower: i32,
+    /// Armor bias: damage this house's objects *take* (`techno.cpp:4099`,
+    /// `damage = damage * House->ArmorBias`) — >1 takes more, <1 takes less.
+    pub armor: i32,
+    /// Rate-of-fire bias: rearm delay after firing (`techno.cpp:3066`,
+    /// `ROF * House->ROFBias`) — <1 fires faster.
+    pub rof: i32,
+    /// Groundspeed bias: movement speed + turn rate (`drive.cpp:648/1354`,
+    /// `MaxSpeed/ROT * House->GroundspeedBias`).
+    pub groundspeed: i32,
+    /// Cost bias: money charged to build (`cell.cpp:2391`, `Cost * House->CostBias`).
+    pub cost: i32,
+    /// Build-time bias: the difficulty `BuildTime` factor folded into
+    /// `Time_To_Build` (`Assign_Handicap` `BuildSpeedBias`, house.cpp:293).
+    pub build_time: i32,
+}
+
+impl Default for Handicap {
+    fn default() -> Handicap {
+        Handicap {
+            firepower: FX_ONE,
+            armor: FX_ONE,
+            rof: FX_ONE,
+            groundspeed: FX_ONE,
+            cost: FX_ONE,
+            build_time: FX_ONE,
+        }
+    }
+}
+
+impl Handicap {
+    /// Whether this handicap is the all-`1.0` no-op (so callers can skip both the
+    /// arithmetic and the hashing).
+    pub fn is_neutral(&self) -> bool {
+        *self == Handicap::default()
+    }
+
+    fn hash_into(&self, h: &mut Fnv1a) {
+        h.write_i32(self.firepower);
+        h.write_i32(self.armor);
+        h.write_i32(self.rof);
+        h.write_i32(self.groundspeed);
+        h.write_i32(self.cost);
+        h.write_i32(self.build_time);
+    }
+}
+
 /// One house's economic state.
 #[derive(Clone, Debug)]
 pub struct House {
@@ -111,6 +179,10 @@ pub struct House {
     pub infantry_prod: Option<Production>,
     /// A completed building type id awaiting a [`crate::Command::PlaceBuilding`].
     pub ready_building: Option<u32>,
+    /// Difficulty stat handicap (M7.9 P2a). Neutral (all `1.0`) for a human on
+    /// Normal and every synthetic catalog; set from the catalog's difficulty
+    /// table when an AI is assigned to this house (`World::set_ai`).
+    pub handicap: Handicap,
 }
 
 impl House {
@@ -126,6 +198,7 @@ impl House {
             unit_prod: None,
             infantry_prod: None,
             ready_building: None,
+            handicap: Handicap::default(),
         }
     }
 
@@ -277,6 +350,13 @@ impl House {
         if let Some(p) = &self.infantry_prod {
             h.write_u8(0x1F);
             p.hash_into(h);
+        }
+        // Difficulty handicap (M7.9 P2a). Folded in ONLY when non-neutral, so a
+        // human-on-Normal / synthetic-catalog house (all biases 1.0) appends no
+        // bytes and hashes identically to every pre-M7.9 golden.
+        if !self.handicap.is_neutral() {
+            h.write_u8(0x2A);
+            self.handicap.hash_into(h);
         }
     }
 }

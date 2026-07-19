@@ -114,6 +114,17 @@ pub enum Command {
         /// The building to sell.
         building: Handle,
     },
+    /// Toggle repair on one of `house`'s own buildings (`BuildingClass::Repair(-1)`,
+    /// `building.cpp:2725`). While repairing, the building heals on the global
+    /// repair cadence, charging `RepairPercent × RepairStep` of its cost per step
+    /// until full or the house runs out of money. Ignored if the issuing house
+    /// does not own the building, it is a wall, or it is already gone (M7.9 P1).
+    Repair {
+        /// House issuing the order (must own `building`).
+        house: u8,
+        /// The building to toggle repair on.
+        building: Handle,
+    },
 }
 
 /// The complete simulation state. Fields are plain and serialisable; there are
@@ -259,7 +270,19 @@ impl World {
 
     /// Install the skirmish AI controllers (one per AI-controlled house). They
     /// run inside the sim each tick, issuing the same [`Command`]s a player would.
+    ///
+    /// Assigning an AI to a house also copies that difficulty's **stat handicap**
+    /// (M7.9 P2a) from the catalog onto the house (`HouseClass::Assign_Handicap`,
+    /// house.cpp:278): firepower/armor/ROF/groundspeed/cost/build-time biases that
+    /// the combat, movement, and production sites then apply house-scoped. Houses
+    /// with no AI (the human player) keep the neutral all-`1.0` handicap.
     pub fn set_ai(&mut self, ai: Vec<AiPlayer>) {
+        for a in &ai {
+            let h = self.catalog.difficulty_handicap(a.difficulty);
+            if let Some(house) = self.houses.get_mut(a.house as usize) {
+                house.handicap = h;
+            }
+        }
         self.ai = ai;
     }
 
@@ -458,6 +481,7 @@ impl World {
             target: None,
             is_wall: proto.is_wall,
             storage: proto.storage,
+            is_repairing: false,
         };
         let handle = self.buildings.insert(building);
         // Stamp occupancy.
@@ -602,6 +626,9 @@ pub fn apply(world: &mut World, tick: u32, commands: &[Command]) {
 
     // System 3.5: service-depot (FIX) unit repair.
     run_repair(world);
+
+    // System 3.6: building self-repair (player/AI repair toggle).
+    run_building_repair(world);
 
     // System 4: combat (targeting + rotation + firing).
     run_combat(world);
@@ -893,6 +920,7 @@ fn apply_command(world: &mut World, cmd: Command) {
         } => apply_place_building(world, house, building, cell),
         Command::CancelProduction { house, kind } => apply_cancel_production(world, house, kind),
         Command::Sell { house, building } => apply_sell(world, house, building),
+        Command::Repair { house, building } => apply_repair(world, house, building),
     }
 }
 
@@ -1000,22 +1028,43 @@ fn apply_start_production(world: &mut World, house: u8, item: BuildItem) {
         return;
     }
 
-    // Build time = base (Cost·TICKS_PER_MINUTE/1000) × the discrete low-power
-    // multiplier, **snapshotted here at production START** (techno.cpp:6819 +
-    // factory.cpp:432 — the original bakes it into the factory Rate once and
-    // never recomputes it while the build runs). This replaces M5's per-tick
-    // continuous throttle (which slowed at ≤½ power); the multiplier is now the
-    // original's exact ×4/×2.5/×1.5 snapshot.
-    let base_ticks = world.catalog.time_to_build(cost);
+    // Build time, **snapshotted here at production START** (the original bakes
+    // it into the factory Rate once in `FactoryClass::Start` and never recomputes
+    // it while the build runs). `Catalog::time_to_build` applies, in the
+    // reference's order: `Cost × Rule.BuildSpeedBias × (TICKS_PER_MINUTE/1000)`
+    // (techno.cpp:6777), then the discrete low-power ×4/×2.5/×1.5 snapshot
+    // (techno.cpp:6832), then the STEP_COUNT rate conversion (factory.cpp:432).
+    // M7.9 P0: the `Rule.BuildSpeedBias` (stock `.8`) and STEP_COUNT steps were
+    // both missing before, so our builds ran ~25% too slow.
+    let handicap = world
+        .houses
+        .get(house as usize)
+        .map(|h| h.handicap)
+        .unwrap_or_default();
     let (scale_n, scale_d) = world
         .houses
         .get(house as usize)
         .map(|h| h.build_time_scale())
         .unwrap_or((1, 1));
-    let total_ticks = ((base_ticks as i64 * scale_n as i64 / scale_d as i64).max(1)) as i32;
+    let mut total_ticks = world.catalog.time_to_build(cost, scale_n, scale_d);
+    // Difficulty handicaps (M7.9 P2a), applied house-scoped:
+    //  - BuildTime bias scales the (already STEP_COUNT-quantised) build time. The
+    //    original folds it into `Time_To_Build` *before* the STEP_COUNT divide
+    //    (`Assign_Handicap` BuildSpeedBias); we apply it after, a benign rounding
+    //    difference and a no-op for a neutral (1.0) house.
+    //  - Cost bias scales the credits charged (`Cost * House->CostBias`), NOT the
+    //    build time (which uses raw cost), matching the original's Purchase_Price.
+    if !handicap.is_neutral() {
+        total_ticks = crate::house::fx_mul(total_ticks, handicap.build_time).max(1);
+    }
+    let biased_cost = if handicap.is_neutral() {
+        cost
+    } else {
+        crate::house::fx_mul(cost, handicap.cost).max(0)
+    };
     let prod = Production {
         item,
-        cost,
+        cost: biased_cost,
         total_ticks,
         progress: 0,
         spent: 0,
@@ -1126,6 +1175,75 @@ fn apply_sell(world: &mut World, house: u8, building: Handle) {
     let refund = (cost as i64 * world.catalog.econ.refund_percent as i64 / 100) as i32;
     remove_building(world, building);
     refund_credits(world, house, refund);
+}
+
+/// Toggle repair on a building the issuing house owns (`BuildingClass::Repair(-1)`,
+/// `building.cpp:2725`). Walls are `OverlayType`s in the original and can never be
+/// repaired, so `is_wall` buildings are refused (consistent with QUIRKS Q9/Q11c).
+/// Toggling *off* stops the drain; toggling *on* a full-health building is a no-op
+/// (the original plays the "scold" cue and does nothing — `building.cpp:2754`).
+fn apply_repair(world: &mut World, house: u8, building: Handle) {
+    let Some(b) = world.buildings.get_mut(building) else {
+        return;
+    };
+    if b.house != house || !b.is_alive() || b.is_wall {
+        return;
+    }
+    if !b.is_repairing && b.health >= b.max_health {
+        return; // already full — nothing to repair (VOC_SCOLD)
+    }
+    b.is_repairing = !b.is_repairing;
+}
+
+/// System 3.6: **building self-repair** (`BuildingClass::Repair_AI`,
+/// `building.cpp:5860`). On the same global repair cadence as the service depot,
+/// each building whose owner has toggled repair heals `Rule.RepairStep = 5` HP,
+/// charging `RepairPercent (=1/4) × (Cost / (MaxStrength / RepairStep))` credits
+/// per step (`TechnoTypeClass::Repair_Cost`, `techno.cpp:6907`, floored to ≥1). It
+/// stops (clears the toggle) at full health or when the house cannot pay the step
+/// — exactly the original's two exit conditions.
+fn run_building_repair(world: &mut World) {
+    if !world.tick_count.is_multiple_of(REPAIR_INTERVAL) {
+        return;
+    }
+    let handles: Vec<Handle> = world
+        .buildings
+        .iter()
+        .filter(|(_, b)| b.is_repairing && b.is_alive())
+        .map(|(h, _)| h)
+        .collect();
+    for h in handles {
+        let (house, cost, max_health, health) = match world.buildings.get(h) {
+            Some(b) => (b.house, b.cost, b.max_health as i32, b.health as i32),
+            None => continue,
+        };
+        if health >= max_health {
+            if let Some(b) = world.buildings.get_mut(h) {
+                b.is_repairing = false;
+            }
+            continue;
+        }
+        // Repair_Cost = (Cost / (MaxStrength / RepairStep)) * RepairPercent, ≥ 1.
+        // RepairStep = 5 HP, RepairPercent = 1/4 (rules.cpp:221-222).
+        let denom = (max_health / BREPAIR_STEP).max(1);
+        let step_cost = ((cost / denom) * BREPAIR_PERCENT_NUM / BREPAIR_PERCENT_DEN).max(1);
+        if world.house_credits(house) < step_cost {
+            // Can't afford this step: stop repairing (building.cpp:5877).
+            if let Some(b) = world.buildings.get_mut(h) {
+                b.is_repairing = false;
+            }
+            continue;
+        }
+        if let Some(hh) = world.houses.get_mut(house as usize) {
+            hh.deduct(step_cost);
+        }
+        if let Some(b) = world.buildings.get_mut(h) {
+            b.health = (b.health + BREPAIR_STEP as u16).min(b.max_health);
+            if b.health >= b.max_health {
+                b.is_repairing = false;
+            }
+        }
+    }
 }
 
 /// Remove a building from the world: clear its footprint occupancy (mirroring
@@ -1533,10 +1651,25 @@ fn run_combat(world: &mut World) {
                 target_coord,
                 &weapon,
             );
+            // ROF handicap (M7.9 P2a): the shooter's house scales its rearm delay
+            // (`techno.cpp:3066`, `ROF * House->ROFBias`). Neutral = exact.
+            let rof = house_rof_scaled(world, shooter_house, weapon.rof);
             if let Some(u) = world.units.get_mut(handle) {
-                u.arm = weapon.rof;
+                u.arm = rof;
             }
         }
+    }
+}
+
+/// Scale a weapon's rearm delay by `house`'s ROF handicap (M7.9 P2a); neutral
+/// houses return it unchanged (exact). At least 1 tick so firing can't become
+/// instantaneous through rounding.
+fn house_rof_scaled(world: &World, house: u8, rof: u16) -> u16 {
+    match world.houses.get(house as usize) {
+        Some(h) if !h.handicap.is_neutral() => {
+            crate::house::fx_mul(rof as i32, h.handicap.rof).max(1) as u16
+        }
+        _ => rof,
     }
 }
 
@@ -1668,8 +1801,10 @@ fn run_building_combat(world: &mut World) {
             target_coord,
             &weapon,
         );
+        // ROF handicap (M7.9 P2a): the defense's house scales its rearm delay.
+        let rof = house_rof_scaled(world, house, weapon.rof);
         if let Some(b) = world.buildings.get_mut(handle) {
-            b.arm = weapon.rof;
+            b.arm = rof;
         }
     }
 }
@@ -1905,6 +2040,14 @@ const UREPAIR_STEP: i32 = 10;
 /// Cost is charged per step, proportional to the HP restored.
 const UREPAIR_PERCENT_NUM: i32 = 20;
 
+/// Hit points a **building** self-repair restores per step (`Rule.RepairStep = 5`,
+/// rules.cpp:221).
+const BREPAIR_STEP: i32 = 5;
+/// Building repair cost fraction (`Rule.RepairPercent = 1/4`, rules.cpp:222) as a
+/// `num/den` ratio.
+const BREPAIR_PERCENT_NUM: i32 = 1;
+const BREPAIR_PERCENT_DEN: i32 = 4;
+
 /// System 3.5: **service depot (FIX)** unit repair. On the global repair cadence,
 /// each FIX heals one friendly, damaged **vehicle** parked on/adjacent to its
 /// footprint by `URepairStep` HP, charging `URepairPercent` of the unit's build
@@ -2120,13 +2263,28 @@ fn fire(
         (weapon.proj_speed, false, 0, 0)
     };
 
+    // Firepower handicap (M7.9 P2a): the shooter's house scales the damage it
+    // deals (`techno.cpp:3303`, `firepower = Attack * House->FirepowerBias`). Only
+    // positive damage is scaled — the medic's negative "heal" is left untouched
+    // (the original guards `if (firepower > 0)`). Neutral (1.0) houses are exact.
+    let dealt = if weapon.damage > 0 {
+        let fp = world
+            .houses
+            .get(source_house as usize)
+            .map(|h| h.handicap.firepower)
+            .unwrap_or(crate::house::FX_ONE);
+        crate::house::fx_mul(weapon.damage, fp)
+    } else {
+        weapon.damage
+    };
+
     let bullet = Bullet {
         pos: if weapon.instant { impact } else { muzzle },
         impact,
         target,
         speed,
         facing: dir,
-        damage: weapon.damage,
+        damage: dealt,
         warhead: weapon.warhead,
         min_damage: weapon.min_damage,
         max_damage: weapon.max_damage,
@@ -2196,8 +2354,8 @@ fn explosion_damage(
         if h == source {
             continue;
         }
-        let (coord, armor) = match world.units.get(h) {
-            Some(u) if u.is_alive() => (u.coord, u.armor),
+        let (coord, armor, target_house) = match world.units.get(h) {
+            Some(u) if u.is_alive() => (u.coord, u.armor, u.house),
             _ => continue,
         };
         let uc = coord.cell();
@@ -2209,6 +2367,10 @@ fn explosion_damage(
             continue;
         }
         let dmg = modify_damage(damage, warhead, armor, distance, min_damage, max_damage);
+        // Armor handicap (M7.9 P2a): the *target's* house scales incoming damage
+        // (`techno.cpp:4099`, `damage = damage * House->ArmorBias`). Only positive
+        // damage — a heal (negative) is never armor-scaled. Neutral = exact.
+        let dmg = house_armor_scaled(world, target_house, dmg);
         // Healing (negative damage, e.g. the medic's Heal weapon): raise health,
         // capped at max; never kills, never triggers retaliation.
         if dmg < 0 {
@@ -2237,7 +2399,7 @@ fn explosion_damage(
 
     // --- Buildings covering the 3×3 neighbourhood ---
     for h in world.buildings.handles() {
-        let (covers_impact, near, center, armor) = match world.buildings.get(h) {
+        let (covers_impact, near, center, armor, target_house) = match world.buildings.get(h) {
             Some(b) if b.is_alive() => {
                 let mut near = false;
                 'scan: for dy in -1..=1 {
@@ -2253,6 +2415,7 @@ fn explosion_damage(
                     near,
                     b.center_cell().center(),
                     b.armor,
+                    b.house,
                 )
             }
             _ => continue,
@@ -2270,6 +2433,8 @@ fn explosion_damage(
             continue;
         }
         let dmg = modify_damage(damage, warhead, armor, distance, min_damage, max_damage);
+        // Armor handicap (M7.9 P2a): the target building's house scales the hit.
+        let dmg = house_armor_scaled(world, target_house, dmg);
         if dmg <= 0 {
             continue;
         }
@@ -2279,6 +2444,19 @@ fn explosion_damage(
                 dead_buildings.push(h);
             }
         }
+    }
+}
+
+/// Scale positive `dmg` by `house`'s armor handicap (M7.9 P2a). A neutral house
+/// (bias 1.0) returns `dmg` unchanged (exact), and negative `dmg` (a heal) is
+/// never scaled — armor only mitigates real damage (`techno.cpp:4097` `damage > 0`).
+fn house_armor_scaled(world: &World, house: u8, dmg: i32) -> i32 {
+    if dmg <= 0 {
+        return dmg;
+    }
+    match world.houses.get(house as usize) {
+        Some(h) if !h.handicap.is_neutral() => crate::house::fx_mul(dmg, h.handicap.armor),
+        _ => dmg,
     }
 }
 
@@ -2990,11 +3168,31 @@ fn move_units(world: &mut World) {
             _ => continue,
         };
 
+        // Groundspeed handicap (M7.9 P2a): this unit's house scales its move speed
+        // and turn rate (`drive.cpp:648/1354`, `MaxSpeed/ROT * House->GroundspeedBias`).
+        // `FX_ONE` for a neutral house yields the raw values exactly, so ordinary
+        // movement (and every movement golden) is byte-identical.
+        let gs_bias = world
+            .units
+            .get(handle)
+            .map(|u| u.house)
+            .and_then(|hh| world.houses.get(hh as usize))
+            .map(|h| h.handicap.groundspeed)
+            .unwrap_or(crate::house::FX_ONE);
+        let eff_speed = |raw: i32| crate::house::fx_mul(raw, gs_bias);
+
         // Rotate toward the next waypoint before translating.
         if let Some(u) = world.units.get_mut(handle) {
             let target = u.path[0].center();
             if let Some(desired) = Facing::toward(u.coord, target) {
-                u.facing = u.facing.rotate_toward(desired, u.stats.rot.wrapping_add(1));
+                // Neutral house: use the raw rot exactly (byte-identical to
+                // pre-handicap). Biased: scale, clamped to a sane 1..=255.
+                let rot = if gs_bias == crate::house::FX_ONE {
+                    u.stats.rot
+                } else {
+                    crate::house::fx_mul(u.stats.rot as i32, gs_bias).clamp(1, 255) as u8
+                };
+                u.facing = u.facing.rotate_toward(desired, rot.wrapping_add(1));
             }
         }
 
@@ -3015,7 +3213,7 @@ fn move_units(world: &mut World) {
             let budget = world
                 .units
                 .get(handle)
-                .map(|u| u.stats.max_speed)
+                .map(|u| eff_speed(u.stats.max_speed))
                 .unwrap_or(0);
             let (nc, _) = advance_along_path(coord, path, budget);
             let land = nc.cell();
@@ -3092,7 +3290,7 @@ fn move_units(world: &mut World) {
         };
         // Consume the waypoints the (final) advance fully reached.
         let (applied_coord, consumed) =
-            advance_along_path(unit.coord, &unit.path, unit.stats.max_speed);
+            advance_along_path(unit.coord, &unit.path, eff_speed(unit.stats.max_speed));
         debug_assert_eq!(applied_coord, new_coord);
         // Record real progress (coord changed) for the head-on tie-break's
         // "already advanced this tick" guard. Vehicles only — infantry never drive
@@ -4188,12 +4386,17 @@ mod m5_tests {
             low > full,
             "low power ({low} ticks) should be slower than full power ({full} ticks)"
         );
-        // Zero power => ×4 build-time multiplier (techno.cpp:6819), snapshotted at
-        // start; allow a small slack for the ±1-tick loop/rounding boundaries.
-        assert!(
-            (full * 4 - 4..=full * 4 + 4).contains(&low),
-            "zero-power build should take ~4× as long (full={full}, low={low})"
-        );
+        // Exact numbers (M7.9 P0 STEP_COUNT conversion). POWR costs 30 with the
+        // synthetic catalog's default `BuildSpeedBias = 1.0`, so the raw build
+        // time is `T = round(30 × 0.9) = 27` ticks — *below* one STEP_COUNT.
+        //   full power: rate = Bound(27/54, 1, 255) = 1  => 1 × 54 =  54 ticks
+        //   zero power: T×4 = 108, rate = Bound(108/54,1,255) = 2 => 2 × 54 = 108
+        // The ×4 power penalty does NOT quadruple the wall-clock here because the
+        // full-power time floors up to a single STEP_COUNT (rate clamped 0→1),
+        // while the ×4 time clears the 54-tick floor — the authentic factory
+        // quirk (`FactoryClass::Start` Bound(.., 1, 255), factory.cpp:439).
+        assert_eq!(full, 54, "full-power POWR floors to one STEP_COUNT");
+        assert_eq!(low, 108, "zero-power POWR: T×4 then STEP_COUNT rate");
     }
 
     // -----------------------------------------------------------------
@@ -4458,17 +4661,37 @@ mod m5_tests {
         );
 
         w.set_house_credits(1, 0);
-        for _ in 0..20 {
+        // Run broke for a good while, recording progress each tick.
+        let mut last = progress_before_broke;
+        for _ in 0..80 {
             w.tick(&[]);
             assert!(
                 w.house_credits(1) >= 0,
                 "credits must never go negative under a stalled installment"
             );
+            last = w.house(1).unwrap().building_prod.unwrap().progress;
         }
+        // Production must NOT complete while broke, and must have plateaued (a
+        // stall). Note: with the M7.9 P0 STEP_COUNT conversion POWR is a 54-step
+        // build costing only 30 credits, so the earliest installments round to
+        // **0** (`30·(p+1)/54 == 0` for the first steps) and those free steps DO
+        // advance at zero credits — exactly as the original proceeds when
+        // `Cost_Per_Tick()` rounds to 0 (factory.cpp:207). Once the running
+        // installment reaches 1 credit the lane truly stalls. So we assert the
+        // real invariants: (a) it never finished, (b) it froze (last two ticks
+        // equal), (c) credits stayed non-negative.
+        assert!(
+            w.house(1).unwrap().ready_building.is_none(),
+            "production must not complete while credits are exhausted"
+        );
         let progress_after_broke = w.house(1).unwrap().building_prod.unwrap().progress;
         assert_eq!(
-            progress_after_broke, progress_before_broke,
-            "production must stall (zero further progress) while credits are exhausted"
+            progress_after_broke, last,
+            "production must have stalled (progress frozen) while broke"
+        );
+        assert!(
+            progress_after_broke < w.house(1).unwrap().building_prod.unwrap().total_ticks,
+            "a stalled build must sit below completion"
         );
 
         // Refund the treasury: production must resume and finish.

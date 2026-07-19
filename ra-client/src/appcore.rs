@@ -44,6 +44,12 @@ const ORE_GOLD_RGB: [u8; 3] = [196, 160, 40];
 /// Gem-ore render colour.
 const ORE_GEM_RGB: [u8; 3] = [70, 150, 210];
 
+/// SELL / REPAIR mode-button size (M7.9 P1). Two small buttons stacked in the
+/// right of the sidebar header, drawn over otherwise-blank header background so
+/// the radar/build-row geometry (and every geometry-based test) is unchanged.
+const MODE_BTN_W: i32 = 34;
+const MODE_BTN_H: i32 = 9;
+
 /// Radar minimap panel side length, in sidebar pixels (a square).
 const RADAR_SIZE: i32 = 120;
 /// Hi-res sidebar cameo dimensions (`<NAME>ICON.SHP`, 64×48 in `hires.mix`).
@@ -328,6 +334,17 @@ pub struct AppCore {
     prev_game_over: GameOver,
     /// Previous player low-power state (to fire the low-power cue on transition).
     prev_low_power: bool,
+
+    // --- Sell / repair mode (M7.9 P1) ---
+    /// Sell mode is armed (SELL button toggled): the next tactical left-click on
+    /// an **own** building sells it (`Command::Sell`). Mirrors the original's
+    /// sidebar SELL cursor mode (`sidebar.cpp`). Mutually exclusive with
+    /// `repair_mode` and placement. Never emits a command for an enemy building or
+    /// any unit (monkey/scripted-drive safe).
+    sell_mode: bool,
+    /// Repair mode is armed (REPAIR button toggled): the next tactical left-click
+    /// on an own building toggles its repair (`Command::Repair`).
+    repair_mode: bool,
 }
 
 impl AppCore {
@@ -398,6 +415,8 @@ impl AppCore {
             sounds: Vec::new(),
             prev_game_over: GameOver::Ongoing,
             prev_low_power: false,
+            sell_mode: false,
+            repair_mode: false,
         }
     }
 
@@ -435,6 +454,54 @@ impl AppCore {
     /// Turn the radar minimap panel on (drawn at the top of the sidebar strip).
     pub fn enable_radar(&mut self) {
         self.radar_enabled = true;
+    }
+
+    // ---- Sell / repair mode (M7.9 P1) ----
+
+    /// Whether sell mode is armed.
+    pub fn sell_mode(&self) -> bool {
+        self.sell_mode
+    }
+
+    /// Whether repair mode is armed.
+    pub fn repair_mode(&self) -> bool {
+        self.repair_mode
+    }
+
+    /// Arm/disarm sell mode. Arming it clears repair mode and any active
+    /// placement (the three tactical-click modes are mutually exclusive), like
+    /// the original's single sidebar cursor state.
+    pub fn set_sell_mode(&mut self, on: bool) {
+        self.sell_mode = on;
+        if on {
+            self.repair_mode = false;
+            self.placing = None;
+        }
+    }
+
+    /// Arm/disarm repair mode (mutually exclusive with sell mode / placement).
+    pub fn set_repair_mode(&mut self, on: bool) {
+        self.repair_mode = on;
+        if on {
+            self.sell_mode = false;
+            self.placing = None;
+        }
+    }
+
+    /// Toggle sell mode (the SELL button action).
+    pub fn toggle_sell_mode(&mut self) {
+        self.set_sell_mode(!self.sell_mode);
+    }
+
+    /// Toggle repair mode (the REPAIR button action).
+    pub fn toggle_repair_mode(&mut self) {
+        self.set_repair_mode(!self.repair_mode);
+    }
+
+    /// Cancel both sell and repair mode (Esc / right-click while armed).
+    fn cancel_action_modes(&mut self) {
+        self.sell_mode = false;
+        self.repair_mode = false;
     }
 
     /// Set the "classic radar rules" mode (M7.8 skirmish option). `true` keeps the
@@ -709,6 +776,9 @@ impl AppCore {
             InputEvent::KeyUp(Key::Deploy) => {}
             InputEvent::KeyDown(Key::Help) => self.show_help = !self.show_help,
             InputEvent::KeyUp(Key::Help) => {}
+            // Esc cancels an armed sell/repair mode (the App layer only forwards
+            // it here while a mode is active; otherwise it opens the pause menu).
+            InputEvent::KeyDown(Key::Menu) => self.cancel_action_modes(),
             InputEvent::KeyDown(k) => self.set_key(k, true),
             InputEvent::KeyUp(k) => self.set_key(k, false),
             InputEvent::MouseMoved { x, y } => {
@@ -725,6 +795,13 @@ impl AppCore {
                     // Sidebar click? (game mode, click in the right strip)
                     if self.sidebar_enabled && x >= self.tactical_width() as i32 {
                         self.sidebar_click(x, y);
+                    } else if self.sell_mode {
+                        // Sell mode: a tactical click sells the own building under
+                        // it (no-op on enemy buildings, units, or empty ground).
+                        self.try_sell_at(x, y);
+                    } else if self.repair_mode {
+                        // Repair mode: toggle repair on the own building clicked.
+                        self.try_repair_at(x, y);
                     } else if self.placing.is_some() {
                         // Placement mode: a tactical click drops the building.
                         self.place_at(x, y);
@@ -736,7 +813,10 @@ impl AppCore {
                     }
                 }
                 MouseButton::Right => {
-                    if self.placing.take().is_some() {
+                    if self.sell_mode || self.repair_mode {
+                        // Right-click cancels sell/repair mode (like the original).
+                        self.cancel_action_modes();
+                    } else if self.placing.take().is_some() {
                         // Right-click cancels placement (keeps the ready building).
                     } else {
                         self.issue_order(x, y);
@@ -1088,6 +1168,8 @@ impl AppCore {
         // Shroud: paint unexplored cells black, hiding whatever sits under them.
         self.draw_shroud(&mut frame, cam);
         self.draw_placement_preview(&mut frame, cam, tw);
+        // Sell/repair-mode hover tint over the own building under the cursor.
+        self.draw_action_hover(&mut frame, cam, tw);
         if let Some(d) = &self.drag {
             draw_rect_outline(
                 &mut frame, d.start.0, d.start.1, d.cur.0, d.cur.1, SELECT_RGB,
@@ -1591,6 +1673,67 @@ impl AppCore {
             .map(|(h, _)| h)
     }
 
+    /// The player's **own** building whose footprint covers a map-pixel point, if
+    /// any — excluding walls (which cannot be sold or repaired). The sell/repair
+    /// modes gate strictly on this, so a click on an enemy building, a unit, or
+    /// empty ground can never emit a command (monkey/scripted-drive safe).
+    fn own_building_at_map(&self, mx: i64, my: i64, player_house: u8) -> Option<Handle> {
+        let cell = CellCoord::new(
+            (mx.div_euclid(CELL_PIXELS as i64)) as i32,
+            (my.div_euclid(CELL_PIXELS as i64)) as i32,
+        );
+        self.world
+            .buildings
+            .iter()
+            .find(|(_, b)| b.house == player_house && b.is_alive() && !b.is_wall && b.covers(cell))
+            .map(|(h, _)| h)
+    }
+
+    /// Sell the own building under a tactical viewport point (sell mode). Emits
+    /// `Command::Sell` only for a live, own, non-wall building; stays in sell mode
+    /// so several buildings can be sold in a row (like the original).
+    fn try_sell_at(&mut self, x: i32, y: i32) {
+        if !self.accepting_orders() {
+            return;
+        }
+        let Some(house) = self.player_house else {
+            return;
+        };
+        let (mx, my) = self.viewport_to_map(x, y);
+        if let Some(building) = self.own_building_at_map(mx, my, house) {
+            self.emit(Command::Sell { house, building });
+        }
+    }
+
+    /// Toggle repair on the own building under a tactical viewport point (repair
+    /// mode). Emits `Command::Repair` only for a live, own, non-wall building.
+    fn try_repair_at(&mut self, x: i32, y: i32) {
+        if !self.accepting_orders() {
+            return;
+        }
+        let Some(house) = self.player_house else {
+            return;
+        };
+        let (mx, my) = self.viewport_to_map(x, y);
+        if let Some(building) = self.own_building_at_map(mx, my, house) {
+            self.emit(Command::Repair { house, building });
+        }
+    }
+
+    /// The SELL and REPAIR mode-button rects `(x0,y0,x1,y1)` in the sidebar header
+    /// (only meaningful when the sidebar is enabled). Stacked at the header's
+    /// right edge over blank background, so no other sidebar geometry moves.
+    fn sell_button_rect(&self) -> (i32, i32, i32, i32) {
+        let x1 = self.viewport_w as i32 - 2;
+        let x0 = x1 - MODE_BTN_W;
+        (x0, 1, x1, 1 + MODE_BTN_H)
+    }
+    fn repair_button_rect(&self) -> (i32, i32, i32, i32) {
+        let (x0, _, x1, _) = self.sell_button_rect();
+        let y0 = 1 + MODE_BTN_H + 1;
+        (x0, y0, x1, y0 + MODE_BTN_H)
+    }
+
     // ---- Build UI actions (public so tests / the verification drive them) ----
 
     /// Queue a command into the loopback pipeline and record it as emitted.
@@ -1986,6 +2129,18 @@ impl AppCore {
         if !self.accepting_orders() {
             return;
         }
+        // SELL / REPAIR mode buttons (M7.9 P1): toggle the corresponding tactical
+        // click mode. A pure UI action — the actual command is only emitted later,
+        // on a tactical click over an own building.
+        let hit = |(x0, y0, x1, y1): (i32, i32, i32, i32)| x >= x0 && x < x1 && y >= y0 && y < y1;
+        if hit(self.sell_button_rect()) {
+            self.toggle_sell_mode();
+            return;
+        }
+        if hit(self.repair_button_rect()) {
+            self.toggle_repair_mode();
+            return;
+        }
         let Some(idx) = self.sidebar_row_at(x, y) else {
             return;
         };
@@ -2187,6 +2342,48 @@ impl AppCore {
         }
     }
 
+    /// Sell/repair-mode indicator: tint the footprint of the own building under
+    /// the cursor (red for sell, green for repair) so the player sees what a click
+    /// would act on. Nothing is tinted over enemy buildings / units / empty ground
+    /// — the same gate as the command emission, so the visual can't imply an
+    /// illegal action.
+    fn draw_action_hover(&self, frame: &mut RgbaImage, cam: Rect, tw: u32) {
+        if !(self.sell_mode || self.repair_mode) {
+            return;
+        }
+        let Some(house) = self.player_house else {
+            return;
+        };
+        if !self.mouse_inside || self.mouse_x >= tw as i32 {
+            return;
+        }
+        let (mx, my) = self.viewport_to_map(self.mouse_x, self.mouse_y);
+        let Some(h) = self.own_building_at_map(mx, my, house) else {
+            return;
+        };
+        let Some(b) = self.world.buildings.get(h) else {
+            return;
+        };
+        let rgb = if self.sell_mode {
+            [230, 60, 50]
+        } else {
+            [70, 210, 70]
+        };
+        for c in b.footprint() {
+            let px = (c.x * CELL_PIXELS) as i64 - cam.x;
+            let py = (c.y * CELL_PIXELS) as i64 - cam.y;
+            fill_rect_alpha(
+                frame,
+                px as i32,
+                py as i32,
+                px as i32 + CELL_PIXELS - 1,
+                py as i32 + CELL_PIXELS - 1,
+                rgb,
+                110,
+            );
+        }
+    }
+
     /// Draw the build sidebar: credits + power header, then buildable rows with
     /// cost, a build-progress bar, or a READY tag.
     fn draw_sidebar(&self, frame: &mut RgbaImage) {
@@ -2211,6 +2408,9 @@ impl AppCore {
             pcol,
         );
 
+        // SELL / REPAIR mode buttons in the header's right edge.
+        self.draw_mode_buttons(frame);
+
         // Radar minimap panel (top of the strip, under the header).
         self.draw_radar(frame);
 
@@ -2219,6 +2419,37 @@ impl AppCore {
         for col in 0..SIDEBAR_COLUMNS {
             self.draw_sidebar_column(frame, col);
         }
+    }
+
+    /// Draw the SELL and REPAIR mode buttons (M7.9 P1). Each shows highlighted
+    /// (bright fill) when its mode is armed, dim otherwise — the sell-mode
+    /// indicator the task calls for.
+    fn draw_mode_buttons(&self, frame: &mut RgbaImage) {
+        let btn = |frame: &mut RgbaImage,
+                   (x0, y0, x1, y1): (i32, i32, i32, i32),
+                   label: &str,
+                   armed: bool,
+                   armed_rgb: [u8; 3]| {
+            let bg = if armed { armed_rgb } else { [46, 46, 54] };
+            fill_rect(frame, x0, y0, x1 - 1, y1 - 1, bg);
+            draw_rect_outline(frame, x0, y0, x1 - 1, y1 - 1, [90, 90, 100]);
+            let tcol = if armed { [12, 12, 12] } else { [200, 200, 210] };
+            font::draw_text(frame, x0 + 2, y0 + 1, label, tcol);
+        };
+        btn(
+            frame,
+            self.sell_button_rect(),
+            "SELL",
+            self.sell_mode,
+            [230, 90, 80],
+        );
+        btn(
+            frame,
+            self.repair_button_rect(),
+            "REP",
+            self.repair_mode,
+            [120, 200, 120],
+        );
     }
 
     /// Draw one build strip (column) of cameo rows plus, when it overflows, its

@@ -686,7 +686,8 @@ fn apply_op_with_mixed_units(core: &mut AppCore, op: MonkeyOp, index: usize) {
             Command::StartProduction { .. }
             | Command::PlaceBuilding { .. }
             | Command::CancelProduction { .. }
-            | Command::Sell { .. } => continue,
+            | Command::Sell { .. }
+            | Command::Repair { .. } => continue,
         };
         let owner = core.world().units.get(unit).unwrap_or_else(|| {
             panic!("drained {cmd:?} addresses a handle that isn't live in the world")

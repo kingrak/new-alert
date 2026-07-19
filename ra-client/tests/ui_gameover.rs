@@ -396,7 +396,8 @@ fn post_game_over_monkey_sequence_never_panics_and_leaks_no_command() {
                     | ra_sim::Command::StartProduction { house, .. }
                     | ra_sim::Command::CancelProduction { house, .. }
                     | ra_sim::Command::PlaceBuilding { house, .. }
-                    | ra_sim::Command::Sell { house, .. } => house,
+                    | ra_sim::Command::Sell { house, .. }
+                    | ra_sim::Command::Repair { house, .. } => house,
                 };
                 assert_ne!(
                     house, dead_house,

@@ -372,8 +372,15 @@ impl App {
     }
 
     fn handle_ingame(&mut self, ev: InputEvent) {
-        // Esc opens the pause overlay (freezing the sim).
+        // Esc first cancels an armed sell/repair mode (the original's cursor
+        // mode); only when no such mode is active does it open the pause overlay.
         if matches!(ev, InputEvent::KeyDown(Key::Menu)) {
+            if let Some(c) = self.core.as_mut() {
+                if c.sell_mode() || c.repair_mode() {
+                    c.handle(ev);
+                    return;
+                }
+            }
             self.state = AppState::Paused;
             self.focus = 0;
             return;

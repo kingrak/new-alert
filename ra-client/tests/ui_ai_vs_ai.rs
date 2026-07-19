@@ -42,7 +42,8 @@ fn load_ai_vs_ai_from_bytes(
     redalert_bytes: &[u8],
     scenario_name: &str,
     starting_credits: i32,
-    difficulty: Difficulty,
+    diff_a: Difficulty,
+    diff_b: Difficulty,
 ) -> Result<AiVsAiGame, Box<dyn std::error::Error>> {
     let main = MixArchive::parse(main_bytes)?;
     let redalert = MixArchive::parse(redalert_bytes)?;
@@ -88,9 +89,13 @@ fn load_ai_vs_ai_from_bytes(
     // duplicate. Immaterial here: this suite doesn't assert anything about
     // ore growth, only that the AI-vs-AI game resolves.
     world.set_ore_growth(true, true);
+    // Per-house difficulty (M7.9 P2a): `set_catalog` above carried the
+    // difficulty stat-handicap table, and `set_ai` copies each house's handicap
+    // onto it — so an asymmetric (Hard vs Easy) game genuinely handicaps the two
+    // sides differently at the combat/movement/production sites.
     world.set_ai(vec![
-        AiPlayer::new(house_a, difficulty),
-        AiPlayer::new(house_b, difficulty),
+        AiPlayer::new(house_a, diff_a),
+        AiPlayer::new(house_b, diff_b),
     ]);
 
     let (start_a, start_b) = two_starts(&world, &scen_ini);
@@ -277,6 +282,7 @@ fn assert_decisive(scenario: &str, max_ticks: u32) {
         scenario,
         CREDITS,
         Difficulty::Hard,
+        Difficulty::Hard,
     )
     .unwrap_or_else(|e| panic!("{scenario}: failed to load an AI-vs-AI game: {e}"));
     let house_a = game.house_a;
@@ -322,4 +328,58 @@ fn real_scg05ea_ai_vs_ai_reaches_a_decisive_outcome() {
 #[test]
 fn real_scm01ea_ai_vs_ai_reaches_a_decisive_outcome() {
     assert_decisive("scm01ea.ini", MAX_TICKS);
+}
+
+/// **M7.9 P2a showcase — Hard must reliably beat Easy.** With the difficulty
+/// stat handicaps wired in (firepower/armor/ROF/groundspeed/cost/build-time,
+/// house-scoped from rules.ini's `[Easy]/[Difficult]` sections), a `Hard` AI
+/// out-damages, out-produces and out-manoeuvres an `Easy` one. To prove the
+/// *difficulty* decides it — not the map's start positions — we run the **same
+/// map twice with the sides swapped** and require the Hard house to win **both**
+/// times. "Reliably" = start-independent.
+#[test]
+fn real_hard_ai_reliably_beats_easy_ai() {
+    if !support::real_assets_available() {
+        eprintln!("SKIP: real assets not found (Hard-vs-Easy showcase)");
+        return;
+    }
+    let dir = support::assets_dir();
+    let main_bytes = std::fs::read(dir.join("main.mix")).expect("main.mix");
+    let redalert_bytes = std::fs::read(dir.join("redalert.mix")).expect("redalert.mix");
+    let scenario = "scg05ea.ini";
+
+    // Orientation 1: house A = Hard, house B = Easy → expect A wins.
+    // Orientation 2: house A = Easy, house B = Hard → expect B wins.
+    for (diff_a, diff_b, hard_is_a) in [
+        (Difficulty::Hard, Difficulty::Easy, true),
+        (Difficulty::Easy, Difficulty::Hard, false),
+    ] {
+        let game = load_ai_vs_ai_from_bytes(
+            &main_bytes,
+            &redalert_bytes,
+            scenario,
+            CREDITS,
+            diff_a,
+            diff_b,
+        )
+        .unwrap_or_else(|e| panic!("failed to load Hard-vs-Easy game: {e}"));
+
+        let (tick, outcome) = drive_to_decisive(game, MAX_TICKS).unwrap_or_else(|| {
+            panic!("Hard-vs-Easy on {scenario} never resolved within {MAX_TICKS} ticks")
+        });
+        let hard_won = matches!(
+            (outcome, hard_is_a),
+            (Outcome::HouseAWins, true) | (Outcome::HouseBWins, false)
+        );
+        eprintln!(
+            "Hard-vs-Easy ({}): resolved at tick {tick} (~{:.1} min), outcome={outcome:?}, hard_won={hard_won}",
+            if hard_is_a { "Hard=A" } else { "Hard=B" },
+            tick as f64 / TICKS_PER_SEC as f64 / 60.0
+        );
+        assert!(
+            hard_won,
+            "the Hard AI must beat the Easy AI (orientation hard_is_a={hard_is_a}, outcome={outcome:?}) \
+             — difficulty stat handicaps should decide it regardless of start position"
+        );
+    }
 }

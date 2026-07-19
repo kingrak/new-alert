@@ -132,9 +132,14 @@ fn synthetic_shroud_frame_golden_hash() {
     let frame = core.compose_game();
     assert_eq!(frame.width, 640);
     assert_eq!(frame.height, 400);
+    // Re-pinned for M7.9 P1 (player sell/repair UI): the sidebar header now
+    // draws the SELL and REPAIR mode buttons at its right edge, changing the
+    // header pixels of every sidebar-enabled `compose_game` frame. Sidebar
+    // **rendering** only — sim state, radar/build-row geometry, and the tactical
+    // area are untouched. Re-derived deterministically.
     assert_eq!(
         support::fnv1a(&frame.pixels),
-        0xbfef_0bbd_9db5_dab6,
+        0x4e42_83fd_f490_565a,
         "synthetic shroud frame hash changed"
     );
 }
@@ -329,12 +334,18 @@ fn real_skirmish_compose_game_map_sweep_with_shroud_no_panic() {
     // collapse to a **single** identical hash, and only position 2 (the player
     // start, with its explored terrain/ore under the shroud) differs. Sim state is
     // untouched; sidebar + radar are rendering. Re-derived deterministically.
+    //
+    // **Re-pinned for M7.9 P1** (player sell/repair UI): the SELL/REPAIR mode
+    // buttons now draw in the sidebar header, so every sweep frame's sidebar
+    // changed. The 0/1/3/4-collapse-to-one, 2-differs structure is preserved
+    // (the buttons are position-independent); only the constants moved. Sim
+    // untouched; sidebar rendering. Re-derived deterministically.
     let golden: [u64; 5] = [
-        0x9c24_7f01_95a6_b4af,
-        0x9c24_7f01_95a6_b4af,
-        0xf48d_584e_eb7d_0bff,
-        0x9c24_7f01_95a6_b4af,
-        0x9c24_7f01_95a6_b4af,
+        0xcae6_645d_b5c4_c643,
+        0xcae6_645d_b5c4_c643,
+        0xa9e4_d26a_257a_fc9b,
+        0xcae6_645d_b5c4_c643,
+        0xcae6_645d_b5c4_c643,
     ];
     let got: Vec<u64> = frames.iter().map(|p| support::fnv1a(p)).collect();
     assert_eq!(

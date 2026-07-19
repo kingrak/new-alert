@@ -556,3 +556,123 @@ keeps every name that resolves (24 maps on the freeware set). User maps are scan
 from the per-OS data dir (`platform::user_maps_dir`, e.g.
 `~/.local/share/new-alert/maps`), created on first run, and load via the same
 INI-text path (`load_from_text` / `load_skirmish_configured`) as archive maps.
+
+---
+
+## Q13 — Build-time fidelity: the missing `BuildSpeed` bias and STEP_COUNT quantise (M7.9 P0)
+
+**Milestone:** M7.9 P0 (player report: "builds feel too slow").
+
+**The bug.** `Catalog::time_to_build` computed `Cost × TICKS_PER_MINUTE / 1000`
+and used the result directly as the tick count. It dropped **two** pieces of
+`TechnoTypeClass::Time_To_Build` + `FactoryClass::Start`:
+
+1. **`Rule.BuildSpeedBias`** (`[General] BuildSpeed`, rules.cpp:464). Our real
+   `redalert.mix` rules.ini ships `BuildSpeed=.8` (note: **`.8`, not `.7`** — the
+   brief's `.7` is retail; rules.ini is ground truth). We applied no bias at all,
+   so every item took `1/0.8 = 1.25×` too long.
+2. The **STEP_COUNT rate conversion** (`factory.cpp:432`): the factory divides the
+   raw time `T` by `STEP_COUNT = 54`, `Bound`s the per-step rate to `1..=255`, and
+   then takes `STEP_COUNT` steps — so the real build time is `rate × 54`, which
+   truncates `T` down to a multiple of 54 (and floors any trivially cheap item to
+   54 ticks). We never quantised.
+
+**The fix** (`ra-sim/src/catalog.rs`). `build_time_base(cost)` reproduces
+`round(round(Cost × 0.8) × 0.9)` with integer 16.16 math (round-to-nearest at each
+`int × fixed` step, matching `common/fixed.h`); `time_to_build(cost, scale_n,
+scale_d)` then applies the low-power snapshot and the STEP_COUNT rate conversion.
+`BuildSpeed` is loaded from rules.ini into `EconRules::build_speed_bias_raw`
+(default `1.0` for synthetic catalogs, matching the reference compile-time
+default).
+
+**Before → after (full power, Normal, single factory):**
+
+| item | before | after (measured) | reference |
+|------|--------|------------------|-----------|
+| POWR $300 | 270 t (18.0 s) | **216 t (14.4 s)** | 216 |
+| WEAP $2000 | 1800 t (120.0 s) | **1404 t (93.6 s)** | 1404 |
+| 2TNK $800 | 720 t (48.0 s) | **540 t (36.0 s)** | 540 |
+
+Pinned with the derivation in `ra-sim/tests/build_time_fidelity.rs`. Units use the
+same formula family as buildings (stock `UnitBuildPenalty = 100 → ×1`). No golden
+churn: synthetic economy goldens are same-script determinism checks, and no pinned
+frame captured a mid-build state that this timing shift would move.
+
+---
+
+## Q14 — Player sell / repair interface + building self-repair (M7.9 P1)
+
+**Milestone:** M7.9 P1 (the sell UI deferred since M6; repair as the bonus).
+
+**Sell mode.** `Command::Sell` has existed in the sim since M6; M7.9 adds the UI
+through the AppCore seam: a **SELL button** in the sidebar header toggles
+`sell_mode`; a tactical left-click while armed sells the **own** building under it
+(`own_building_at_map` gates strictly on own + alive + non-wall), refunding
+`RefundPercent`. Right-click or Esc cancels the mode (the `App` layer forwards Esc
+to the core only while a mode is armed, else it opens pause). **Monkey/scripted-
+drive safe:** a click on an enemy building, a unit, or empty ground emits nothing.
+A red footprint hover-tint shows what a click would sell.
+
+**Repair (bonus, implemented).** New `Command::Repair` toggles
+`Building::is_repairing` (`BuildingClass::Repair(-1)`, building.cpp:2725); a
+**REPAIR button** + repair mode drive it, with a green hover-tint. A new
+`run_building_repair` system heals on the global repair cadence
+(`REPAIR_INTERVAL = 15` ticks ≈ `Rule.RepairRate`): `+Rule.RepairStep (=5)` HP per
+step, charging `Rule.RepairPercent (=1/4) × (Cost / (MaxStrength / RepairStep))`
+credits (`TechnoTypeClass::Repair_Cost`, techno.cpp:6907, floored ≥1). It stops at
+full health or when the house can't pay the step — the original's two exits
+(building.cpp:5860-5878). Walls refuse repair (they're overlays in the original,
+per Q9/Q11c).
+
+**Hash / golden discipline.** `is_repairing` is folded into the building hash
+**only while `true`**, so a building never ordered to repair (every pre-M7.9
+golden) hashes identically. The SELL/REPAIR buttons render in the sidebar header,
+which legitimately moves the four **sidebar-enabled** `compose_game` frame goldens
+(`ui_shroud_golden` ×2, `ui_menu_golden_frames` paused/gameover ×2) — re-pinned
+with citations; sidebar rendering only, no sim/geometry change.
+
+---
+
+## Q15 — Difficulty stat handicaps, and why the RA sections invert for AI opponents (M7.9 P2a)
+
+**Milestone:** M7.9 P2a ("the authentic Easy/Normal/Hard"; "Hard must reliably
+beat Easy in AI-vs-AI").
+
+**What we ported.** `HouseClass::Assign_Handicap` (house.cpp:278): each AI house
+carries a `Handicap` — the `[Easy]/[Normal]/[Difficult]` bias multipliers
+(`Difficulty_Get`, rules.cpp:307) — applied house-scoped at the reference's own
+computation sites:
+- **Firepower** (damage dealt) at `fire()` (`techno.cpp:3303`).
+- **Armor** (damage taken) per-target in `explosion_damage` (`techno.cpp:4099`).
+- **ROF** (rearm delay) in unit + building combat (`techno.cpp:3066`).
+- **Groundspeed** (move speed + turn rate) in `move_units` (`drive.cpp:648/1354`).
+- **Cost** (credits charged) and **BuildTime** in `apply_start_production`
+  (`Assign_Handicap` BuildSpeedBias / Purchase_Price).
+
+Biases are raw 16.16 fixed, loaded from rules.ini by the client into
+`EconRules::difficulty`; a house with no AI (the human) and every synthetic catalog
+keep the **neutral all-`1.0`** handicap, which is a byte-exact no-op (`fx_mul(v,
+1.0) == v`) and is folded into the house hash **only when non-neutral** — so no
+pre-M7.9 golden moves.
+
+**The inversion (the quirk).** RA's difficulty sections are *player-centric*:
+`Rule.Diff[DIFF_EASY]` = `[Easy]` = the **buffed** handicap (FirePower 1.2, ROF .8,
+Cost/BuildTime .8) — what the *player* gets on the easy setting. There is no
+separate "AI strength" knob; the AI opponent is just neutral. But the brief (and
+intuition) wants an AI **labelled** by how hard it is to *beat*: a "Hard" opponent
+should be **strong**. So `Catalog::difficulty_handicap` maps our labels to the
+sections that make the label true: **`Hard → [Easy]`** (the buffs), `Normal →
+[Normal]`, **`Easy → [Difficult]`** (the nerfs). The bias *values* are 100%
+authentic rules.ini; only the label→section pairing is inverted, and it is
+inverted precisely because a "hard game" in RA means the player is nerfed (i.e. the
+opponent is relatively strong). Verified start-independent in
+`ui_ai_vs_ai::real_hard_ai_reliably_beats_easy_ai` (same map, sides swapped, Hard
+wins both).
+
+**Deferred (documented).** The rest of P2 — Expert_AI weighted enemy selection
+(house.cpp:4941), base-size rubber-banding (house.cpp:4929), composed attack teams
+with staging cells + harvester harassment + retreat thresholds, and economic
+reflexes (AI repair/sell/fire-sale, `AI_Raise_Money`/`Fire_Sale`) — is **not** in
+M7.9; only the difficulty handicaps (a) and the existing wave cadence are wired.
+Those four are each a substantial system and are left for a dedicated AI milestone.
+The repair *machinery* an AI would reuse (Q14) is in place.

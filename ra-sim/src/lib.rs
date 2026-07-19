@@ -51,7 +51,7 @@ pub use coords::{
     spot_index, CellCoord, Facing, Lepton, Locomotor, WorldCoord, LEPTONS_PER_CELL, SPOT_OFFSET,
     SUBCELL_COUNT,
 };
-pub use house::{BuildItem, House, ProdKind, Production};
+pub use house::{BuildItem, Handicap, House, ProdKind, Production};
 pub use occupancy::UnitGrid;
 pub use ore::{OreCell, OreField};
 pub use path::Passability;

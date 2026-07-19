@@ -27,8 +27,8 @@ use ra_formats::tmpl::Template;
 
 use ra_sim::coords::{CellCoord, Facing};
 use ra_sim::{
-    BuildItem, BuildingProto, Catalog, EconRules, Handle, MoveStats, OreField, Passability,
-    UnitProto, World,
+    BuildItem, BuildingProto, Catalog, EconRules, Handicap, Handle, MoveStats, OreField,
+    Passability, UnitProto, World,
 };
 
 use crate::appcore::AppCore;
@@ -562,7 +562,46 @@ fn econ_rules(rules: &Ini) -> EconRules {
             .get_int("General", "GrowthRate")
             .unwrap_or(d.growth_rate as i64)
             .max(1) as i32,
+        // `Rule.BuildSpeedBias` from `[General] BuildSpeed` (rules.cpp:464),
+        // parsed as a `fixed` (`.8` in stock RA) into raw 16.16. This is the
+        // global build-time multiplier the M7.9 P0 audit found we were dropping.
+        build_speed_bias_raw: match rules.get("General", "BuildSpeed") {
+            Some(v) => ra_data::combat::parse_fixed_raw(v) as i32,
+            None => d.build_speed_bias_raw,
+        },
+        // Difficulty stat-handicap table (M7.9 P2a). Indexed by our
+        // `Difficulty` (Easy=0, Normal=1, Hard=2). The rules.ini section names are
+        // player-centric — `[Easy]` is the *buffed* handicap — so for an AI
+        // **opponent** (labelled by how hard it is to beat) we invert: a `Hard` AI
+        // gets `[Easy]`'s buffs and an `Easy` AI gets `[Difficult]`'s nerfs, so
+        // Hard reliably beats Easy (see QUIRKS).
+        difficulty: [
+            diff_handicap(rules, "Difficult"), // our Easy  -> weak
+            diff_handicap(rules, "Normal"),    // our Normal
+            diff_handicap(rules, "Easy"),      // our Hard  -> strong
+        ],
         ..d
+    }
+}
+
+/// Read one `[Easy]/[Normal]/[Difficult]` difficulty section into a [`Handicap`]
+/// (raw 16.16 biases). Missing keys default to `1.0` (`Difficulty_Get`,
+/// rules.cpp:307, defaults each bias to 1). `Armor`/`ROF`/`Groundspeed`/`Cost`/
+/// `BuildTime`/`FirePower` map to the same-named `Handicap` fields.
+fn diff_handicap(rules: &Ini, section: &str) -> Handicap {
+    let fx = |key: &str| -> i32 {
+        match rules.get(section, key) {
+            Some(v) => ra_data::combat::parse_fixed_raw(v) as i32,
+            None => 1 << 16,
+        }
+    };
+    Handicap {
+        firepower: fx("FirePower"),
+        armor: fx("Armor"),
+        rof: fx("ROF"),
+        groundspeed: fx("Groundspeed"),
+        cost: fx("Cost"),
+        build_time: fx("BuildTime"),
     }
 }
 

@@ -82,7 +82,7 @@ pub struct WeaponDef {
 /// Parse an ASCII fixed-point number into raw 16.16, matching `fixed(char const*)`
 /// (`common/fixed.cpp:82`): a trailing `%` means `value/100`; a decimal point
 /// splits whole and fractional parts. Non-numeric input yields 0.
-fn parse_fixed_raw(s: &str) -> i64 {
+pub fn parse_fixed_raw(s: &str) -> i64 {
     let s = s.trim();
     // Percentage form: atoi(digits) * 65536 / 100.
     if let Some(pos) = s.find('%') {

@@ -67,6 +67,12 @@ pub struct Building {
     pub is_wall: bool,
     /// Credit storage this structure adds to its house's cap (`Storage=`).
     pub storage: i32,
+    /// Player has toggled repair on this building (`BuildingClass::IsRepairing`,
+    /// `building.cpp:1669`). While set, `run_building_repair` heals it on the
+    /// global repair cadence, draining credits per step; it clears itself at full
+    /// health or when the house can't pay. Defaults `false` (M7.9 P1). Hashed only
+    /// when `true`, so no non-repairing building perturbs an existing golden.
+    pub is_repairing: bool,
 }
 
 impl Building {
@@ -138,6 +144,12 @@ impl Building {
         // over time and is folded in ONLY for armed buildings — appending no bytes
         // for ordinary structures, so every pre-Chunk-B golden (no armed building)
         // hashes byte-identically.
+        // Repair toggle (M7.9 P1): folded in ONLY while actively repairing, so a
+        // building that has never been ordered to repair (every pre-M7.9 golden)
+        // appends no byte and hashes identically.
+        if self.is_repairing {
+            h.write_u8(0x5A);
+        }
         if self.is_combat() {
             h.write_u8(0xDE);
             h.write_u8(self.turret_facing.0);

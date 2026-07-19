@@ -72,9 +72,11 @@ fn paused_overlay_frame_hash() {
     assert_eq!(a.state(), AppState::Paused);
     let f = a.compose();
     assert_eq!((f.width, f.height), (1024, 768));
+    // Re-pinned for M7.9 P1: the game surface (composed under the pause overlay)
+    // now shows the SELL/REPAIR sidebar buttons. Sidebar rendering only.
     assert_eq!(
         support::fnv1a(&f.pixels),
-        0x73ba_6fb7_89a4_2c0a,
+        0x773d_8e22_356a_c386,
         "Paused overlay frame hash changed"
     );
 }
@@ -106,9 +108,11 @@ fn gameover_overlay_frame_hash() {
     );
     let f = a.compose();
     assert_eq!((f.width, f.height), (1024, 768));
+    // Re-pinned for M7.9 P1: the game surface under the VICTORY banner now shows
+    // the SELL/REPAIR sidebar buttons. Sidebar rendering only.
     assert_eq!(
         support::fnv1a(&f.pixels),
-        0x8bfb_478a_810d_f155,
+        0x77bc_23ae_c3a9_1651,
         "GameOver overlay frame hash changed"
     );
 }
