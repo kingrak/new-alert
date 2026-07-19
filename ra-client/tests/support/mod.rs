@@ -14,8 +14,9 @@ use std::sync::OnceLock;
 
 use ra_client::appcore::AppCore;
 use ra_client::assets::{self, LoadedGame};
-use ra_client::compositor::{IndexedImage, Palette};
+use ra_client::compositor::{IndexedImage, Palette, RgbaImage};
 use ra_client::input::{InputEvent, MouseButton};
+use ra_client::menu::{App, GameFactory, MapEntry, MapSource, ResolvedSkirmish};
 use ra_client::terrain::{self, TileSet};
 use ra_client::unit_render::{SpriteFrame, UnitSprite};
 use ra_data::scenario::{MapCell, Scenario, Theater, MAP_CELL_H, MAP_CELL_W};
@@ -23,8 +24,8 @@ use ra_data::templates;
 use ra_formats::tmpl::{Template, ICON_WIDTH};
 use ra_sim::coords::{CellCoord, Facing};
 use ra_sim::{
-    BuildItem, Command, Handle, MoveStats, Target, WarheadProfile, WeaponProfile, World,
-    ARMOR_COUNT,
+    AiPlayer, BuildItem, Command, Handle, MoveStats, Passability, Target, WarheadProfile,
+    WeaponProfile, World, ARMOR_COUNT,
 };
 
 /// Tiny dependency-free FNV-1a 64-bit hash — same algorithm used by the
@@ -720,4 +721,154 @@ pub fn run_select_and_move_script(
         hashes.push(core.sim_hash());
     }
     (hashes, emitted)
+}
+
+// ===========================================================================
+// Menu (App) test fixtures (M7.8): shared by the menu monkey, golden-frame,
+// and pixel-driven-flow suites so the three don't each hand-roll their own
+// copy of the same synthetic factory/map list (a fourth copy already exists,
+// deliberately kept self-contained, in `ui_menu_state_machine.rs`).
+// ===========================================================================
+
+/// A fixed, asset-free map list: three entries (two "archive" + one "user"),
+/// same shape as `ui_menu_state_machine.rs`'s `synth_maps` — used everywhere a
+/// menu test needs a small, deterministic, non-empty map list. Empty preview
+/// images mean the setup screen draws its placeholder cross, so no art is
+/// needed either.
+pub fn menu_synth_maps() -> Vec<MapEntry> {
+    let mk = |name: &str, file: &str, players: u8, src: MapSource| MapEntry {
+        name: name.to_string(),
+        filename: file.to_string(),
+        players,
+        width: 64,
+        height: 64,
+        source: src,
+        preview: RgbaImage {
+            width: 0,
+            height: 0,
+            pixels: Vec::new(),
+        },
+    };
+    vec![
+        mk("Alpha", "alpha.ini", 2, MapSource::Archive),
+        mk("Bravo", "bravo.ini", 4, MapSource::Archive),
+        mk("MyMap", "mymap.mpr", 2, MapSource::User),
+    ]
+}
+
+/// A [`GameFactory`] that builds a tiny, always-`Ongoing` synthetic `World`
+/// from the resolved skirmish choices — both sides get one unarmed unit (so
+/// neither is "eliminated" at spawn), matching `ui_menu_state_machine.rs`'s
+/// `SynthFactory` exactly. Used by the monkey/pixel-flow suites, which need a
+/// game that stays playable rather than immediately resolving.
+pub struct MenuSynthFactory;
+
+impl GameFactory for MenuSynthFactory {
+    fn build(&self, res: &ResolvedSkirmish) -> Result<(AppCore, CellCoord), String> {
+        if res.map_filename.is_empty() {
+            return Err("empty map".to_string());
+        }
+        let mut world = World::new(Passability::all_passable(), 0xABCD_1234);
+        world.init_houses(8, res.credits);
+        world.set_player_house(res.player_house);
+        let ai_house = if res.player_house == 2 { 0 } else { 2 };
+        world.set_ai(vec![AiPlayer::new(ai_house, res.difficulty)]);
+        let stats = MoveStats {
+            max_speed: 20,
+            rot: 8,
+        };
+        world.spawn_unit(
+            0,
+            res.player_house,
+            CellCoord::new(10, 10),
+            Facing(0),
+            100,
+            stats,
+        );
+        world.spawn_unit(0, ai_house, CellCoord::new(50, 50), Facing(0), 100, stats);
+        let raster = IndexedImage {
+            width: 16,
+            height: 16,
+            pixels: vec![0u8; 16 * 16],
+        };
+        let mut core = AppCore::with_sim(raster, [[0u8; 3]; 256], world, Vec::new(), Vec::new());
+        core.enable_sidebar(res.player_house, Vec::new());
+        core.enable_radar();
+        core.set_classic_radar(res.classic_radar);
+        Ok((core, CellCoord::new(10, 10)))
+    }
+}
+
+/// A [`GameFactory`] that builds a synthetic `World` pre-arranged to resolve
+/// **Victory** on the very first `update()` tick: the AI house starts with no
+/// units and no buildings at all, so `update_game_over`'s
+/// `world.ai.iter().all(|a| !world.house_alive(a.house))` is true immediately
+/// (`ra-sim/src/world.rs`). Mirrors `ui_gameover.rs`'s `Eliminate::Ai` fixture,
+/// adapted to the `GameFactory` seam so the menu's `App::start_game` can drive
+/// into `AppState::GameOver` through the real `update()` path rather than a
+/// backdoor state-setter (there is none).
+pub struct MenuGameOverFactory;
+
+impl GameFactory for MenuGameOverFactory {
+    fn build(&self, res: &ResolvedSkirmish) -> Result<(AppCore, CellCoord), String> {
+        if res.map_filename.is_empty() {
+            return Err("empty map".to_string());
+        }
+        let mut world = World::new(Passability::all_passable(), 0xC0FE_C0DE);
+        world.init_houses(8, res.credits);
+        world.set_player_house(res.player_house);
+        let ai_house = if res.player_house == 2 { 0 } else { 2 };
+        world.set_ai(vec![AiPlayer::new(ai_house, res.difficulty)]);
+        // The player gets a unit; the AI house is left with nothing, so the
+        // very next `update_game_over` resolves Victory.
+        let stats = MoveStats {
+            max_speed: 20,
+            rot: 8,
+        };
+        world.spawn_unit(
+            0,
+            res.player_house,
+            CellCoord::new(10, 10),
+            Facing(0),
+            100,
+            stats,
+        );
+        let raster = IndexedImage {
+            width: 16,
+            height: 16,
+            pixels: vec![0u8; 16 * 16],
+        };
+        let mut core = AppCore::with_sim(raster, [[0u8; 3]; 256], world, Vec::new(), Vec::new());
+        core.enable_sidebar(res.player_house, Vec::new());
+        core.enable_radar();
+        core.set_classic_radar(res.classic_radar);
+        Ok((core, CellCoord::new(10, 10)))
+    }
+}
+
+/// A ready-to-use `App` at `MainMenu`, resized to a fixed 1024x768 viewport
+/// (`App::new`'s own default, made explicit) with [`menu_synth_maps`] and
+/// [`MenuSynthFactory`].
+pub fn menu_app() -> App {
+    let mut a = App::new(menu_synth_maps(), Box::new(MenuSynthFactory));
+    a.handle(InputEvent::Resize {
+        width: 1024,
+        height: 768,
+    });
+    a
+}
+
+/// Click (MouseDown+MouseUp, left button) at a viewport pixel coordinate —
+/// the same helper shape `ui_menu_state_machine.rs` uses locally.
+pub fn menu_click(a: &mut App, x: i32, y: i32) {
+    a.handle(InputEvent::MouseDown {
+        button: MouseButton::Left,
+        x,
+        y,
+    });
+    a.handle(InputEvent::MouseUp {
+        button: MouseButton::Left,
+        x,
+        y,
+    });
 }

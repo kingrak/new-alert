@@ -726,6 +726,82 @@ fn engineer_cannot_capture_a_wall_and_is_not_consumed() {
     );
 }
 
+/// M7.8 carried-fix depth: fix (a)'s immediate-reconcile applies at **two**
+/// call sites — `remove_building` (sell/destroy, pinned above by
+/// `selling_a_full_silo_reconciles_stored_tiberium_immediately_no_refund`)
+/// and `capture_building` (`world.rs`: `capture_building` recomputes the
+/// *former* owner's `house_storage_capacity` and calls `reconcile_capacity`
+/// right after flipping ownership). Only the sell path had a pin before this
+/// test — capturing a storage building is a second, independent way to lose
+/// capacity, and it goes through different code entirely (no `Command::Sell`,
+/// no `remove_building` at all — the building stays alive, just under new
+/// ownership). This closes that gap: house 2 owns both a PROC (1000 storage)
+/// and a weakened SILO (500 storage), filled to the combined 1500 cap; house
+/// 1's engineer captures the SILO (health at the 1/4-max threshold); the
+/// instant it flips to house 1, house 2's capacity drops to 1000 (PROC only)
+/// and its stored tiberium must already be clamped to 1000 in the *same*
+/// `tick()` call — not deferred to house 2's next harvest.
+#[test]
+fn engineer_capturing_a_silo_reconciles_the_former_owners_tiberium_immediately() {
+    let mut w = world(0);
+    w.spawn_building(B_PROC, 2, CellCoord::new(10, 10)).unwrap();
+    let silo = w.spawn_building(B_SILO, 2, CellCoord::new(20, 10)).unwrap();
+    let cap_before = w.house_capacity(2);
+    assert_eq!(cap_before, 1500, "PROC(1000) + SILO(500)");
+    w.houses[2].add_harvest(1500, cap_before);
+    assert_eq!(
+        w.houses[2].tiberium, 1500,
+        "house 2 filled to its combined cap"
+    );
+
+    // Weaken the SILO to the capture threshold (health <= max/4 == 125).
+    w.buildings.get_mut(silo).unwrap().health = 100;
+    let eng = spawn_infantry(&mut w, 1, CellCoord::new(19, 10), Facing(0), 25, None);
+
+    w.tick(&[Command::Attack {
+        unit: eng,
+        target: Target::Building(silo),
+        house: 1,
+    }]);
+
+    assert_eq!(
+        w.buildings.get(silo).map(|b| b.house),
+        Some(1),
+        "the weakened SILO should be captured, not just damaged"
+    );
+    assert!(
+        !w.units.contains(eng),
+        "the engineer is consumed on a successful capture"
+    );
+
+    let cap_after = w.house_capacity(2);
+    assert_eq!(
+        cap_after, 1000,
+        "house 2's capacity should drop to just the PROC once the SILO changes hands"
+    );
+    assert_eq!(
+        w.houses[2].tiberium, 1000,
+        "carried fix a (capture path): house 2's stored tiberium is clamped to its new, \
+         lower capacity in the same tick the capture happens, not deferred to its next harvest"
+    );
+
+    // No deferred clamp left to trigger: a subsequent zero-income harvest is
+    // a true no-op, exactly like the sell-path pin.
+    let before = w.houses[2].tiberium;
+    w.houses[2].add_harvest(0, cap_after);
+    assert_eq!(
+        w.houses[2].tiberium, before,
+        "no deferred clamp: the capture-path reconcile was already immediate"
+    );
+
+    // The new owner (house 1) needs no reconcile of its own — its capacity
+    // only grew — and gets no stored-tiberium windfall from the capture.
+    assert_eq!(
+        w.houses[1].tiberium, 0,
+        "capturing a SILO does not transfer or credit any of its former owner's stored tiberium"
+    );
+}
+
 // ===========================================================================
 // 4. MEDI heal targeting.
 // ===========================================================================
