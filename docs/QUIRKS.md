@@ -397,3 +397,75 @@ is up, the AI keeps `2 + refineries` combat defences, preferring the strongest
 buildable one (reverse catalog order → tesla/gun before pillbox). Simplified to a
 deterministic priority tier (no new sim-RNG draw), consistent with the rest of
 `next_structure`. AI-vs-AI still reaches decisive outcomes.
+
+---
+
+## Q10 — Support buildings and infantry specialists
+
+**Milestone:** M7.7 Chunk C (P4 support buildings + P5 infantry specialists — the
+final M7.7 chunk).
+
+**DOME — radar gated on a powered dome.** The radar minimap is no longer always
+on: `AppCore::has_radar()` requires the player to own a **live, powered** radar
+dome (DOME) — `RadarClass::Radar_Activate` gated on `IsRadarActive` +
+`House->Power_Fraction()`. A catalog that models no DOME (synthetic test fixtures)
+keeps the radar always-on, so those goldens are unaffected; the real skirmish/econ
+loaders now **start without radar** until a DOME is built and powered (a
+coordinator-authorised skirmish-default change; the `ui_shroud_golden` sweep is
+re-pinned — with the radar gone, sweep frames that differed only by the radar's
+per-position view-box collapse to a single hash, which is itself the proof).
+
+**SILO — storage capacity (two-pool credit model).** Ported `HouseClass`'s split:
+a house has **given credits** (`Credits` — scenario start, sell refunds, captures)
+and **harvested tiberium** (`Tiberium` — capped at `Capacity`, the sum of building
+`Storage=`). Spendable money is `available() = credits + tiberium`
+(`Available_Money`, `house.cpp:2022`); spending draws from tiberium first then
+credits (`Spend_Money`); harvest income books into tiberium, and anything beyond
+capacity is **wasted** (`Harvested`, `house.cpp:1975`). This split is why a house
+may *start* with more money than its storage without the cap eating its harvest.
+PROC contributes `Storage=2000`, each SILO `Storage=1500`. **Backward-compat:** a
+house with no storage-declaring building (`capacity == 0`, every synthetic-catalog
+economy) routes harvest straight to `credits` and keeps `tiberium == 0`, which is
+folded into the hash only when non-zero — so all pre-Chunk-C economy goldens are
+byte-identical; only real-asset economies (PROC storage) change.
+
+**FIX — service depot repair.** On a global repair cadence (`Rule.RepairRate =
+.016` min ≈ 15 ticks), each FIX heals one friendly, damaged **vehicle** parked on
+or adjacent to its footprint by `Rule.URepairStep = 10` HP, charging
+`Rule.URepairPercent = 20%` of the unit's build cost proportional to the HP
+restored (drawn from `available()`). Simplified dock: nearest adjacent damaged
+friendly vehicle, no radio/`MISSION_ENTER` protocol. (FIX is identified by catalog
+name, like DOME/FIX role checks — a table-free single-type test.)
+
+**APWR / ATEK / STEK** are plain structures: APWR is a `Power=200` plant; the tech
+centres are prerequisite gates (ATEK for Allied tech, STEK gates E4). No special
+behaviour beyond power/prereqs.
+
+**Infantry specialists.**
+- **E4 flamethrower** and **DOG**: ordinary roster additions — units with a weapon
+  (E4's `Flamer`/Fire, DOG's `DogJaw`/Organic). DOG's `Organic` warhead only harms
+  unarmored targets (`Verses = 100%,0%,0%,0%,0%`), so it is anti-infantry. **No leap
+  animation** — the `LeapDog` projectile flies straight (QUIRK; cosmetic only).
+- **MEDI medic (heal).** The medic's `Heal` weapon has **negative** `Damage=-50`.
+  The M4 `modify_damage` port kept `combat.cpp:83`'s heal special case (negative
+  damage applied full strength only at point-blank, `distance < 8` leptons, against
+  `Armor=none`), and `explosion_damage` now applies negative results as **healing**
+  (raise health, capped at max; never kills or triggers retaliation). A medic
+  auto-acquires the nearest wounded friendly infantryman in range and fires the
+  heal through the normal combat path. (Heal capability is **derived** from
+  `weapon.damage < 0` — no new flag.)
+- **E6 engineer (capture).** Ported `infantry.cpp:659`: an engineer ordered to
+  attack an enemy building marches to the footprint and, on arrival, **captures** it
+  (ownership + power + build-count flip) when its health ratio is `≤
+  EngineerCaptureLevel = ConditionRed = 1/4` (`rules.cpp:281`), otherwise **damages**
+  it by `EngineerDamage = 1/3` of its max strength (`rules.cpp:280`); the engineer is
+  **consumed** either way (`delete this`, `infantry.cpp:680`). Engineer capability is
+  **derived** as "unarmed non-harvester infantry" — E6 is the only such unit — so no
+  new flag (§3.8). SPY/THF/Tanya stay deferred (QUIRK).
+
+**AI.** The AI's infantry lane now builds **offensive** infantry only (a weapon with
+positive damage) — admitting E4/DOG, excluding the medic/engineer (which need micro
+the skirmish AI lacks) — `house.cpp:6400`. The structure priority gains a **radar
+dome** once the economy is running (`AI_Building`, `house.cpp:5696`). SILO/FIX/tech
+centres are not in the AI's build order (situational; deferred). AI-vs-AI still
+reaches decisive outcomes.

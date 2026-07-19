@@ -582,6 +582,13 @@ const B_TSLA: u32 = 9;
 const B_SBAG: u32 = 10;
 const B_CYCL: u32 = 11;
 const B_BRIK: u32 = 12;
+// M7.7 Chunk C support buildings.
+const B_DOME: u32 = 13;
+const B_SILO: u32 = 14;
+const B_FIX: u32 = 15;
+const B_APWR: u32 = 16;
+const B_ATEK: u32 = 17;
+const B_STEK: u32 = 18;
 /// Fixed unit-proto ids.
 const U_MCV: u32 = 0;
 const U_HARV: u32 = 1;
@@ -599,6 +606,11 @@ const U_V2RL: u32 = 11;
 const U_APC: u32 = 12;
 const U_TRUK: u32 = 13;
 const U_MNLY: u32 = 14;
+// M7.7 Chunk C infantry specialists.
+const U_E4: u32 = 15;
+const U_DOG: u32 = 16;
+const U_MEDI: u32 = 17;
+const U_E6: u32 = 18;
 
 /// Map a prerequisite short-name to its building type id (only the starter set
 /// is modelled; unknown prereqs — e.g. `fix` for the MCV — are dropped, which is
@@ -786,6 +798,13 @@ pub fn build_content(
         ("SBAG", false, false, false, false),
         ("CYCL", false, false, false, false),
         ("BRIK", false, false, false, false),
+        // M7.7 Chunk C support buildings (ids appended).
+        ("DOME", false, false, false, false), // radar dome (gates the minimap)
+        ("SILO", false, false, false, false), // ore silo (Storage=1500)
+        ("FIX", false, false, false, false),  // service depot (repairs units)
+        ("APWR", false, false, false, false), // advanced power plant
+        ("ATEK", false, false, false, false), // allied tech centre (prereq gate)
+        ("STEK", false, false, false, false), // soviet tech centre (prereq gate)
     ];
     // Per-name defense/wall attributes: GUN has a rotating turret; TSLA charges;
     // SBAG/CYCL/BRIK are walls (1×1 buildable segments — QUIRKS Q9).
@@ -842,6 +861,7 @@ pub fn build_content(
             has_turret: defense_attrs(name).0,
             charges: defense_attrs(name).1,
             is_wall: defense_attrs(name).2,
+            storage: stats.storage,
         });
     }
 
@@ -850,7 +870,7 @@ pub fn build_content(
     // rules.ini `Tracked=` (`udata.cpp:1301`): all the new vehicles are `Tracked=yes`
     // (Track) except TRUK (no key → the SPEED_WHEEL default). Ids are *appended* so
     // the existing MCV..E3 ids stay stable (no golden churn from renumbering).
-    let uspecs: [(&str, bool, Option<u32>, bool, u8); 15] = [
+    let uspecs: [(&str, bool, Option<u32>, bool, u8); 19] = [
         ("MCV", false, Some(B_FACT), false, LOCO_TRACK as u8),
         ("HARV", true, None, false, LOCO_TRACK as u8),
         ("1TNK", false, None, false, LOCO_TRACK as u8),
@@ -867,6 +887,11 @@ pub fn build_content(
         ("APC", false, None, false, LOCO_TRACK as u8),  // Armed transport (no passengers — QUIRK)
         ("TRUK", false, None, false, LOCO_WHEEL as u8), // Supply truck (unarmed)
         ("MNLY", false, None, false, LOCO_TRACK as u8), // Minelayer (plain vehicle — QUIRK)
+        // --- M7.7 P5 infantry specialists ---
+        ("E4", false, None, true, LOCO_FOOT as u8), // Flamethrower (Flamer/Fire)
+        ("DOG", false, None, true, LOCO_FOOT as u8), // Attack dog (DogJaw/Organic — no leap anim)
+        ("MEDI", false, None, true, LOCO_FOOT as u8), // Medic (Heal weapon — negative damage)
+        ("E6", false, None, true, LOCO_FOOT as u8), // Engineer (captures enemy buildings)
     ];
     let mut units = Vec::new();
     let mut unit_sprites = Vec::new();
@@ -943,6 +968,13 @@ pub fn build_content(
         BuildItem::Building(B_PROC),
         BuildItem::Building(B_WEAP),
         BuildItem::Building(B_TENT),
+        // Support buildings (M7.7 Chunk C).
+        BuildItem::Building(B_DOME),
+        BuildItem::Building(B_SILO),
+        BuildItem::Building(B_FIX),
+        BuildItem::Building(B_APWR),
+        BuildItem::Building(B_ATEK),
+        BuildItem::Building(B_STEK),
         // Defenses (M7.7 Chunk B) — structures column.
         BuildItem::Building(B_PBOX),
         BuildItem::Building(B_HBOX),
@@ -967,6 +999,11 @@ pub fn build_content(
         BuildItem::Unit(U_E1),
         BuildItem::Unit(U_E2),
         BuildItem::Unit(U_E3),
+        // Infantry specialists (M7.7 Chunk C).
+        BuildItem::Unit(U_E4),
+        BuildItem::Unit(U_DOG),
+        BuildItem::Unit(U_MEDI),
+        BuildItem::Unit(U_E6),
     ];
     Ok(GameContent {
         catalog,

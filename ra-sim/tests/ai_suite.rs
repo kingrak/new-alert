@@ -103,6 +103,7 @@ fn catalog() -> Catalog {
         has_turret: false,
         charges: false,
         is_wall: false,
+        storage: 0,
     };
     let uproto = |name: &str,
                   sprite_id: u32,

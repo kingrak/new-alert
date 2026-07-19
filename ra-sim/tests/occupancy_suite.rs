@@ -486,6 +486,7 @@ fn factory_catalog() -> Catalog {
             has_turret: false,
             charges: false,
             is_wall: false,
+            storage: 0,
         }],
         units: vec![UnitProto {
             is_infantry: false,
@@ -650,6 +651,7 @@ fn refinery_catalog() -> Catalog {
             has_turret: false,
             charges: false,
             is_wall: false,
+            storage: 0,
         }],
         units: vec![],
         econ: EconRules::default(),

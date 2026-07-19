@@ -42,6 +42,8 @@ pub struct BuildingStats {
     /// `Sight=` range in cells — how far the structure reveals the shroud on
     /// placement (M6). Defaults to 4 when absent.
     pub sight: u8,
+    /// Credit storage (`Storage=`) — refineries/silos; 0 otherwise (M7.7 Chunk C).
+    pub storage: i32,
 }
 
 /// The code-defined footprint (width, height) in cells for a building short
@@ -53,6 +55,8 @@ pub fn footprint(name: &str) -> Option<(u8, u8)> {
         "PROC" => (3, 3),          // ore refinery,        BSIZE_33 (bdata.cpp:748)
         "POWR" => (2, 2),          // power plant,         BSIZE_22 (bdata.cpp:983)
         "APWR" => (3, 3),          // advanced power,      BSIZE_33
+        "ATEK" => (2, 3),          // allied tech centre,  BSIZE_23
+        "STEK" => (3, 3),          // soviet tech centre,  BSIZE_33
         "WEAP" => (3, 2),          // war factory,         BSIZE_32 (bdata.cpp:394)
         "FIX" => (3, 2),           // service depot,       BSIZE_32
         "SILO" => (1, 1),          // ore silo,            BSIZE_11
@@ -101,6 +105,7 @@ pub fn building_stats(rules: &Ini, name: &str) -> Option<BuildingStats> {
         .map(parse_prereq)
         .unwrap_or_default();
     let sight = rules.get_int(name, "Sight").unwrap_or(4).clamp(0, 10) as u8;
+    let storage = rules.get_int(name, "Storage").unwrap_or(0) as i32;
 
     Some(BuildingStats {
         foot_w,
@@ -112,6 +117,7 @@ pub fn building_stats(rules: &Ini, name: &str) -> Option<BuildingStats> {
         tech_level,
         prereq,
         sight,
+        storage,
     })
 }
 

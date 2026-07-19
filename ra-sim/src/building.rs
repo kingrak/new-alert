@@ -65,6 +65,8 @@ pub struct Building {
     /// Wall segment (SBAG/CYCL/BRIK) — blocks movement, attackable, not a base
     /// structure (see QUIRKS Q9).
     pub is_wall: bool,
+    /// Credit storage this structure adds to its house's cap (`Storage=`).
+    pub storage: i32,
 }
 
 impl Building {

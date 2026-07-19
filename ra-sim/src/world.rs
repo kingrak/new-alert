@@ -291,14 +291,22 @@ impl World {
     pub fn house_credits(&self, house: u8) -> i32 {
         self.houses
             .get(house as usize)
-            .map(|h| h.credits)
+            .map(|h| h.available())
             .unwrap_or(0)
     }
 
-    /// Set a house's credits (no-op if out of range). For the loader / tests.
+    /// A house's credit-storage capacity (sum of `Storage=` over live buildings).
+    pub fn house_capacity(&self, house: u8) -> i32 {
+        house_storage_capacity(self, house)
+    }
+
+    /// Set a house's spendable money (no-op if out of range). For the loader /
+    /// tests: resets the harvested-tiberium pool and puts the whole amount in the
+    /// given-credits pool, so `house_credits` reads back exactly `credits`.
     pub fn set_house_credits(&mut self, house: u8, credits: i32) {
         if let Some(h) = self.houses.get_mut(house as usize) {
             h.credits = credits;
+            h.tiberium = 0;
         }
     }
 
@@ -435,6 +443,7 @@ impl World {
             charge: 0,
             target: None,
             is_wall: proto.is_wall,
+            storage: proto.storage,
         };
         let handle = self.buildings.insert(building);
         // Stamp occupancy.
@@ -577,8 +586,14 @@ pub fn apply(world: &mut World, tick: u32, commands: &[Command]) {
     // System 3: harvesters (the harvest FSM sets paths and books credits).
     run_harvesters(world);
 
+    // System 3.5: service-depot (FIX) unit repair.
+    run_repair(world);
+
     // System 4: combat (targeting + rotation + firing).
     run_combat(world);
+
+    // System 4.25: engineers march to a targeted enemy building and capture it.
+    run_engineers(world);
 
     // System 4.5: defense-building combat (auto-acquire + turret + fire), after
     // unit combat so RNG (bullet scatter) is drawn in a fixed unit-then-building
@@ -827,11 +842,16 @@ fn apply_command(world: &mut World, cmd: Command) {
             target,
             house,
         } => {
-            // Reject the order up front for unowned/stale/unarmed units, and for
-            // targeting oneself. Otherwise store the TarCom; `run_combat` drives
-            // the approach/aim/fire each tick.
+            // Reject the order up front for unowned/stale units and self-targeting.
+            // Armed units accept any target (`run_combat` drives approach/aim/fire);
+            // an **engineer** (unarmed infantry) accepts a *building* target so it
+            // can march in to capture it (`run_engineers`).
             let ok = match world.units.get(unit) {
-                Some(u) => u.house == house && u.weapon.is_some(),
+                Some(u) => {
+                    u.house == house
+                        && (u.weapon.is_some()
+                            || (is_engineer(u) && matches!(target, Target::Building(_))))
+                }
                 None => false,
             };
             if !ok {
@@ -1145,6 +1165,17 @@ fn remove_building(world: &mut World, handle: Handle) {
 }
 
 /// Whether `house` still owns a live barracks (infantry factory).
+/// A house's total credit-storage capacity: the sum of `Storage=` over its live
+/// buildings (refineries + silos), `HouseClass::Capacity` (`house.cpp:46`).
+pub fn house_storage_capacity(world: &World, house: u8) -> i32 {
+    world
+        .buildings
+        .iter()
+        .filter(|(_, b)| b.house == house && b.is_alive())
+        .map(|(_, b)| b.storage)
+        .sum()
+}
+
 fn house_has_barracks(world: &World, house: u8) -> bool {
     world
         .buildings
@@ -1331,6 +1362,13 @@ fn run_combat(world: &mut World) {
                 u.arm -= 1;
             }
         }
+
+        // Medic (MEDI) auto-acquire: a healer (a weapon whose Damage is negative)
+        // with no live wounded target picks the nearest wounded friendly infantry
+        // in range. It then fires its `Heal` weapon at it through the normal path;
+        // `modify_damage` applies the negative damage as healing at point-blank on
+        // unarmored targets (`combat.cpp:83`).
+        maybe_acquire_heal_target(world, handle);
 
         // Snapshot what we need without holding a borrow across the RNG draw.
         let (primary, secondary, coord, turret, body, has_turret, rot, target) =
@@ -1602,6 +1640,264 @@ fn run_building_combat(world: &mut World) {
     }
 }
 
+/// If `handle` is a **medic** (a unit whose weapon does *negative* damage) and it
+/// has no live wounded target, acquire the nearest wounded friendly infantry
+/// within its heal range as the target (so the normal combat path fires the heal).
+fn maybe_acquire_heal_target(world: &mut World, handle: Handle) {
+    let (house, coord, range) = match world.units.get(handle) {
+        Some(u) => match u.weapon {
+            Some(w) if w.damage < 0 => (u.house, u.coord, w.range),
+            _ => return,
+        },
+        None => return,
+    };
+    // Keep a still-valid wounded-friendly target.
+    let keep = match world.units.get(handle).and_then(|u| u.target) {
+        Some(Target::Unit(t)) => world
+            .units
+            .get(t)
+            .map(|tu| tu.is_alive() && tu.house == house && tu.health < tu.max_health)
+            .unwrap_or(false),
+        _ => false,
+    };
+    if keep {
+        return;
+    }
+    // Nearest wounded friendly infantry in range (excluding the medic itself).
+    let mut best: Option<(i32, Handle)> = None;
+    for (h, u) in world.units.iter() {
+        if h == handle || u.house != house || !u.is_infantry() || !u.is_alive() {
+            continue;
+        }
+        if u.health >= u.max_health {
+            continue;
+        }
+        let d = leptons_distance(coord, u.coord);
+        if d <= range && best.map(|(bd, _)| d < bd).unwrap_or(true) {
+            best = Some((d, h));
+        }
+    }
+    if let Some(u) = world.units.get_mut(handle) {
+        u.target = best.map(|(_, h)| Target::Unit(h));
+    }
+}
+
+/// Whether a unit is an **engineer** (E6): an unarmed, non-harvester infantryman.
+/// Derived rather than flagged — E6 is the only unarmed infantry in the roster,
+/// so "unarmed foot soldier" is a sufficient, table-free capability test (§3.8).
+fn is_engineer(u: &crate::unit::Unit) -> bool {
+    u.is_infantry() && u.weapon.is_none() && !u.is_harvester
+}
+
+/// `Rule.EngineerCaptureLevel = ConditionRed = 1/4` (`rules.cpp:281`): a building
+/// at or below this health fraction is captured; above it, the engineer only
+/// damages it. Expressed as a numerator/denominator to stay integer.
+const ENGINEER_CAPTURE_NUM: i32 = 1;
+const ENGINEER_CAPTURE_DEN: i32 = 4;
+/// `Rule.EngineerDamage = 1/3` (`rules.cpp:280`): fraction of a building's max
+/// strength an engineer removes when it cannot yet capture it.
+const ENGINEER_DAMAGE_NUM: i32 = 1;
+const ENGINEER_DAMAGE_DEN: i32 = 3;
+
+/// System 4.25: **engineers** (E6). An engineer ordered to attack an enemy
+/// building marches to the footprint and, on arrival, either **captures** it
+/// (health ≤ `EngineerCaptureLevel`, ownership flips) or **damages** it by
+/// `EngineerDamage` of its max strength (`InfantryClass::Mission_Capture` /
+/// `infantry.cpp:659`). The engineer is **consumed** on use either way.
+fn run_engineers(world: &mut World) {
+    for handle in world.units.handles() {
+        let (house, coord, target) = match world.units.get(handle) {
+            Some(u) if is_engineer(u) => match u.target {
+                Some(Target::Building(t)) => (u.house, u.coord, t),
+                _ => continue,
+            },
+            _ => continue,
+        };
+        // Target still a live enemy building?
+        let (bcell, bw, bh, bhouse, bhealth, bmax) = match world.buildings.get(target) {
+            Some(b) if b.is_alive() => (
+                b.cell,
+                b.foot_w as i32,
+                b.foot_h as i32,
+                b.house,
+                b.health as i32,
+                b.max_health as i32,
+            ),
+            _ => {
+                if let Some(u) = world.units.get_mut(handle) {
+                    u.target = None;
+                }
+                continue;
+            }
+        };
+        if bhouse == house {
+            // Friendly building — nothing to capture; drop the order.
+            if let Some(u) = world.units.get_mut(handle) {
+                u.target = None;
+            }
+            continue;
+        }
+        // Adjacent to the footprint?
+        let c = coord.cell();
+        let adjacent =
+            c.x >= bcell.x - 1 && c.x <= bcell.x + bw && c.y >= bcell.y - 1 && c.y <= bcell.y + bh;
+        if !adjacent {
+            // March to the nearest passable footprint-adjacent cell.
+            let need_path = world
+                .units
+                .get(handle)
+                .map(|u| u.path.is_empty())
+                .unwrap_or(false);
+            if need_path {
+                if let Some(b) = world.buildings.get(target) {
+                    if let Some(goal) = nearest_adjacent_passable(&world.passable, b, c) {
+                        if let Some(path) = find_path(&world.passable, c, goal, Locomotor::Foot) {
+                            if let Some(u) = world.units.get_mut(handle) {
+                                u.path = path;
+                                u.dest = Some(goal);
+                            }
+                        }
+                    }
+                }
+            }
+            continue;
+        }
+        // Arrived: capture (health at/below the capture level) or damage.
+        let capturable = bhealth * ENGINEER_CAPTURE_DEN <= bmax * ENGINEER_CAPTURE_NUM;
+        if capturable {
+            capture_building(world, target, house);
+        } else {
+            let dmg = (bmax * ENGINEER_DAMAGE_NUM / ENGINEER_DAMAGE_DEN).min(bhealth - 1);
+            if let Some(b) = world.buildings.get_mut(target) {
+                b.health = (b.health as i32 - dmg).max(1) as u16;
+            }
+        }
+        // The engineer is consumed on use (`delete this`, `infantry.cpp:680`).
+        world.units.remove(handle);
+    }
+}
+
+/// Flip a building's ownership to `new_house` (engineer capture): move its power
+/// and owned-building count between houses and re-key its combat target. Power
+/// and the build-count bookkeeping mirror `BuildingClass::Captured`
+/// (`building.cpp:3207`).
+fn capture_building(world: &mut World, building: Handle, new_house: u8) {
+    let (old_house, type_id, power) = match world.buildings.get(building) {
+        Some(b) => (b.house, b.type_id, b.power),
+        None => return,
+    };
+    if old_house == new_house {
+        return;
+    }
+    // Move power + build-count from the old house to the new one.
+    if let Some(oh) = world.houses.get_mut(old_house as usize) {
+        if power >= 0 {
+            oh.power_output -= power;
+        } else {
+            oh.power_drain -= -power;
+        }
+        oh.adjust_building_count(type_id, -1);
+    }
+    if let Some(nh) = world.houses.get_mut(new_house as usize) {
+        if power >= 0 {
+            nh.power_output += power;
+        } else {
+            nh.power_drain += -power;
+        }
+        nh.adjust_building_count(type_id, 1);
+    }
+    if let Some(b) = world.buildings.get_mut(building) {
+        b.house = new_house;
+        b.target = None; // a captured defense re-acquires for its new owner
+    }
+}
+
+/// Ticks between repair steps at a service depot (`Rule.RepairRate = .016` min ≈
+/// 0.96 s ≈ 14 ticks; we use 15 ≈ 1 s). A global cadence (no per-building timer).
+const REPAIR_INTERVAL: u32 = 15;
+/// Hit points restored per repair step for a unit (`Rule.URepairStep = 10`).
+const UREPAIR_STEP: i32 = 10;
+/// Percent of a unit's build cost to fully repair it (`Rule.URepairPercent = 20%`).
+/// Cost is charged per step, proportional to the HP restored.
+const UREPAIR_PERCENT_NUM: i32 = 20;
+
+/// System 3.5: **service depot (FIX)** unit repair. On the global repair cadence,
+/// each FIX heals one friendly, damaged **vehicle** parked on/adjacent to its
+/// footprint by `URepairStep` HP, charging `URepairPercent` of the unit's build
+/// cost proportional to the HP restored (`BuildingClass::Repair`, the
+/// `Rule.URepair*` economy). Simplified dock: no radio/`MISSION_ENTER` protocol —
+/// the nearest adjacent damaged friendly vehicle is repaired.
+fn run_repair(world: &mut World) {
+    if !world.tick_count.is_multiple_of(REPAIR_INTERVAL) {
+        return;
+    }
+    // Which building type id is the service depot (by catalog name).
+    let fix_id = world
+        .catalog
+        .buildings
+        .iter()
+        .position(|p| p.name.eq_ignore_ascii_case("FIX"));
+    let Some(fix_id) = fix_id else {
+        return;
+    };
+    let fix_id = fix_id as u32;
+
+    // Snapshot the depots (handle, house, footprint anchor/size) in slot order.
+    let depots: Vec<(u8, CellCoord, i32, i32)> = world
+        .buildings
+        .iter()
+        .filter(|(_, b)| b.type_id == fix_id && b.is_alive())
+        .map(|(_, b)| (b.house, b.cell, b.foot_w as i32, b.foot_h as i32))
+        .collect();
+
+    for (house, tl, w, h) in depots {
+        // The nearest friendly, damaged, non-infantry unit adjacent to the depot.
+        let mut best: Option<(i32, Handle)> = None;
+        for (uh, u) in world.units.iter() {
+            if u.house != house || u.is_infantry() || u.health >= u.max_health || !u.is_alive() {
+                continue;
+            }
+            let c = u.cell();
+            let adj = c.x >= tl.x - 1 && c.x <= tl.x + w && c.y >= tl.y - 1 && c.y <= tl.y + h;
+            if !adj {
+                continue;
+            }
+            let d = (c.x - tl.x).abs() + (c.y - tl.y).abs();
+            if best.map(|(bd, _)| d < bd).unwrap_or(true) {
+                best = Some((d, uh));
+            }
+        }
+        let Some((_, uh)) = best else {
+            continue;
+        };
+        let (max_health, missing, type_id) = match world.units.get(uh) {
+            Some(u) => (
+                u.max_health as i32,
+                (u.max_health - u.health) as i32,
+                u.type_id,
+            ),
+            None => continue,
+        };
+        let step = UREPAIR_STEP.min(missing);
+        if step <= 0 {
+            continue;
+        }
+        // Cost of one step = URepairPercent * unit_cost * step_hp / max_health.
+        let unit_cost = world.catalog.unit(type_id).map(|p| p.cost).unwrap_or(0);
+        let step_cost = (unit_cost * UREPAIR_PERCENT_NUM * step / 100 / max_health.max(1)).max(0);
+        // Only repair if the house can pay (`CreditReserve` simplified to "has it").
+        if world.house_credits(house) < step_cost {
+            continue;
+        }
+        if let Some(hh) = world.houses.get_mut(house as usize) {
+            hh.deduct(step_cost);
+        }
+        if let Some(u) = world.units.get_mut(uh) {
+            u.health = (u.health + step as u16).min(u.max_health);
+        }
+    }
+}
+
 /// The world position of a defense building's current target (unit centre /
 /// building centre / force-fire cell).
 fn building_target_position(world: &World, target: Target) -> Option<WorldCoord> {
@@ -1829,7 +2125,15 @@ fn explosion_damage(
             continue;
         }
         let dmg = modify_damage(damage, warhead, armor, distance, min_damage, max_damage);
-        if dmg <= 0 {
+        // Healing (negative damage, e.g. the medic's Heal weapon): raise health,
+        // capped at max; never kills, never triggers retaliation.
+        if dmg < 0 {
+            if let Some(u) = world.units.get_mut(h) {
+                u.health = (u.health as i32 - dmg).min(u.max_health as i32) as u16;
+            }
+            continue;
+        }
+        if dmg == 0 {
             continue;
         }
         if let Some(u) = world.units.get_mut(h) {
@@ -2020,7 +2324,7 @@ fn advance_production(world: &mut World, house_idx: usize, kind: ProdKind) {
         return;
     }
     if let Some(h) = world.houses.get_mut(house_idx) {
-        h.credits -= installment;
+        h.deduct(installment);
     }
     p.spent += installment;
     p.progress += 1;
@@ -2424,8 +2728,15 @@ fn process_harvester(world: &mut World, handle: Handle) {
             } else {
                 let econ = world.catalog.econ;
                 let credits = hs.gold as i32 * econ.gold_value + hs.gems as i32 * econ.gem_value;
+                // Storage cap (M7.7 Chunk C): a house can hold at most the sum of
+                // its buildings' `Storage=` (refineries + silos); harvest income
+                // beyond the cap is **wasted** (`HouseClass::Harvested`,
+                // `house.cpp:80`). A house with no storage-declaring building
+                // (`cap == 0`, e.g. synthetic test catalogs) stays uncapped, so
+                // those goldens are byte-identical.
+                let cap = house_storage_capacity(world, house);
                 if let Some(hh) = world.houses.get_mut(house as usize) {
-                    hh.credits += credits;
+                    hh.add_harvest(credits, cap);
                 }
                 hs.cargo = 0;
                 hs.gold = 0;
@@ -2902,6 +3213,124 @@ mod tests {
         }
     }
 
+    /// A MEDI-style heal weapon (negative damage, Organic warhead — only vs
+    /// unarmored). Point-blank on an infantryman it heals; used by the smoke test.
+    fn heal_weapon() -> WeaponProfile {
+        WeaponProfile {
+            damage: -50,
+            rof: 80,
+            range: 468, // 1.83 cells
+            proj_speed: 255,
+            proj_rot: 0,
+            invisible: true,
+            instant: true,
+            warhead: WarheadProfile {
+                spread: 0,
+                verses: pct5([100, 0, 0, 0, 0]),
+            },
+            warhead_ap: false,
+            arcing: false,
+            ballistic_scatter: 256,
+            homing_scatter: 512,
+            min_damage: 1,
+            max_damage: 1000,
+        }
+    }
+
+    /// M7.7 Chunk C smoke: a medic auto-acquires a wounded friendly infantryman
+    /// and heals it (negative damage through `modify_damage`'s point-blank heal).
+    #[test]
+    fn medic_heals_a_wounded_friendly_infantryman() {
+        let mut world = World::new(Passability::all_passable(), 0x1EA1_0001);
+        // A medic and a wounded friendly, both infantry, in the same cell area.
+        let medic = world.spawn_unit(0, 1, CellCoord::new(10, 10), Facing(0), 80, stats());
+        world.set_unit_combat(medic, 0, Some(heal_weapon()), false);
+        if let Some(u) = world.units.get_mut(medic) {
+            u.make_infantry(0);
+        }
+        let patient = world.spawn_unit(0, 1, CellCoord::new(10, 11), Facing(0), 50, stats());
+        world.set_unit_combat(patient, 0, None, false);
+        if let Some(u) = world.units.get_mut(patient) {
+            u.make_infantry(0);
+            u.health = 10; // wounded (max 50)
+        }
+        let hp0 = world.units.get(patient).unwrap().health;
+        for _ in 0..40 {
+            world.tick(&[]);
+        }
+        let hp1 = world.units.get(patient).unwrap().health;
+        assert!(
+            hp1 > hp0,
+            "medic should have healed the wounded friendly ({hp0} -> {hp1})"
+        );
+        assert!(
+            hp1 <= world.units.get(patient).unwrap().max_health,
+            "heal must not exceed max health"
+        );
+    }
+
+    /// M7.7 Chunk C smoke: an engineer ordered onto a nearly-dead enemy building
+    /// captures it (ownership flips) and is consumed.
+    #[test]
+    fn engineer_captures_a_weak_enemy_building_and_is_consumed() {
+        use crate::catalog::{BuildingProto, Catalog, EconRules};
+        let mut world = World::new(Passability::all_passable(), 0xE6E6_0001);
+        let proto = BuildingProto {
+            name: "POWR".into(),
+            foot_w: 2,
+            foot_h: 2,
+            max_health: 400,
+            armor: 1,
+            power: 100,
+            cost: 300,
+            prereq: vec![],
+            is_refinery: false,
+            is_construction_yard: false,
+            is_war_factory: false,
+            is_barracks: false,
+            free_harvester_unit: None,
+            sight: 4,
+            sprite_id: 0,
+            weapon: None,
+            has_turret: false,
+            charges: false,
+            is_wall: false,
+            storage: 0,
+        };
+        world.set_catalog(Catalog {
+            buildings: vec![proto],
+            units: vec![],
+            econ: EconRules::default(),
+        });
+        world.init_houses(3, 0);
+        // Enemy (house 2) building, damaged to below the 1/4 capture level.
+        let bldg = world.spawn_building(0, 2, CellCoord::new(20, 20)).unwrap();
+        world.buildings.get_mut(bldg).unwrap().health = 80; // 20% of 400 (<= 25%)
+                                                            // Engineer (house 1, unarmed infantry) adjacent to the footprint.
+        let eng = world.spawn_unit(0, 1, CellCoord::new(19, 20), Facing(0), 25, stats());
+        world.set_unit_combat(eng, 0, None, false);
+        if let Some(u) = world.units.get_mut(eng) {
+            u.make_infantry(0);
+        }
+        world.tick(&[Command::Attack {
+            unit: eng,
+            target: Target::Building(bldg),
+            house: 1,
+        }]);
+        for _ in 0..20 {
+            world.tick(&[]);
+        }
+        assert_eq!(
+            world.buildings.get(bldg).map(|b| b.house),
+            Some(1),
+            "the building should now belong to house 1 (captured)"
+        );
+        assert!(
+            !world.units.contains(eng),
+            "the engineer should be consumed on capture"
+        );
+    }
+
     /// M7.7 Chunk B smoke: a defense building auto-acquires the nearest enemy
     /// unit in range and damages it through the shared bullet path — no player
     /// order needed (`BuildingClass::Mission_Guard`).
@@ -2929,6 +3358,7 @@ mod tests {
             has_turret: false,
             charges: false,
             is_wall: false,
+            storage: 0,
         };
         world.set_catalog(Catalog {
             buildings: vec![pbox],
@@ -3396,6 +3826,7 @@ mod m5_tests {
             has_turret: false,
             charges: false,
             is_wall: false,
+            storage: 0,
         };
         let uproto =
             |name: &str, harv: bool, deploys: Option<u32>, cost: i32, prereq: Vec<u32>| UnitProto {

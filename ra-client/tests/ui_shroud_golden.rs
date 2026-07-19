@@ -318,15 +318,23 @@ fn real_skirmish_compose_game_map_sweep_with_shroud_no_panic() {
     //
     // **Re-pinned for M7.7 Chunk B** (defenses + walls): the structures column now
     // lists PBOX/HBOX/GUN/FTUR/TSLA + SBAG/CYCL/BRIK, enough to overflow and show
-    // its own scroll arrows. Still sidebar **rendering** only — the sim is
-    // untouched, so map-sweep positions 1 and 3 remain identical to each other.
-    // Coordinator-authorised; re-derived deterministically (read back once).
+    // its own scroll arrows. Still sidebar **rendering** only.
+    //
+    // **Re-pinned for M7.7 Chunk C** (DOME radar gating): the radar minimap is now
+    // gated on owning a **powered radar dome**. `load_skirmish` starts each house
+    // with no DOME, so the radar panel is **absent** — a deliberate skirmish-default
+    // change (coordinator-authorised). The panel's disappearance is itself the
+    // proof: the radar used to draw a per-position camera view-box, so sweep
+    // positions 0/1/3/4 differed only by that box; with the radar gone they now
+    // collapse to a **single** identical hash, and only position 2 (the player
+    // start, with its explored terrain/ore under the shroud) differs. Sim state is
+    // untouched; sidebar + radar are rendering. Re-derived deterministically.
     let golden: [u64; 5] = [
-        0x61c6_cbf1_e320_6666,
-        0xa484_51ec_76af_f50a,
-        0x6d60_2888_29e5_00e2,
-        0xa484_51ec_76af_f50a,
-        0x9f43_5bd3_ed15_8d56,
+        0x9c24_7f01_95a6_b4af,
+        0x9c24_7f01_95a6_b4af,
+        0xf48d_584e_eb7d_0bff,
+        0x9c24_7f01_95a6_b4af,
+        0x9c24_7f01_95a6_b4af,
     ];
     let got: Vec<u64> = frames.iter().map(|p| support::fnv1a(p)).collect();
     assert_eq!(

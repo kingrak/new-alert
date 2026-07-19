@@ -1682,14 +1682,53 @@ impl AppCore {
         2 + (font::GLYPH_H + 2) + font::GLYPH_H + 4
     }
 
-    /// The radar panel rectangle `(x0, y0, size)` in viewport pixels, if enabled.
+    /// The radar panel rectangle `(x0, y0, size)` in viewport pixels, if the
+    /// minimap is currently active (M7.7 Chunk C: gated on owning a **powered
+    /// radar dome**).
     fn radar_rect(&self) -> Option<(i32, i32, i32)> {
-        if !self.radar_enabled {
+        if !self.has_radar() {
             return None;
         }
         let x0 = self.tactical_width() as i32 + 2;
         let y0 = self.sidebar_header_h();
         Some((x0, y0, RADAR_SIZE))
+    }
+
+    /// Whether the radar minimap is active. Requires the sidebar radar to be
+    /// enabled and — when the catalog models a radar dome (DOME) — the player to
+    /// own a **live, powered** one (`RadarClass::Radar_Activate`, gated on
+    /// `IsRadarActive` + `House->Power_Fraction()`). A catalog with no DOME
+    /// concept (synthetic test fixtures) keeps the radar always-on, so those
+    /// goldens are unaffected.
+    pub fn has_radar(&self) -> bool {
+        if !self.radar_enabled {
+            return false;
+        }
+        let Some(house) = self.player_house else {
+            return false;
+        };
+        let dome_id = self
+            .world
+            .catalog
+            .buildings
+            .iter()
+            .position(|p| p.name.eq_ignore_ascii_case("DOME"));
+        match dome_id {
+            None => true, // no radar-dome concept modeled → always on
+            Some(id) => {
+                let owns_live = self
+                    .world
+                    .buildings
+                    .iter()
+                    .any(|(_, b)| b.house == house && b.type_id == id as u32 && b.is_alive());
+                let powered = self
+                    .world
+                    .house(house)
+                    .map(|h| !h.low_power())
+                    .unwrap_or(true);
+                owns_live && powered
+            }
+        }
     }
 
     /// Per-row height — taller when cameo art is drawn.

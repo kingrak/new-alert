@@ -86,8 +86,16 @@ impl Production {
 /// One house's economic state.
 #[derive(Clone, Debug)]
 pub struct House {
-    /// Spendable credits.
+    /// Given credits (scenario start, sell refunds, captures) — the non-harvest
+    /// pool. Kept separate from harvested `tiberium` so a house may *start* with
+    /// more money than its storage capacity without the harvest cap wasting it
+    /// (`HouseClass::Credits`, `house.cpp`). Spendable money is `available()`.
     pub credits: i32,
+    /// Harvested ore in storage, capped at the house's `Capacity` (sum of
+    /// building `Storage=`). Harvest income beyond the cap is wasted
+    /// (`HouseClass::Tiberium` / `Harvested`, `house.cpp:1975`). `0` until the
+    /// house harvests into a storage building (M7.7 Chunk C).
+    pub tiberium: i32,
     /// Sum of positive building `Power=` (output).
     pub power_output: i32,
     /// Sum of `-power` for draining buildings (consumption).
@@ -110,6 +118,7 @@ impl House {
     pub fn new(credits: i32) -> House {
         House {
             credits,
+            tiberium: 0,
             power_output: 0,
             power_drain: 0,
             building_counts: Vec::new(),
@@ -117,6 +126,37 @@ impl House {
             unit_prod: None,
             infantry_prod: None,
             ready_building: None,
+        }
+    }
+
+    /// Total spendable money = given credits + stored harvested tiberium
+    /// (`HouseClass::Available_Money`, `house.cpp:2022`).
+    pub fn available(&self) -> i32 {
+        self.credits + self.tiberium
+    }
+
+    /// Spend `amount`, drawing from stored `tiberium` first, then `credits`
+    /// (`HouseClass::Spend_Money`, `house.cpp`). Amounts beyond `available()`
+    /// simply drive `credits` negative (callers gate on `available()` first).
+    pub fn deduct(&mut self, amount: i32) {
+        if amount <= self.tiberium {
+            self.tiberium -= amount;
+        } else {
+            self.credits -= amount - self.tiberium;
+            self.tiberium = 0;
+        }
+    }
+
+    /// Book harvest `income` into storage, wasting anything beyond `capacity`
+    /// (`HouseClass::Harvested`, `house.cpp:1975`). A house with **no** storage
+    /// capacity (`capacity == 0`, e.g. synthetic test catalogs with no `Storage=`
+    /// building) is left uncapped — the income is added to `credits` directly, so
+    /// those economies (and their goldens) are byte-identical to pre-cap.
+    pub fn add_harvest(&mut self, income: i32, capacity: i32) {
+        if capacity <= 0 {
+            self.credits += income;
+        } else {
+            self.tiberium = (self.tiberium + income).min(capacity);
         }
     }
 
@@ -178,6 +218,15 @@ impl House {
 
     pub(crate) fn hash_into(&self, h: &mut Fnv1a) {
         h.write_i32(self.credits);
+        // Harvested-tiberium storage is folded in ONLY when non-zero — a house
+        // that never harvests into a storage building (every synthetic-catalog
+        // economy: no `Storage=`, so `add_harvest` routes income to `credits`)
+        // keeps `tiberium == 0` and appends no bytes, so those goldens are
+        // byte-identical to the pre-cap hash.
+        if self.tiberium != 0 {
+            h.write_u8(0x71);
+            h.write_i32(self.tiberium);
+        }
         h.write_i32(self.power_output);
         h.write_i32(self.power_drain);
         h.write_u32(self.building_counts.len() as u32);

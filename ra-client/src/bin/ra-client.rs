@@ -75,6 +75,7 @@ fn run(args: &[String]) -> Result<(), BoxErr> {
         "verify-m76" => cmd_verify_m76(args),
         "verify-m77" => cmd_verify_m77(args),
         "verify-m77b" => cmd_verify_m77b(args),
+        "verify-m77c" => cmd_verify_m77c(args),
         "verify-terrain" => cmd_verify_terrain(args),
         _ => {
             eprintln!(
@@ -2117,6 +2118,261 @@ fn cmd_verify_m77b(mut args: Vec<String>) -> Result<(), BoxErr> {
         let first = h1.iter().zip(&h2).position(|(a, b)| a != b).unwrap_or(0);
         Err(format!("determinism FAILED: hash chains diverge at tick {first}").into())
     }
+}
+
+/// M7.7 Chunk C showcase: DOME radar gated on a powered dome, SILO storage cap,
+/// FIX unit repair, engineer capture, and medic healing — with hand-checkable
+/// numbers and a same-script-twice determinism check. Building ids match the
+/// loader: DOME=13, SILO=14, FIX=15. Unit ids: 2TNK=3, E1=5, MEDI=17, E6=18.
+fn cmd_verify_m77c(mut args: Vec<String>) -> Result<(), BoxErr> {
+    use ra_sim::{Command, Target};
+    const V_PROC: u32 = 2; // refinery (building id)
+    const V_DOME: u32 = 13;
+    const V_SILO: u32 = 14;
+    const V_FIX: u32 = 15;
+    const V_2TNK: u32 = 3;
+    const V_E1: u32 = 5;
+    const V_MEDI: u32 = 17;
+    const V_E6: u32 = 18;
+    let out_dir = take_flag(&mut args, "--out-dir").unwrap_or_else(|| ".".to_string());
+    let assets_flag = take_flag(&mut args, "--assets");
+    let scenario = take_flag(&mut args, "--scenario").unwrap_or_else(|| "scg05eb.ini".to_string());
+    let dir = platform::resolve_assets_dir(assets_flag.as_deref())
+        .ok_or("could not find an assets directory (try --assets DIR or RA_ASSETS_DIR)")?;
+    eprintln!("assets: {}  scenario: {scenario}", dir.display());
+
+    let run = |dump: bool| -> Result<(String, Vec<u64>), BoxErr> {
+        let game = assets::load_econ_from_dir(&dir, &scenario, 5000)?;
+        let mut core = game.core;
+        let house = game.controlled;
+        let enemy: u8 = if house == 2 { 3 } else { 2 };
+        let base = game.start_cell;
+        let mut hashes: Vec<u64> = Vec::new();
+        let mut report = String::new();
+
+        // --- Base with power so a DOME can run. ---
+        {
+            let w = core.world_mut();
+            w.spawn_building(V_FACT, house, CellCoord::new(base.x, base.y));
+            w.spawn_building(V_POWR, house, CellCoord::new(base.x + 4, base.y));
+            w.spawn_building(V_POWR, house, CellCoord::new(base.x + 6, base.y));
+        }
+
+        // --- DOME radar gate: no radar until a powered dome exists. ---
+        let radar_before = core.has_radar();
+        let dome =
+            core.world_mut()
+                .spawn_building(V_DOME, house, CellCoord::new(base.x, base.y + 4));
+        core.update(67);
+        let radar_with_dome = core.has_radar();
+        center_camera_on(&mut core, base);
+        if dump {
+            dump_game_png(&mut core, &out_dir, "m77c_radar_on.png")?;
+        }
+        // Force the house into low power (drain exceeds output) so the dome loses
+        // power and the radar switches off.
+        if let Some(h) = core.world_mut().houses.get_mut(house as usize) {
+            h.power_drain = h.power_output + 500;
+        }
+        core.update(67);
+        let radar_no_power = core.has_radar();
+        if dump {
+            dump_game_png(&mut core, &out_dir, "m77c_radar_off.png")?;
+        }
+        report.push_str(&format!(
+            "DOME radar: before={radar_before} withPoweredDome={radar_with_dome} afterPowerLost={radar_no_power} (expect false/true/false)\n"
+        ));
+        let _ = dome;
+
+        // --- SILO storage cap: capacity = sum of Storage; harvest beyond wasted. ---
+        {
+            let w = core.world_mut();
+            w.spawn_building(V_PROC, house, CellCoord::new(base.x, base.y + 8));
+            // refinery Storage=2000
+        }
+        let cap_1 = core.world().house_capacity(house);
+        core.world_mut()
+            .spawn_building(V_SILO, house, CellCoord::new(base.x + 4, base.y + 8));
+        core.world_mut()
+            .spawn_building(V_SILO, house, CellCoord::new(base.x + 6, base.y + 8));
+        let cap_3 = core.world().house_capacity(house);
+        // Book harvest income directly (the capped-storage path, `Harvested`): with
+        // no given credits, the harvested pool fills to capacity and stops — the
+        // excess is wasted. Deliver 6000 into a 5000-capacity base.
+        core.world_mut().set_house_credits(house, 0);
+        let deposit = 3000;
+        if let Some(h) = core.world_mut().houses.get_mut(house as usize) {
+            h.add_harvest(deposit, cap_3);
+        }
+        let after1 = core.world().house_credits(house);
+        if let Some(h) = core.world_mut().houses.get_mut(house as usize) {
+            h.add_harvest(deposit, cap_3);
+        }
+        let after2 = core.world().house_credits(house);
+        let wasted = (2 * deposit - cap_3).max(0);
+        report.push_str(&format!(
+            "SILO cap: capacity(1 refinery)={cap_1} capacity(+2 silos)={cap_3}; harvested \
+             {deposit}+{deposit} -> banked {after1} then capped at {after2} (= {cap_3}), \
+             wasted {wasted}\n"
+        ));
+
+        // --- FIX service depot: a damaged tank on the depot heals, credits drain. ---
+        {
+            let w = core.world_mut();
+            w.spawn_building(V_FIX, house, CellCoord::new(base.x + 10, base.y));
+        }
+        core.world_mut().set_house_credits(house, 5000);
+        let fix_credits_pre = core.world().house_credits(house);
+        // Park the tank in the depot's adjacency ring (just below its footprint).
+        let tank = spawn_combat_unit(
+            &mut core,
+            V_2TNK,
+            house,
+            CellCoord::new(base.x + 10, base.y + 2),
+        );
+        if let Some(u) = core.world_mut().units.get_mut(tank) {
+            u.health = 100; // damaged (max ~400)
+        }
+        let tank_hp_pre = core.world().units.get(tank).map(|u| u.health).unwrap_or(0);
+        for _ in 0..200 {
+            core.update(67);
+            hashes.push(core.sim_hash());
+        }
+        let tank_hp_post = core.world().units.get(tank).map(|u| u.health).unwrap_or(0);
+        let fix_credits_post = core.world().house_credits(house);
+        report.push_str(&format!(
+            "FIX repair: tank HP {tank_hp_pre} -> {tank_hp_post} (rising), credits {fix_credits_pre} -> {fix_credits_post} (draining)\n"
+        ));
+        if dump {
+            center_camera_on(&mut core, CellCoord::new(base.x + 10, base.y + 1));
+            dump_game_png(&mut core, &out_dir, "m77c_fix_repair.png")?;
+        }
+
+        // --- Engineer capture: E6 captures a weak enemy building. ---
+        let ebldg = core
+            .world_mut()
+            .spawn_building(V_POWR, enemy, CellCoord::new(base.x + 3, base.y + 14))
+            .unwrap();
+        if let Some(b) = core.world_mut().buildings.get_mut(ebldg) {
+            b.health = (b.max_health as i32 / 5) as u16; // 20% (<= capture level)
+        }
+        let owner_pre = core.world().buildings.get(ebldg).map(|b| b.house);
+        let eng = spawn_infantry_unit(
+            &mut core,
+            V_E6,
+            house,
+            CellCoord::new(base.x + 3, base.y + 12),
+        );
+        core.inject_command(Command::Attack {
+            unit: eng,
+            target: Target::Building(ebldg),
+            house,
+        });
+        for _ in 0..120 {
+            core.update(67);
+            hashes.push(core.sim_hash());
+            if core.world().buildings.get(ebldg).map(|b| b.house) == Some(house) {
+                break;
+            }
+        }
+        let owner_post = core.world().buildings.get(ebldg).map(|b| b.house);
+        let eng_alive = core.world().units.contains(eng);
+        report.push_str(&format!(
+            "Engineer capture: building owner {owner_pre:?} -> {owner_post:?} (flipped to {house}), engineer consumed={}\n",
+            !eng_alive
+        ));
+        if dump {
+            center_camera_on(&mut core, CellCoord::new(base.x + 3, base.y + 13));
+            dump_game_png(&mut core, &out_dir, "m77c_engineer_capture.png")?;
+        }
+
+        // --- Medic heal: MEDI heals a wounded friendly infantryman. ---
+        let patient = spawn_infantry_unit(
+            &mut core,
+            V_E1,
+            house,
+            CellCoord::new(base.x + 15, base.y + 3),
+        );
+        if let Some(u) = core.world_mut().units.get_mut(patient) {
+            u.health = 10;
+        }
+        let medic = spawn_infantry_unit(
+            &mut core,
+            V_MEDI,
+            house,
+            CellCoord::new(base.x + 15, base.y + 4),
+        );
+        let _ = medic;
+        let patient_hp_pre = core
+            .world()
+            .units
+            .get(patient)
+            .map(|u| u.health)
+            .unwrap_or(0);
+        for _ in 0..120 {
+            core.update(67);
+            hashes.push(core.sim_hash());
+        }
+        let patient_hp_post = core
+            .world()
+            .units
+            .get(patient)
+            .map(|u| u.health)
+            .unwrap_or(0);
+        report.push_str(&format!(
+            "Medic heal: wounded infantry HP {patient_hp_pre} -> {patient_hp_post} (rising)\n"
+        ));
+
+        // --- Hand-checkable stats. ---
+        for (id, name) in [(V_MEDI, "MEDI"), (V_E6, "E6")] {
+            if let Some(p) = core.world().catalog.unit(id) {
+                report.push_str(&format!(
+                    "  {name}: cost={} strength={} weaponDmg={:?}\n",
+                    p.cost,
+                    p.max_health,
+                    p.weapon.map(|w| w.damage)
+                ));
+            }
+        }
+        for (id, name) in [(V_SILO, "SILO"), (V_DOME, "DOME"), (V_FIX, "FIX")] {
+            if let Some(p) = core.world().catalog.building(id) {
+                report.push_str(&format!(
+                    "  {name}: cost={} storage={} power={}\n",
+                    p.cost, p.storage, p.power
+                ));
+            }
+        }
+        Ok((report, hashes))
+    };
+
+    let (report, h1) = run(true)?;
+    let (_r2, h2) = run(false)?;
+    eprintln!("--- M7.7 Chunk C verification ---\n{report}");
+    if h1 == h2 {
+        eprintln!(
+            "DETERMINISM OK: identical {}-tick hash chains across two runs (final {:#018x})",
+            h1.len(),
+            h1.last().copied().unwrap_or(0)
+        );
+        Ok(())
+    } else {
+        let first = h1.iter().zip(&h2).position(|(a, b)| a != b).unwrap_or(0);
+        Err(format!("determinism FAILED: hash chains diverge at tick {first}").into())
+    }
+}
+
+/// Spawn an infantry unit of catalog proto `unit_id` (convert to sub-cell infantry).
+fn spawn_infantry_unit(
+    core: &mut AppCore,
+    unit_id: u32,
+    house: u8,
+    cell: CellCoord,
+) -> ra_sim::Handle {
+    let h = spawn_combat_unit(core, unit_id, house, cell);
+    if let Some(u) = core.world_mut().units.get_mut(h) {
+        u.make_infantry(1);
+    }
+    h
 }
 
 /// Default move stats for a scratch-spawned unit in the M7.7 showcase.

@@ -294,6 +294,7 @@ fn econ_catalog() -> Catalog {
         has_turret: false,
         charges: false,
         is_wall: false,
+        storage: 0,
     };
     let uproto =
         |name: &str, harv: bool, deploys: Option<u32>, cost: i32, prereq: Vec<u32>| UnitProto {

@@ -96,6 +96,7 @@ fn catalog() -> Catalog {
         has_turret: false,
         charges: false,
         is_wall: false,
+        storage: 0,
     };
     let uproto =
         |sprite_id: u32, cost: i32, prereq: Vec<u32>, weapon: Option<WeaponProfile>| UnitProto {

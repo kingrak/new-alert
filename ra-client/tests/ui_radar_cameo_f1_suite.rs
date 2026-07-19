@@ -256,6 +256,7 @@ fn radar_victory_fixture(seed: u32) -> AppCore {
             has_turret: false,
             charges: false,
             is_wall: false,
+            storage: 0,
         }],
         units: vec![],
         econ: EconRules::default(),
@@ -378,6 +379,7 @@ fn cameo_row_core(seed: u32) -> AppCore {
         has_turret: false,
         charges: false,
         is_wall: false,
+        storage: 0,
     };
     let uproto = |name: &str| UnitProto {
         is_infantry: false,
@@ -866,6 +868,7 @@ fn two_strip_core(seed: u32, n_units: usize) -> AppCore {
         has_turret: false,
         charges: false,
         is_wall: false,
+        storage: 0,
     };
     let uproto = |name: String| UnitProto {
         is_infantry: false,

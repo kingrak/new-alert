@@ -277,6 +277,7 @@ fn proto(name: &str, foot_w: u8, foot_h: u8, sight: u8) -> BuildingProto {
         has_turret: false,
         charges: false,
         is_wall: false,
+        storage: 0,
     }
 }
 

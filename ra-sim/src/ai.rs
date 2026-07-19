@@ -251,6 +251,21 @@ impl AiPlayer {
                 }
             }
         }
+        // 3b2) Radar dome (`AI_Building` builds a radar for tech + minimap once the
+        // economy is running, `house.cpp:5696`). One is enough. Matched by catalog
+        // name so it needs no new role enum.
+        if has_factory {
+            if let Some(dome) = cat
+                .buildings
+                .iter()
+                .position(|p| p.name.eq_ignore_ascii_case("DOME"))
+                .map(|i| i as u32)
+            {
+                if !owns(dome) && self.buildable(world, hs, dome) {
+                    return Some(dome);
+                }
+            }
+        }
         // 3c) Base defense (`AI_Building` base-defense urgency, `house.cpp:5696`).
         // Once a war factory is up, keep a handful of combat defenses scaled to the
         // base size. Simplified to a deterministic priority tier — no new sim-RNG
@@ -370,11 +385,20 @@ impl AiPlayer {
             .map(|b| hs.owns_building(b))
             .unwrap_or(false);
         if hs.infantry_prod.is_none() && world.house_credits(self.house) > 0 && has_barracks {
+            // Only **offensive** infantry (a weapon that does positive damage) —
+            // this admits the new combat specialists E4 (flamethrower) and DOG but
+            // excludes the medic (heal weapon, negative damage) and the engineer
+            // (unarmed), which the skirmish AI cannot use without micro. (`AI_Infantry`,
+            // `house.cpp:6400`, builds combat infantry for its attack teams.)
             let eligible: Vec<u32> = cat
                 .units
                 .iter()
                 .enumerate()
-                .filter(|(id, p)| p.is_infantry && self.unit_buildable(world, hs, *id as u32))
+                .filter(|(id, p)| {
+                    p.is_infantry
+                        && p.weapon.map(|w| w.damage > 0).unwrap_or(false)
+                        && self.unit_buildable(world, hs, *id as u32)
+                })
                 .map(|(id, _)| id as u32)
                 .collect();
             // RNG is drawn ONLY when infantry are actually producible, so catalogs

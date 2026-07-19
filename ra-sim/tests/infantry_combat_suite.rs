@@ -812,6 +812,7 @@ fn catalog45() -> Catalog {
                 has_turret: false,
                 charges: false,
                 is_wall: false,
+                storage: 0,
             },
             BuildingProto {
                 is_barracks: true,
@@ -833,6 +834,7 @@ fn catalog45() -> Catalog {
                 has_turret: false,
                 charges: false,
                 is_wall: false,
+                storage: 0,
             },
         ],
         units: vec![
@@ -1080,6 +1082,7 @@ fn ai_catalog() -> Catalog {
         has_turret: false,
         charges: false,
         is_wall: false,
+        storage: 0,
     };
     let uproto = |name: &str,
                   sprite_id: u32,

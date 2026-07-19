@@ -113,6 +113,11 @@ pub struct BuildingProto {
     /// base structure (win/lose, AI base). Modeled as a 1×1 building rather than a
     /// separate overlay layer — see QUIRKS Q9.
     pub is_wall: bool,
+    /// Credit **storage** this structure provides (`Storage=`) — refineries and
+    /// silos. A house's spendable-credit cap is the sum over its live buildings;
+    /// harvest income beyond the cap is wasted (`HouseClass::Harvested`,
+    /// `house.cpp:80`). `0` for non-storage buildings (M7.7 Chunk C).
+    pub storage: i32,
 }
 
 /// A buildable unit type (vehicle) with the runtime stats it spawns with.

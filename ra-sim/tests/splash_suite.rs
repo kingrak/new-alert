@@ -464,6 +464,7 @@ fn splash_building_catalog() -> ra_sim::Catalog {
         has_turret: false,
         charges: false,
         is_wall: false,
+        storage: 0,
     };
     ra_sim::Catalog {
         buildings: vec![proto(3, 3), proto(1, 1)],
