@@ -11,20 +11,31 @@
 //!   so all real base building happens here. We reproduce its effective
 //!   precedence: keep power non-negative → guarantee a refinery+harvester →
 //!   war factory → (defences/tech, which the starter catalog does not model).
-//! - **Attack waves** — `HouseClass::AI` spawns teams on the `AlertTime` timer
-//!   (`house.cpp:1042`) that head for the designated `Enemy` (chosen by the
-//!   distance-dominant scoring at `house.cpp:4941`). We gather this house's idle
-//!   armed units on a timer and send them at the nearest enemy structure.
+//! - **`HouseClass::Expert_AI`** (`house.cpp:4877`, M7.10) — on the ~10 s AITimer:
+//!   pick the designated **enemy** by the weighted score (distance-dominant +
+//!   kills-against-me + relative base size + last-attacker, house.cpp:4941), and
+//!   raise the **rubber-band** unit/building caps to the average enemy's size + 10
+//!   (`Control.MaxUnit/MaxBuilding`, house.cpp:5010).
+//! - **Composed attack teams** (M7.10, standing in for `TeamTypeClass`/`TeamClass`
+//!   mission scripts, teamtype.h) — on the `AlertTime` cadence (house.cpp:1042),
+//!   gather a weighted vehicle+infantry mix that can reach a **staging cell** on
+//!   the base edge toward the enemy, rally there, then attack-move the objective;
+//!   dissolve (survivors retreat) when decimated, with an occasional
+//!   harvester-harassment mission.
+//! - **Economic reflexes** (M7.10) — repair damaged buildings (`Repair_AI`,
+//!   building.cpp:5834, via `Command::Repair`), sell a non-essential building when
+//!   broke (`AI_Raise_Money`, house.cpp:5552), and fire-sale + all-out attack in
+//!   the lost-cause endgame (`Fire_Sale`/`Do_All_To_Hunt`, house.cpp:7622/7651).
 //!
-//! Difficulty scales the attack cadence and wave size (the `easy/normal/hard`
-//! rules.ini handicaps). The full FirePower/Armor/BuildTime stat biases
-//! (`house.cpp:278` `Assign_Handicap`) are a documented simplification — combat
-//! and production run at uniform rates for every house in this milestone.
+//! Difficulty (M7.9 P2a) applies the full FirePower/Armor/ROF/Groundspeed/Cost/
+//! BuildTime stat handicaps (`Assign_Handicap`, house.cpp:278) house-scoped, and
+//! also scales the attack cadence + wave size here.
 //!
 //! **Sync RNG.** Where the original draws `Scen.RandomNumber` we draw the sim
-//! RNG, in a fixed order (`step` is called per AI house in house-index order):
-//! the weighted-random vehicle pick (`house.cpp:6186`) and the attack-cadence
-//! jitter (`house.cpp:1056`).
+//! RNG, in a fixed order (`step` runs per AI house in house-index order): the
+//! weighted vehicle/infantry production picks (`house.cpp:6186`), the attack
+//! jitter (`house.cpp:1056`), and the team composition draws (harass roll, vehicle
+//! count, infantry count). Expert_AI scoring is deterministic (no draw).
 
 use crate::catalog::Catalog;
 use crate::coords::CellCoord;
@@ -65,7 +76,100 @@ impl Difficulty {
             Difficulty::Hard => 2,
         }
     }
+
+    /// Target number of **vehicles** in a composed attack team (M7.10 d).
+    fn team_vehicles(self) -> i32 {
+        match self {
+            Difficulty::Easy => 2,
+            Difficulty::Normal => 3,
+            Difficulty::Hard => 4,
+        }
+    }
 }
+
+/// Expert_AI re-evaluation cadence (`HouseClass::Expert_AI` returns
+/// `TICKS_PER_SECOND * 10`, house.cpp:4877 — "relatively time consuming, call
+/// periodically"). Enemy re-selection and rubber-band caps run on this timer, not
+/// every tick.
+const EXPERT_PERIOD: u32 = 150;
+
+/// A composed attack team (M7.10 d) — a subset of the house's forces gathered
+/// with a target composition, moved to a staging cell near the base edge toward
+/// the enemy, then sent in as an attack-move. Dissolves (survivors retreat) when
+/// decimated. Stands in for the original's `TeamTypeClass`/`TeamClass` mission
+/// scripts (teamtype.h) with a single ad-hoc team.
+#[derive(Clone, Debug)]
+struct Team {
+    /// Live member unit handles.
+    members: Vec<crate::Handle>,
+    /// Where the team is in its lifecycle.
+    phase: TeamPhase,
+    /// What it is going for (an enemy building/base, or an enemy harvester).
+    target: Target,
+    /// The rally cell near the base edge toward the enemy.
+    staging: CellCoord,
+    /// Member count at formation — the denominator for the retreat threshold.
+    initial_size: usize,
+    /// Countdown while `Staging` before we give up waiting and attack anyway.
+    stage_timer: u32,
+    /// A harvester-harassment team (targets an enemy harvester) vs. a base assault.
+    is_harass: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TeamPhase {
+    /// Moving to the staging cell (gathering).
+    Staging,
+    /// Attack-moving the target.
+    Attacking,
+}
+
+impl Team {
+    fn hash_into(&self, h: &mut Fnv1a) {
+        h.write_u32(self.members.len() as u32);
+        for m in &self.members {
+            h.write_u32(m.index);
+            h.write_u32(m.gen);
+        }
+        h.write_u8(self.phase as u8);
+        match self.target {
+            Target::Unit(t) => {
+                h.write_u8(0);
+                h.write_u32(t.index);
+                h.write_u32(t.gen);
+            }
+            Target::Building(t) => {
+                h.write_u8(1);
+                h.write_u32(t.index);
+                h.write_u32(t.gen);
+            }
+            Target::Cell(c) => {
+                h.write_u8(2);
+                h.write_i32(c.x);
+                h.write_i32(c.y);
+            }
+        }
+        h.write_i32(self.staging.x);
+        h.write_i32(self.staging.y);
+        h.write_u32(self.initial_size as u32);
+        h.write_u32(self.stage_timer);
+        h.write_u8(self.is_harass as u8);
+    }
+}
+
+/// How long a team waits at staging before committing to the attack anyway
+/// (~13 s at 15 Hz), so a team never stalls forever if a straggler can't reach
+/// the rally cell.
+const STAGE_TIMEOUT: u32 = 200;
+
+/// Minimum available money before the AI will start a building repair
+/// (`Rule.RepairThreshhold`, rules.cpp:263 = 1000) — it won't repair itself broke.
+const REPAIR_THRESHOLD: i32 = 1000;
+
+/// Money floor below which a moneyless AI sells a non-essential building to raise
+/// cash (`Check_Raise_Money` `< 100`, house.cpp:5288, taken as the emergency
+/// floor for the "can't make money" case).
+const RAISE_MONEY_FLOOR: i32 = 100;
 
 /// One AI-controlled house. Holds only small, hashable decision state; all world
 /// facts are read fresh from [`World`] each tick.
@@ -81,6 +185,21 @@ pub struct AiPlayer {
     attack_timer: u32,
     /// Whether the starting MCV has been deployed into a construction yard.
     deployed: bool,
+    /// Ticks until the next Expert_AI pass (enemy re-pick + rubber-band caps).
+    expert_timer: u32,
+    /// The designated enemy house (`HouseClass::Enemy`, house.cpp:4989), chosen by
+    /// the weighted Expert_AI score. `None` until one is picked.
+    enemy: Option<u8>,
+    /// Rubber-band unit cap (`Control.MaxUnit`, house.cpp:5010): the AI builds
+    /// vehicles up to this, scaled to the average enemy's army size. `0` until the
+    /// first Expert_AI pass sets it.
+    max_units: u32,
+    /// Rubber-band building cap (`Control.MaxBuilding`, house.cpp:5010): caps the
+    /// AI's discretionary base expansion so it doesn't spam power plants and wall
+    /// itself in. `0` until the first Expert_AI pass sets it (= uncapped).
+    max_buildings: u32,
+    /// The one active composed attack team, if any (M7.10 d).
+    team: Option<Team>,
 }
 
 /// Economy/build decisions are re-evaluated on this cadence (~1 s), matching the
@@ -97,6 +216,11 @@ impl AiPlayer {
             decide_timer: 0,
             attack_timer: difficulty.attack_interval(),
             deployed: false,
+            expert_timer: 0,
+            enemy: None,
+            max_units: 0,
+            max_buildings: 0,
+            team: None,
         }
     }
 
@@ -106,6 +230,54 @@ impl AiPlayer {
         h.write_u32(self.decide_timer);
         h.write_u32(self.attack_timer);
         h.write_u8(self.deployed as u8);
+        h.write_u32(self.expert_timer);
+        // Fold new decision state in ONLY when set/present, so any pre-M7.10 AI
+        // golden (which never sets an enemy/cap/team) hashes byte-identically and
+        // the churn is scoped to games that actually exercise the new AI.
+        if let Some(e) = self.enemy {
+            h.write_u8(0xE1);
+            h.write_u8(e);
+        }
+        if self.max_units != 0 {
+            h.write_u8(0xCA);
+            h.write_u32(self.max_units);
+        }
+        if self.max_buildings != 0 {
+            h.write_u8(0xCB);
+            h.write_u32(self.max_buildings);
+        }
+        if let Some(t) = &self.team {
+            h.write_u8(0x7E);
+            t.hash_into(h);
+        }
+    }
+
+    /// The house this AI plays.
+    pub fn house(&self) -> u8 {
+        self.house
+    }
+
+    /// The designated enemy house, if any (Expert_AI `Enemy`).
+    pub fn enemy(&self) -> Option<u8> {
+        self.enemy
+    }
+
+    /// The rubber-band unit / building caps (`Control.MaxUnit`/`MaxBuilding`).
+    pub fn caps(&self) -> (u32, u32) {
+        (self.max_units, self.max_buildings)
+    }
+
+    /// A read-only snapshot of the active composed team, for showcase/inspection:
+    /// `(member_count, initial_size, is_staging, is_harass)`. `None` when no team.
+    pub fn team_summary(&self) -> Option<(usize, usize, bool, bool)> {
+        self.team.as_ref().map(|t| {
+            (
+                t.members.len(),
+                t.initial_size,
+                t.phase == TeamPhase::Staging,
+                t.is_harass,
+            )
+        })
     }
 
     /// One AI tick: read `world`, draw from `rng` where the original draws the
@@ -119,6 +291,15 @@ impl AiPlayer {
 
         self.decide_timer = self.decide_timer.saturating_sub(1);
         self.attack_timer = self.attack_timer.saturating_sub(1);
+        self.expert_timer = self.expert_timer.saturating_sub(1);
+
+        // 0) Expert_AI pass (M7.10 b+c): re-pick the designated enemy by the
+        // weighted score and raise the rubber-band unit cap to match the enemies'
+        // sizes. On the AITimer cadence, not every tick. No commands, no RNG.
+        if self.expert_timer == 0 {
+            self.expert_timer = EXPERT_PERIOD;
+            self.expert_ai(world);
+        }
 
         // 1) Deploy the starting MCV into a construction yard once. Building
         // and unit production genuinely need a live construction yard (their
@@ -159,15 +340,101 @@ impl AiPlayer {
             }
         }
 
-        if self.attack_timer == 0 {
-            // Reset with a jittered interval (house.cpp:1056: AlertTime reset is
-            // `interval * Random_Pick(TICKS_PER_MINUTE/2, TICKS_PER_MINUTE*2)`;
-            // simplified to a ±50% jitter around the base interval).
-            let base = self.difficulty.attack_interval();
-            let jitter = rng.range(-(base as i32) / 2, (base as i32) / 2);
-            self.attack_timer = (base as i32 + jitter).max(1) as u32;
-            self.launch_attack(world, out);
+        // 2) Economic reflexes (M7.10 e): repair damaged buildings, sell when
+        // broke, and fire-sale + all-out attack in the endgame. Runs on the
+        // decide cadence to bound work and command volume.
+        if (self.decide_timer == DECIDE_PERIOD || self.decide_timer == 0)
+            && (self.has_construction_yard(world) || self.has_any_building(world))
+        {
+            self.economic_reflexes(world, out);
         }
+
+        // 3) Composed attack teams (M7.10 d): advance the active team's lifecycle
+        // (stage → attack → dissolve) every tick, and on the attack cadence form a
+        // new one from idle forces.
+        self.manage_team(world, rng, out);
+    }
+
+    // ---- Expert_AI: enemy selection + rubber-band caps (house.cpp:4877) -----
+
+    /// Re-evaluate the designated enemy and the rubber-band unit cap
+    /// (`HouseClass::Expert_AI`, house.cpp:4900-5020). Pure decision update — reads
+    /// `world`, writes only `self.enemy` / `self.max_units`, emits nothing, draws
+    /// no RNG (the scoring is fully deterministic).
+    fn expert_ai(&mut self, world: &World) {
+        // Drop a dead/defeated designated enemy (house.cpp:4888).
+        if let Some(e) = self.enemy {
+            if !world.house_alive(e) {
+                self.enemy = None;
+            }
+        }
+
+        let center = self.base_center(world);
+        // MAP_CELL_W in the original (128). Distance is in cells here.
+        const MAP_W: i32 = 128;
+        let my_units = self.army_size(world, self.house);
+        let my_buildings = self.building_size(world, self.house);
+        let my_infantry = self.infantry_size(world, self.house);
+
+        let mut best: Option<(i32, u8)> = None;
+        let mut enemy_units_sum = 0i32;
+        let mut enemy_buildings_sum = 0i32;
+        let mut enemy_count = 0i32;
+        // Houses in index order (deterministic), skipping ourself + dead houses.
+        for h in 0..world.houses.len() as u8 {
+            if h == self.house || !world.house_alive(h) {
+                continue;
+            }
+            // Only enemy houses that have a base established (a `Center`) count —
+            // the original refuses to pick until every enemy has started
+            // (house.cpp:4922); we relax to "has any building or unit".
+            let ecenter = self.base_center_of(world, h);
+            let eu = self.army_size(world, h);
+            let eb = self.building_size(world, h);
+            let ei = self.infantry_size(world, h);
+            enemy_units_sum += eu;
+            enemy_buildings_sum += eb;
+            enemy_count += 1;
+
+            // house.cpp:4941 weighted score (all terms cited):
+            //   ((MAP_CELL_W*2) - Distance) * 2                  (distance-dominant)
+            //   + BuildingsKilled[me]*5 + UnitsKilled[me]        (kills against me)
+            //   + (enemy.CurUnits - CurUnits)                    (relative base size)
+            //   + (enemy.CurBuildings - CurBuildings)
+            //   + (enemy.CurInfantry - CurInfantry)/4
+            //   + (enemy == LAEnemy ? 100 : 0)                   (last attacker)
+            let dist = cell_distance(center, ecenter);
+            let mut value = ((MAP_W * 2) - dist) * 2;
+            if let Some(eh) = world.house(h) {
+                value += eh.buildings_killed_by(self.house) as i32 * 5;
+                value += eh.units_killed_by(self.house) as i32;
+            }
+            value += eu - my_units;
+            value += eb - my_buildings;
+            value += (ei - my_infantry) / 4;
+            if world.house(self.house).and_then(|h| h.last_attacker) == Some(h) {
+                value += 100;
+            }
+            if best.map(|(bv, _)| value > bv).unwrap_or(true) {
+                best = Some((value, h));
+            }
+        }
+        self.enemy = best.map(|(_, h)| h);
+
+        // Rubber-band caps (house.cpp:5010): raise our unit + building appetite to
+        // the average enemy's size + 10, never shrinking (max with the current
+        // cap), with sane early-game floors so a base with no visible enemies still
+        // builds a starting force and a full base.
+        let (avg_u, avg_b) = if enemy_count > 0 {
+            (
+                enemy_units_sum / enemy_count,
+                enemy_buildings_sum / enemy_count,
+            )
+        } else {
+            (0, 0)
+        };
+        self.max_units = self.max_units.max((avg_u + 10).max(10) as u32);
+        self.max_buildings = self.max_buildings.max((avg_b + 10).max(10) as u32);
     }
 
     // ---- Base building (AI_Building, house.cpp:5696) -----------------------
@@ -292,15 +559,23 @@ impl AiPlayer {
                 }
             }
         }
-        // 4) Keep expanding: a second refinery, then a spare power plant.
-        if let Some(r) = refinery_id {
-            if self.count_owned(world, r) < 2 && self.buildable(world, hs, r) {
-                return Some(r);
+        // 4) Keep expanding: a second refinery, then a spare power plant — but only
+        // up to the rubber-band **building cap** (M7.10 c). Without this the
+        // discretionary spare-power fallback builds forever, spamming plants until
+        // the base walls itself in (units can't path out to attack). `0` cap
+        // (pre-Expert_AI) means uncapped.
+        let under_bcap = self.max_buildings == 0
+            || self.building_size(world, self.house) < self.max_buildings as i32;
+        if under_bcap {
+            if let Some(r) = refinery_id {
+                if self.count_owned(world, r) < 2 && self.buildable(world, hs, r) {
+                    return Some(r);
+                }
             }
-        }
-        if let Some(p) = power_id {
-            if self.buildable(world, hs, p) {
-                return Some(p);
+            if let Some(p) = power_id {
+                if self.buildable(world, hs, p) {
+                    return Some(p);
+                }
             }
         }
         None
@@ -343,7 +618,13 @@ impl AiPlayer {
                     }
                 }
             }
-            if !issued {
+            // Rubber-band cap (M7.10 c): stop building **combat vehicles** once our
+            // army reaches the enemy-scaled cap (`Control.MaxUnit`, house.cpp:5010).
+            // Harvesters (the economy replacement above) are never capped. `0` cap
+            // (before the first Expert_AI pass) means "uncapped".
+            let under_cap =
+                self.max_units == 0 || self.army_size(world, self.house) < self.max_units as i32;
+            if !issued && under_cap {
                 // Weighted-random pick among buildable **vehicles** — the original
                 // `AI_Unit` table (`house.cpp:6172`): each buildable non-harvester
                 // unit weighs **20 if it has a primary weapon, else 1** (so the
@@ -414,49 +695,421 @@ impl AiPlayer {
         }
     }
 
-    // ---- Attack waves (house.cpp:1042 team spawn + Greatest_Threat) ---------
+    // ---- Composed attack teams (M7.10 d) -----------------------------------
 
-    /// Gather this house's idle armed units and send them at the nearest enemy
-    /// structure (its base), once enough force has accumulated.
-    fn launch_attack(&self, world: &World, out: &mut Vec<Command>) {
-        // Idle armed vehicles (not harvesters, not already attacking).
-        let force: Vec<_> = world
-            .units
-            .handles()
-            .into_iter()
-            .filter(|&h| {
-                world
-                    .units
-                    .get(h)
-                    .map(|u| {
-                        u.house == self.house
-                            && u.weapon.is_some()
-                            && !u.is_harvester
-                            && u.target.is_none()
-                    })
-                    .unwrap_or(false)
-            })
-            .collect();
-        if force.len() < self.difficulty.min_force() {
+    /// Advance the active team's lifecycle each tick, and form a new one on the
+    /// attack cadence. Ports the shape of `TeamClass` mission scripts
+    /// (teamtype.h): gather (Staging) → attack-move (Attacking) → dissolve when
+    /// decimated (the fear/retreat threshold), with an occasional
+    /// harvester-harassment team.
+    fn manage_team(&mut self, world: &World, rng: &mut RandomLcg, out: &mut Vec<Command>) {
+        if self.team.is_some() {
+            self.advance_team(world, out);
             return;
         }
+        // No team → form one on the attack cadence.
+        if self.attack_timer == 0 {
+            // Jittered reset (house.cpp:1056: `AlertTime * Random_Pick(...)`;
+            // simplified to a ±50% jitter around the base interval).
+            let base = self.difficulty.attack_interval();
+            let jitter = rng.range(-(base as i32) / 2, (base as i32) / 2);
+            self.attack_timer = (base as i32 + jitter).max(1) as u32;
+            self.form_team(world, rng, out);
+        }
+    }
 
-        // Pick a target: the nearest enemy building to our base centre, else the
-        // nearest enemy unit. Enemy = any live house other than ours (the
-        // original scores by distance-dominant value, house.cpp:4941; nearest is
-        // the dominant term).
-        let base = self.base_center(world);
-        let target = self.nearest_enemy_target(world, base);
+    /// Progress the current team: prune dead members, dissolve+retreat if
+    /// decimated, and drive the Staging → Attacking transition. Issues attack/move
+    /// orders only on transitions, never every tick (so it doesn't spam commands).
+    fn advance_team(&mut self, world: &World, out: &mut Vec<Command>) {
+        let Some(mut team) = self.team.take() else {
+            return;
+        };
+        team.members
+            .retain(|&h| world.units.get(h).map(|u| u.is_alive()).unwrap_or(false));
+        let alive = team.members.len();
+        if alive == 0 {
+            return; // team wiped out; slot cleared (took it out above)
+        }
+
+        // Dissolve + retreat when decimated (below half the starting size, floored
+        // at 2) — our stand-in for the per-unit fear/retreat thresholds
+        // (`FootClass` `IsScaredToDeath`/`Fear`, deferred). Survivors fall back to
+        // the base and the slot frees for a fresh team.
+        let retreat_floor = (team.initial_size / 2).max(2);
+        if alive < retreat_floor {
+            let base = self.base_center(world);
+            for &unit in &team.members {
+                out.push(Command::Move {
+                    unit,
+                    dest: base,
+                    house: self.house,
+                });
+            }
+            return; // team dissolved
+        }
+
+        match team.phase {
+            TeamPhase::Staging => {
+                team.stage_timer = team.stage_timer.saturating_sub(1);
+                // Gathered once most members are within 3 cells of the rally point.
+                let gathered = team
+                    .members
+                    .iter()
+                    .filter(|&&h| {
+                        world
+                            .units
+                            .get(h)
+                            .map(|u| cell_distance(u.cell(), team.staging) <= 3)
+                            .unwrap_or(false)
+                    })
+                    .count()
+                    * 2
+                    >= alive;
+                if gathered || team.stage_timer == 0 {
+                    // Re-validate the target (it may have died while staging).
+                    let target = self
+                        .validate_target(world, team.target)
+                        .or_else(|| self.enemy_target(world));
+                    if let Some(target) = target {
+                        team.target = target;
+                        team.phase = TeamPhase::Attacking;
+                        for &unit in &team.members {
+                            out.push(Command::Attack {
+                                unit,
+                                target,
+                                house: self.house,
+                            });
+                        }
+                    } else {
+                        return; // no enemy left; disband
+                    }
+                }
+            }
+            TeamPhase::Attacking => {
+                // Re-target if the objective died (chase the next-nearest enemy).
+                if self.validate_target(world, team.target).is_none() {
+                    if let Some(target) = self.enemy_target(world) {
+                        team.target = target;
+                        for &unit in &team.members {
+                            out.push(Command::Attack {
+                                unit,
+                                target,
+                                house: self.house,
+                            });
+                        }
+                    } else {
+                        return; // enemy eliminated; disband
+                    }
+                }
+            }
+        }
+        self.team = Some(team);
+    }
+
+    /// Form a composed team from idle forces: a weighted vehicle+infantry mix
+    /// (`team_vehicles` vehicles + 0..2 infantry), a staging cell near the base
+    /// edge toward the enemy, and — occasionally — a harvester-harassment mission
+    /// instead of a base assault. RNG draws (fixed order): harass roll, then the
+    /// vehicle count jitter, then the infantry count.
+    fn form_team(&mut self, world: &World, rng: &mut RandomLcg, out: &mut Vec<Command>) {
+        // Occasional harvester-harassment mission (1 in 4) when an enemy harvester
+        // exists — a small, fast strike at the enemy economy. Draw the roll first
+        // (fixed RNG order) regardless, so the sequence is stable.
+        let harass_roll = rng.range(0, 3);
+        let harvester_target = self.enemy_harvester(world);
+        let is_harass = harass_roll == 0 && harvester_target.is_some();
+
+        // Target: an enemy harvester (harass) or the designated enemy's base.
+        let target = if is_harass {
+            harvester_target
+        } else {
+            self.enemy_target(world)
+        };
         let Some(target) = target else {
             return;
         };
-        for unit in force {
-            out.push(Command::Attack {
+
+        // Staging cell: a rally point on the base edge **toward the enemy**, pushed
+        // far enough out to clear the base's own building ring so the team can
+        // actually egress.
+        let base = self.base_center(world);
+        let tcell = self.target_cell(world, target).unwrap_or(base);
+        let staging = self.staging_cell(world, base, tcell);
+
+        // Idle armed units of ours (not harvesters, no current target) that can
+        // actually **reach the staging cell** — this excludes units boxed inside
+        // the base by our own buildings, so the composed team is one that can
+        // egress (mirrors a `TeamClass` only recruiting members that can reach the
+        // rally waypoint). Reachability is checked with the real pathfinder.
+        let mut vehicles: Vec<crate::Handle> = Vec::new();
+        let mut infantry: Vec<crate::Handle> = Vec::new();
+        for h in world.units.handles() {
+            if let Some(u) = world.units.get(h) {
+                if u.house == self.house
+                    && u.weapon.is_some()
+                    && !u.is_harvester
+                    && u.target.is_none()
+                    && crate::path::find_path(world.passability(), u.cell(), staging, u.locomotor)
+                        .is_some()
+                {
+                    if u.is_infantry() {
+                        infantry.push(h);
+                    } else {
+                        vehicles.push(h);
+                    }
+                }
+            }
+        }
+
+        // Composition: a weighted vehicle+infantry mix. Vehicles: difficulty base
+        // ±1; infantry: 0..2. Clamped to what is actually idle + reachable.
+        let want_i = rng.range(0, 2).clamp(0, infantry.len() as i32) as usize;
+        let mut want_v = (self.difficulty.team_vehicles() + rng.range(-1, 1))
+            .clamp(0, vehicles.len() as i32) as usize;
+        // Top up the vehicle count so the team reaches the difficulty's minimum
+        // force when enough units exist (a pure-vehicle team still qualifies) —
+        // otherwise a cautious composition below `min_force` would never launch.
+        let min_force = self.difficulty.min_force();
+        while want_v + want_i < min_force && want_v < vehicles.len() {
+            want_v += 1;
+        }
+
+        let mut members: Vec<crate::Handle> = Vec::new();
+        members.extend(vehicles.iter().take(want_v).copied());
+        members.extend(infantry.iter().take(want_i).copied());
+
+        // Need at least the difficulty's minimum force to bother.
+        if members.len() < min_force {
+            return;
+        }
+
+        let initial_size = members.len();
+        // Send everyone to the rally point (gather), then attack once staged.
+        for &unit in &members {
+            out.push(Command::Move {
                 unit,
-                target,
+                dest: staging,
                 house: self.house,
             });
         }
+        self.team = Some(Team {
+            members,
+            phase: TeamPhase::Staging,
+            target,
+            staging,
+            initial_size,
+            stage_timer: STAGE_TIMEOUT,
+            is_harass,
+        });
+    }
+
+    /// A rally cell on the base edge toward `dest` — pushed far enough out
+    /// (`STEP` cells) to clear the base's own building ring, so team members can
+    /// egress to it. Returns the farthest passable cell along the line toward the
+    /// enemy (falls back to `base` if none is passable).
+    fn staging_cell(&self, world: &World, base: CellCoord, dest: CellCoord) -> CellCoord {
+        // Far enough to sit outside a rubber-band-capped base's building blob.
+        const STEP: i32 = 12;
+        let dx = (dest.x - base.x).signum();
+        let dy = (dest.y - base.y).signum();
+        let mut best = base;
+        // Prefer the farthest passable cell along the line (walk outward, keep the
+        // last passable one so we clear the base rather than stopping at its edge).
+        for k in 1..=STEP {
+            let c = CellCoord::new(base.x + dx * k, base.y + dy * k);
+            if world.passability().is_passable(c) {
+                best = c;
+            }
+        }
+        best
+    }
+
+    /// Whether a target is still a live objective (used to re-validate a team's
+    /// aim after members/objectives may have died).
+    fn validate_target(&self, world: &World, target: Target) -> Option<Target> {
+        match target {
+            Target::Unit(h) => world
+                .units
+                .get(h)
+                .filter(|u| u.is_alive() && u.house != self.house)
+                .map(|_| target),
+            Target::Building(h) => world
+                .buildings
+                .get(h)
+                .filter(|b| b.is_alive() && b.house != self.house)
+                .map(|_| target),
+            Target::Cell(_) => Some(target),
+        }
+    }
+
+    /// The designated enemy's nearest building to our base, else any nearest
+    /// enemy target — the objective a base-assault team heads for.
+    fn enemy_target(&self, world: &World) -> Option<Target> {
+        let base = self.base_center(world);
+        // Prefer the designated enemy's base (Expert_AI `Enemy`).
+        if let Some(e) = self.enemy {
+            let mut best: Option<(i64, crate::Handle)> = None;
+            for (h, b) in world.buildings.iter() {
+                if b.house == e && b.is_alive() {
+                    let d = sq_dist(b.center_cell(), base);
+                    if best.map(|(bd, _)| d < bd).unwrap_or(true) {
+                        best = Some((d, h));
+                    }
+                }
+            }
+            if let Some((_, h)) = best {
+                return Some(Target::Building(h));
+            }
+        }
+        self.nearest_enemy_target(world, base)
+    }
+
+    /// The nearest enemy harvester to our base (harassment target), if any.
+    fn enemy_harvester(&self, world: &World) -> Option<Target> {
+        let base = self.base_center(world);
+        let mut best: Option<(i64, crate::Handle)> = None;
+        for (h, u) in world.units.iter() {
+            if u.house != self.house && u.is_harvester && u.is_alive() {
+                let d = sq_dist(u.cell(), base);
+                if best.map(|(bd, _)| d < bd).unwrap_or(true) {
+                    best = Some((d, h));
+                }
+            }
+        }
+        best.map(|(_, h)| Target::Unit(h))
+    }
+
+    /// The cell a target currently occupies (for staging direction).
+    fn target_cell(&self, world: &World, target: Target) -> Option<CellCoord> {
+        match target {
+            Target::Unit(h) => world.units.get(h).map(|u| u.cell()),
+            Target::Building(h) => world.buildings.get(h).map(|b| b.center_cell()),
+            Target::Cell(c) => Some(c),
+        }
+    }
+
+    // ---- Economic reflexes (M7.10 e) ---------------------------------------
+
+    /// Repair damaged buildings, sell when broke, and fire-sale + all-out attack
+    /// in the endgame (`HouseClass::Expert_AI` money/state block, house.cpp:5030 +
+    /// `Repair_AI`/`AI_Raise_Money`/`Fire_Sale`/`Do_All_To_Hunt`).
+    fn economic_reflexes(&mut self, world: &World, out: &mut Vec<Command>) {
+        // Fire-sale endgame first: if we can no longer produce anything (no
+        // construction yard, war factory, or barracks) AND no MCV left to redeploy
+        // one, but still hold buildings, the game is effectively lost — sell
+        // everything and throw all forces at the enemy (`Check_Fire_Sale` →
+        // `Fire_Sale` + `Do_All_To_Hunt`, house.cpp:5252/7622/7651). The MCV guard
+        // is essential: at game start (before the starting MCV deploys) a house may
+        // already hold a building yet have no factory — that is a *buildup* state,
+        // not a lost cause, so it must not trigger the fire sale.
+        let can_produce = self.has_construction_yard(world)
+            || self.owns_role(world, Role::WarFactory)
+            || self.owns_role(world, Role::Barracks);
+        let recoverable = self.own_mcv(world).is_some();
+        // `deployed` gates this to a house that once had a construction yard and
+        // has since lost its production — the genuine lost-cause endgame. A house
+        // that never established a base (e.g. a scenario/test house holding a lone
+        // non-factory building) is a *buildup*, not an endgame, and must not
+        // fire-sale itself into elimination.
+        if self.deployed && !can_produce && !recoverable && self.has_any_building(world) {
+            self.fire_sale_and_hunt(world, out);
+            return;
+        }
+
+        let money = world.house_credits(self.house);
+
+        // Building auto-repair (`Repair_AI`, building.cpp:5834): if we can afford it
+        // (`Available_Money >= Rule.RepairThreshhold`), start repairing the
+        // most-damaged own building not already repairing. One per pass
+        // (`House->DidRepair`). Reuses the P1 `Command::Repair` machinery.
+        if money >= REPAIR_THRESHOLD {
+            let mut worst: Option<(i32, crate::Handle)> = None;
+            for (h, b) in world.buildings.iter() {
+                if b.house == self.house && b.is_alive() && !b.is_wall && !b.is_repairing {
+                    let ratio = b.health as i32 * 1000 / b.max_health.max(1) as i32;
+                    if ratio < 1000 && worst.map(|(bw, _)| ratio < bw).unwrap_or(true) {
+                        worst = Some((ratio, h));
+                    }
+                }
+            }
+            if let Some((_, building)) = worst {
+                out.push(Command::Repair {
+                    house: self.house,
+                    building,
+                });
+                return; // one economic action per pass
+            }
+        }
+
+        // Sell-when-broke (`AI_Raise_Money`, house.cpp:5552 / `Check_Raise_Money`,
+        // house.cpp:5283): when money is critically low AND we can't make more,
+        // sell one **non-essential** building (defenses/tech/silos before the core
+        // economy) to raise cash.
+        let can_make_money = self.owns_role(world, Role::Refinery) && self.has_harvester(world);
+        if money < RAISE_MONEY_FLOOR && !can_make_money {
+            if let Some(building) = self.least_essential_sellable(world) {
+                out.push(Command::Sell {
+                    house: self.house,
+                    building,
+                });
+            }
+        }
+    }
+
+    /// Sell every building and send every unit to attack — the lost-cause endgame.
+    fn fire_sale_and_hunt(&self, world: &World, out: &mut Vec<Command>) {
+        for (h, b) in world.buildings.iter() {
+            if b.house == self.house && b.is_alive() {
+                out.push(Command::Sell {
+                    house: self.house,
+                    building: h,
+                });
+            }
+        }
+        if let Some(target) = self.enemy_target(world) {
+            for h in world.units.handles() {
+                if let Some(u) = world.units.get(h) {
+                    if u.house == self.house && u.weapon.is_some() && !u.is_harvester {
+                        out.push(Command::Attack {
+                            unit: h,
+                            target,
+                            house: self.house,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    /// The least-essential sellable building: a non-core structure (not the
+    /// construction yard / refinery / war factory / barracks / power / wall),
+    /// preferring the highest-index (usually a defense/tech add-on) so the core
+    /// economy is kept until last (`AI_Raise_Money` priority order, house.cpp:5560).
+    fn least_essential_sellable(&self, world: &World) -> Option<crate::Handle> {
+        let cat = &world.catalog;
+        let mut pick: Option<(usize, crate::Handle)> = None;
+        for (h, b) in world.buildings.iter() {
+            if b.house != self.house || !b.is_alive() || b.is_wall {
+                continue;
+            }
+            let essential = b.is_construction_yard
+                || b.is_refinery
+                || b.is_war_factory
+                || b.is_barracks
+                || cat
+                    .building(b.type_id)
+                    .map(|p| p.power > 0)
+                    .unwrap_or(false);
+            if essential {
+                continue;
+            }
+            let idx = b.type_id as usize;
+            if pick.map(|(pi, _)| idx > pi).unwrap_or(true) {
+                pick = Some((idx, h));
+            }
+        }
+        pick.map(|(_, h)| h)
     }
 
     fn nearest_enemy_target(&self, world: &World, from: CellCoord) -> Option<Target> {
@@ -491,6 +1144,89 @@ impl AiPlayer {
     }
 
     // ---- Helpers -----------------------------------------------------------
+
+    /// Count of a house's live combat units (`HouseClass::CurUnits`, house.cpp).
+    /// Harvesters are excluded — they are economy, not army (matching the intent
+    /// of the rubber-band/enemy-size comparison, which is about fighting strength).
+    fn army_size(&self, world: &World, house: u8) -> i32 {
+        world
+            .units
+            .iter()
+            .filter(|(_, u)| {
+                u.house == house && u.is_alive() && !u.is_harvester && !u.is_infantry()
+            })
+            .count() as i32
+    }
+
+    /// Count of a house's live infantry (`HouseClass::CurInfantry`).
+    fn infantry_size(&self, world: &World, house: u8) -> i32 {
+        world
+            .units
+            .iter()
+            .filter(|(_, u)| u.house == house && u.is_alive() && u.is_infantry())
+            .count() as i32
+    }
+
+    /// Count of a house's live non-wall buildings (`HouseClass::CurBuildings`).
+    fn building_size(&self, world: &World, house: u8) -> i32 {
+        world
+            .buildings
+            .iter()
+            .filter(|(_, b)| b.house == house && b.is_alive() && !b.is_wall)
+            .count() as i32
+    }
+
+    /// A house's base-centre cell (construction yard, else any building, else its
+    /// first unit, else the map centre) — the `Center` used in enemy scoring.
+    fn base_center_of(&self, world: &World, house: u8) -> CellCoord {
+        if let Some((_, b)) = world
+            .buildings
+            .iter()
+            .find(|(_, b)| b.house == house && b.is_construction_yard && b.is_alive())
+            .or_else(|| {
+                world
+                    .buildings
+                    .iter()
+                    .find(|(_, b)| b.house == house && b.is_alive())
+            })
+        {
+            return b.center_cell();
+        }
+        world
+            .units
+            .iter()
+            .find(|(_, u)| u.house == house && u.is_alive())
+            .map(|(_, u)| u.cell())
+            .unwrap_or(CellCoord::new(64, 64))
+    }
+
+    /// Whether the house owns any live building at all.
+    fn has_any_building(&self, world: &World) -> bool {
+        world
+            .buildings
+            .iter()
+            .any(|(_, b)| b.house == self.house && b.is_alive())
+    }
+
+    /// Whether the house owns a live building of the given role.
+    fn owns_role(&self, world: &World, role: Role) -> bool {
+        self.role_building(&world.catalog, role)
+            .map(|id| {
+                world
+                    .house(self.house)
+                    .map(|h| h.owns_building(id))
+                    .unwrap_or(false)
+            })
+            .unwrap_or(false)
+    }
+
+    /// Whether the house owns a live harvester (part of "can make money").
+    fn has_harvester(&self, world: &World) -> bool {
+        world
+            .units
+            .iter()
+            .any(|(_, u)| u.house == self.house && u.is_harvester && u.is_alive())
+    }
 
     fn has_construction_yard(&self, world: &World) -> bool {
         world
@@ -594,4 +1330,19 @@ enum Role {
     Refinery,
     WarFactory,
     Barracks,
+}
+
+/// Cell distance between two cells (Chebyshev — the max of the axis deltas),
+/// matching the original's `Distance` used for cell-space base scoring
+/// (`house.cpp:4941`, where `Distance` collapses to the dominant axis).
+fn cell_distance(a: CellCoord, b: CellCoord) -> i32 {
+    (a.x - b.x).abs().max((a.y - b.y).abs())
+}
+
+/// Squared Euclidean cell distance — cheap nearest-target comparisons (no sqrt,
+/// order-preserving).
+fn sq_dist(a: CellCoord, b: CellCoord) -> i64 {
+    let dx = (a.x - b.x) as i64;
+    let dy = (a.y - b.y) as i64;
+    dx * dx + dy * dy
 }

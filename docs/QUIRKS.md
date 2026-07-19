@@ -676,3 +676,73 @@ reflexes (AI repair/sell/fire-sale, `AI_Raise_Money`/`Fire_Sale`) — is **not**
 M7.9; only the difficulty handicaps (a) and the existing wave cadence are wired.
 Those four are each a substantial system and are left for a dedicated AI milestone.
 The repair *machinery* an AI would reuse (Q14) is in place.
+
+---
+
+## Q16 — Expert AI: enemy selection, rubber-banding, composed teams, economic reflexes (M7.10)
+
+**Milestone:** M7.10 (the deferred M7.9 P2 b–e, as a dedicated AI milestone).
+
+Ported the four remaining `HouseClass` AI systems, all deterministic, all through
+the normal `Command` pipeline, all sim-RNG at cited original call sites.
+
+**(b) Expert_AI enemy selection** (`house.cpp:4941`, on the ~10 s `AITimer`
+cadence — `EXPERT_PERIOD = 150`, not every tick). Weighted score per candidate
+enemy: `((MAP_CELL_W*2) − dist)·2` (distance-dominant) `+ BuildingsKilled[me]·5 +
+UnitsKilled[me]` (kills I've scored against them) `+ (theirUnits−myUnits) +
+(theirBuildings−myBuildings) + (theirInfantry−myInfantry)/4` (relative size) `+
+100` if they're my last attacker. The kill tallies and last-attacker live on
+`House` (`units_killed_by`/`buildings_killed_by`/`last_attacker`, attributed in
+`explosion_damage` when a cross-house hit lands/kills) and are **not hashed** —
+deterministic derived state read only by the AI, so every combat golden (no AI)
+stays byte-identical.
+
+**(c) Base-size rubber-banding** (`house.cpp:5010`). Expert_AI also raises
+`max_units`/`max_buildings` to the average enemy's army/base size + 10 (never
+shrinking). `max_units` gates combat-vehicle production (not harvesters);
+`max_buildings` gates the discretionary base-expansion tail of `next_structure`.
+The **building cap is load-bearing**: without it the spare-power-plant fallback
+built forever and walled the base in (units couldn't path out to attack).
+
+**(d) Composed attack teams** (stand-in for `TeamTypeClass`/`TeamClass` scripts,
+teamtype.h). On the `AlertTime` cadence a team forms with a weighted
+vehicle+infantry mix, gathers at a **staging cell** on the base edge toward the
+enemy, then attack-moves the objective; it **dissolves** (survivors retreat to
+base) when decimated below half its starting size. An occasional (1-in-4)
+**harvester-harassment** mission targets an enemy harvester instead. Team RNG
+draws in fixed order: harass roll, vehicle count, infantry count.
+- **Deviation — reachability-filtered recruitment.** Team members are only
+  recruited from idle armed units that can actually `find_path` to the staging
+  cell, so a unit boxed inside our own base ring is never picked (it would just
+  stall the team). The original's `TeamClass` recruits by type/zone, not a
+  reachability probe; ours is the pragmatic equivalent that survives a dense base.
+- **Deviation — team-level retreat, not per-unit fear.** The original's per-unit
+  `Fear`/`IsScaredToDeath` thresholds (`foot.cpp`) are **deferred**; we dissolve
+  the whole team when its survivor count drops below half. Observable outcome
+  (decimated attackers fall back) matches; the granularity differs.
+
+**(e) Economic reflexes.**
+- **Repair** (`Repair_AI`, building.cpp:5834): when `Available_Money ≥
+  Rule.RepairThreshhold (1000)` the AI toggles repair (P1's `Command::Repair`) on
+  its most-damaged building; `run_building_repair` heals it and stops it when full
+  or unaffordable.
+- **Sell-when-broke** (`AI_Raise_Money`, house.cpp:5552): when money `< 100` and
+  the house **can't make money** (no refinery+harvester), it sells its
+  least-essential building (defenses/tech before the core economy) via
+  `Command::Sell`.
+- **Fire-sale + all-out** (`Check_Fire_Sale`/`Fire_Sale`/`Do_All_To_Hunt`,
+  house.cpp:5252/7622/7651): a house that has **deployed** and then lost all
+  production (no yard/factory/barracks) with no MCV to recover sells every
+  building and throws every unit at the enemy. **The `deployed` guard is
+  essential** — without it a not-yet-deployed house (or a scenario/test house
+  holding a lone non-factory building) would fire-sale itself into elimination at
+  game start (surfaced by `building_combat_economy_edges`'s last-building test).
+
+**Determinism / goldens.** New AI decision state (`enemy`, `max_units`,
+`max_buildings`, `team`) is folded into the AI hash **only when set/present**, and
+`AiPlayer` state is hashed only for worlds that have an AI — so no non-AI golden
+(combat/movement/economy/menu) moved. AI-vs-AI resolves decisively on both real
+scenarios at every difficulty, Hard still reliably beats Easy (both sides), and
+same-seed determinism holds (`ai_suite`). Showcase:
+`ai_suite::showcase_composed_team_lifecycle_and_repair` logs a full team lifecycle
+(compose → stage → attack → dissolve) and a repair reflex.

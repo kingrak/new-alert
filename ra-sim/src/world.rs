@@ -276,6 +276,12 @@ impl World {
     /// house.cpp:278): firepower/armor/ROF/groundspeed/cost/build-time biases that
     /// the combat, movement, and production sites then apply house-scoped. Houses
     /// with no AI (the human player) keep the neutral all-`1.0` handicap.
+    /// Read-only view of the installed AI controllers (for tests/showcases to
+    /// inspect AI decision state — designated enemy, rubber-band caps, active team).
+    pub fn ai(&self) -> &[AiPlayer] {
+        &self.ai
+    }
+
     pub fn set_ai(&mut self, ai: Vec<AiPlayer>) {
         for a in &ai {
             let h = self.catalog.difficulty_handicap(a.difficulty);
@@ -2334,6 +2340,7 @@ fn explosion_damage(
     min_damage: i32,
     max_damage: i32,
     source: Handle,
+    attacker_house: u8,
     dead_units: &mut Vec<Handle>,
     dead_buildings: &mut Vec<Handle>,
 ) {
@@ -2382,9 +2389,20 @@ fn explosion_damage(
         if dmg == 0 {
             continue;
         }
+        // Last-attacker + kill attribution (M7.10 Expert_AI scoring): a hit from
+        // a different house marks it as this house's last attacker, and a lethal
+        // one tallies the kill. Only cross-house damage counts (never self/ally
+        // splash). Guarded by `target_house != attacker_house`.
+        if target_house != attacker_house {
+            if let Some(th) = world.houses.get_mut(target_house as usize) {
+                th.last_attacker = Some(attacker_house);
+            }
+        }
+        let mut killed = false;
         if let Some(u) = world.units.get_mut(h) {
             u.health = u.health.saturating_sub(dmg as u16);
             if u.health == 0 {
+                killed = true;
                 if !dead_units.contains(&h) {
                     dead_units.push(h);
                 }
@@ -2393,6 +2411,11 @@ fn explosion_damage(
                 // `FootClass::Take_Damage` assigns the attacker as TarCom when
                 // the unit survives, is allowed to retaliate, and is idle.
                 assign_retaliation(u, source);
+            }
+        }
+        if killed && target_house != attacker_house {
+            if let Some(th) = world.houses.get_mut(target_house as usize) {
+                th.record_unit_killed_by(attacker_house);
             }
         }
     }
@@ -2438,10 +2461,22 @@ fn explosion_damage(
         if dmg <= 0 {
             continue;
         }
+        if target_house != attacker_house {
+            if let Some(th) = world.houses.get_mut(target_house as usize) {
+                th.last_attacker = Some(attacker_house);
+            }
+        }
+        let mut killed = false;
         if let Some(b) = world.buildings.get_mut(h) {
             b.health = b.health.saturating_sub(dmg as u16);
             if b.health == 0 && !dead_buildings.contains(&h) {
+                killed = true;
                 dead_buildings.push(h);
+            }
+        }
+        if killed && target_house != attacker_house {
+            if let Some(th) = world.houses.get_mut(target_house as usize) {
+                th.record_building_killed_by(attacker_house);
             }
         }
     }
@@ -2516,6 +2551,7 @@ fn run_bullets(world: &mut World) {
                 b.min_damage,
                 b.max_damage,
                 b.source_unit,
+                b.source_house,
                 &mut dead_units,
                 &mut dead_buildings,
             );

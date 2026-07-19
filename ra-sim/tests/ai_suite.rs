@@ -1035,3 +1035,120 @@ fn ai_attacks_the_enemy_base_even_when_it_is_never_shroud_revealed() {
         )
     });
 }
+
+// ---------------------------------------------------------------------------
+// M7.10 showcase: log one composed-team lifecycle (composition → staging →
+// attacking → dissolve) and one economic-reflex event (building repair). Runs
+// a real Hard skirmish; the AI drives everything through the normal command
+// pipeline. Run with `--nocapture` to read the narrative log.
+// ---------------------------------------------------------------------------
+#[test]
+fn showcase_composed_team_lifecycle_and_repair() {
+    let mut w = skirmish(0x5C0E_7A10, Difficulty::Hard);
+    let mut logged_form = false;
+    let mut logged_attack = false;
+    let mut logged_dissolve = false;
+    let mut logged_repair = false;
+    let mut prev: Option<(usize, usize, bool, bool)> = None;
+
+    for t in 0..16000u32 {
+        w.tick(&[]);
+
+        // --- Composed-team lifecycle (house 1's AI) ---
+        let (enemy, summary, caps) = {
+            let ai = w.ai().iter().find(|a| a.house() == 1).unwrap();
+            (ai.enemy(), ai.team_summary(), ai.caps())
+        };
+        match (prev, summary) {
+            (None, Some((n, init, staging, harass))) => {
+                eprintln!(
+                    "[t={t}] TEAM FORMED: {n} members (init {init}), phase={}, harass={harass}, \
+                     enemy=house {:?}, caps(units={},bldgs={})",
+                    if staging { "Staging" } else { "Attacking" },
+                    enemy,
+                    caps.0,
+                    caps.1
+                );
+                logged_form = true;
+            }
+            (Some((_, _, true, _)), Some((n, _, false, _))) => {
+                eprintln!("[t={t}] TEAM ATTACKING: {n} members committed to the objective");
+                logged_attack = true;
+            }
+            (Some(_), None) => {
+                eprintln!("[t={t}] TEAM DISSOLVED (wiped out or decimated → survivors retreat)");
+                logged_dissolve = true;
+            }
+            _ => {}
+        }
+        prev = summary;
+
+        // Force a decimation once the team is attacking, to exercise the
+        // dissolve/retreat path (survivors below half the starting size fall back
+        // to base). Remove all-but-one attacking member in one blow.
+        if logged_attack && !logged_dissolve {
+            let attackers: Vec<_> = w
+                .units
+                .iter()
+                .filter(|(_, u)| u.house == 1 && u.target.is_some())
+                .map(|(h, _)| h)
+                .collect();
+            if attackers.len() >= 2 {
+                for &h in attackers.iter().take(attackers.len() - 1) {
+                    w.units.remove(h);
+                }
+                eprintln!(
+                    "[t={t}] (injected) wiped {} of {} attacking members to trigger a retreat",
+                    attackers.len() - 1,
+                    attackers.len()
+                );
+            }
+        }
+
+        // --- Economic reflex: damage a building, watch the AI repair it ---
+        if t == 400 {
+            w.set_house_credits(1, 20000); // ensure it can afford repairs
+            let victim = w
+                .buildings
+                .iter()
+                .find(|(_, b)| b.house == 1 && b.is_alive() && !b.is_wall)
+                .map(|(h, _)| h);
+            if let Some(h) = victim {
+                let mx = w.buildings.get(h).unwrap().max_health;
+                w.buildings.get_mut(h).unwrap().health = mx / 3;
+                eprintln!("[t={t}] (injected) damaged a house-1 building to 1/3 strength");
+            }
+        }
+        if !logged_repair {
+            if let Some((_, b)) = w
+                .buildings
+                .iter()
+                .find(|(_, b)| b.house == 1 && b.is_repairing)
+            {
+                eprintln!(
+                    "[t={t}] ECONOMIC REFLEX: AI toggled repair — building healing ({}/{} hp)",
+                    b.health, b.max_health
+                );
+                logged_repair = true;
+            }
+        }
+
+        if logged_form && logged_attack && logged_dissolve && logged_repair {
+            break;
+        }
+    }
+
+    assert!(logged_form, "the AI should form at least one composed team");
+    assert!(
+        logged_attack,
+        "a formed team should reach the Attacking phase"
+    );
+    assert!(
+        logged_dissolve,
+        "a decimated team should dissolve (survivors retreat)"
+    );
+    assert!(
+        logged_repair,
+        "the AI should repair the damaged building (economic reflex)"
+    );
+}

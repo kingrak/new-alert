@@ -183,6 +183,22 @@ pub struct House {
     /// Normal and every synthetic catalog; set from the catalog's difficulty
     /// table when an AI is assigned to this house (`World::set_ai`).
     pub handicap: Handicap,
+    /// Per-attacker kill tallies (M7.10, Expert_AI enemy scoring). Index =
+    /// attacker house; `units_killed_by[A]` counts **this** house's units that
+    /// house `A` has destroyed (`HouseClass::UnitsKilled`, house.cpp:4951), and
+    /// `buildings_killed_by` the same for structures (`BuildingsKilled`,
+    /// house.cpp:4950). Grown lazily. **Not folded into the sim hash** — it is
+    /// deterministic derived state (driven entirely by the already-hashed combat)
+    /// read only by the AI, so leaving it out keeps every combat golden (which has
+    /// no AI to read it) byte-identical while staying same-seed reproducible.
+    pub units_killed_by: Vec<u32>,
+    /// See [`House::units_killed_by`] — the building counterpart.
+    pub buildings_killed_by: Vec<u32>,
+    /// The house that most recently dealt damage to this one
+    /// (`HouseClass::LAEnemy`, house.cpp:4966 — the "last attacker" bonus in
+    /// enemy scoring). `None` until first attacked. Not hashed (same rationale as
+    /// the kill tallies).
+    pub last_attacker: Option<u8>,
 }
 
 impl House {
@@ -199,7 +215,44 @@ impl House {
             infantry_prod: None,
             ready_building: None,
             handicap: Handicap::default(),
+            units_killed_by: Vec::new(),
+            buildings_killed_by: Vec::new(),
+            last_attacker: None,
         }
+    }
+
+    /// Record that house `attacker` destroyed one of this house's units.
+    pub fn record_unit_killed_by(&mut self, attacker: u8) {
+        let i = attacker as usize;
+        if self.units_killed_by.len() <= i {
+            self.units_killed_by.resize(i + 1, 0);
+        }
+        self.units_killed_by[i] = self.units_killed_by[i].saturating_add(1);
+    }
+
+    /// Record that house `attacker` destroyed one of this house's buildings.
+    pub fn record_building_killed_by(&mut self, attacker: u8) {
+        let i = attacker as usize;
+        if self.buildings_killed_by.len() <= i {
+            self.buildings_killed_by.resize(i + 1, 0);
+        }
+        self.buildings_killed_by[i] = self.buildings_killed_by[i].saturating_add(1);
+    }
+
+    /// Units of this house that house `attacker` has killed (0 if never).
+    pub fn units_killed_by(&self, attacker: u8) -> u32 {
+        self.units_killed_by
+            .get(attacker as usize)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// Buildings of this house that house `attacker` has killed (0 if never).
+    pub fn buildings_killed_by(&self, attacker: u8) -> u32 {
+        self.buildings_killed_by
+            .get(attacker as usize)
+            .copied()
+            .unwrap_or(0)
     }
 
     /// Total spendable money = given credits + stored harvested tiberium

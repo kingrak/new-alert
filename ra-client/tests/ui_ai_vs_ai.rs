@@ -263,8 +263,15 @@ fn drive_to_decisive(mut game: AiVsAiGame, max_ticks: u32) -> Option<(u32, Outco
     None
 }
 
-/// Run one scenario end to end and assert it resolves within `max_ticks`.
+/// Run one scenario end to end at Hard-vs-Hard and assert it resolves.
 fn assert_decisive(scenario: &str, max_ticks: u32) {
+    assert_decisive_at(scenario, max_ticks, Difficulty::Hard);
+}
+
+/// Run one scenario end to end with both AIs at `difficulty` and assert it
+/// reaches a clean decisive outcome within `max_ticks` (M7.10 acceptance:
+/// AI-vs-AI must be decisive at *every* difficulty, not just Hard).
+fn assert_decisive_at(scenario: &str, max_ticks: u32, difficulty: Difficulty) {
     if !support::real_assets_available() {
         eprintln!(
             "SKIP: real assets not found under {} (set RA_ASSETS_DIR or copy \
@@ -281,8 +288,8 @@ fn assert_decisive(scenario: &str, max_ticks: u32) {
         &redalert_bytes,
         scenario,
         CREDITS,
-        Difficulty::Hard,
-        Difficulty::Hard,
+        difficulty,
+        difficulty,
     )
     .unwrap_or_else(|e| panic!("{scenario}: failed to load an AI-vs-AI game: {e}"));
     let house_a = game.house_a;
@@ -328,6 +335,19 @@ fn real_scg05ea_ai_vs_ai_reaches_a_decisive_outcome() {
 #[test]
 fn real_scm01ea_ai_vs_ai_reaches_a_decisive_outcome() {
     assert_decisive("scm01ea.ini", MAX_TICKS);
+}
+
+/// M7.10 acceptance — decisive at **every** difficulty (not just Hard), on
+/// `scg05ea` (the faster-resolving of the two maps). Easy-vs-Easy and
+/// Normal-vs-Normal must both reach a clean win, not stall.
+#[test]
+fn real_scg05ea_ai_vs_ai_decisive_at_easy() {
+    assert_decisive_at("scg05ea.ini", MAX_TICKS, Difficulty::Easy);
+}
+
+#[test]
+fn real_scg05ea_ai_vs_ai_decisive_at_normal() {
+    assert_decisive_at("scg05ea.ini", MAX_TICKS, Difficulty::Normal);
 }
 
 /// **M7.9 P2a showcase — Hard must reliably beat Easy.** With the difficulty
