@@ -617,12 +617,25 @@ A red footprint hover-tint shows what a click would sell.
 `Building::is_repairing` (`BuildingClass::Repair(-1)`, building.cpp:2725); a
 **REPAIR button** + repair mode drive it, with a green hover-tint. A new
 `run_building_repair` system heals on the global repair cadence
-(`REPAIR_INTERVAL = 15` ticks ≈ `Rule.RepairRate`): `+Rule.RepairStep (=5)` HP per
-step, charging `Rule.RepairPercent (=1/4) × (Cost / (MaxStrength / RepairStep))`
+(`REPAIR_INTERVAL = 15` ticks ≈ `Rule.RepairRate`): `+Rule.RepairStep` HP per
+step, charging `Rule.RepairPercent × (Cost / (MaxStrength / RepairStep))`
 credits (`TechnoTypeClass::Repair_Cost`, techno.cpp:6907, floored ≥1). It stops at
 full health or when the house can't pay the step — the original's two exits
 (building.cpp:5860-5878). Walls refuse repair (they're overlays in the original,
 per Q9/Q11c).
+
+> **M7.9.1 audit correction (ra-tester).** The original M7.9 landing pinned
+> `RepairStep = 5` / `RepairPercent = 1/4` from the reference's **compile-time**
+> defaults (`rules.cpp:221-222`). The real `redalert.mix` rules.ini *overrides*
+> both (`[General] RepairStep=7`, `RepairPercent=20%` = `1/5`) — confirmed by
+> extracting the actual asset (`radump extract redalert.mix rules.ini --in
+> local.mix`). This is the same category of bug as the P0 `BuildSpeedBias` miss:
+> a compile-time default used where rules.ini ground truth differs. Fixed in
+> `ra-sim/src/world.rs` (`BREPAIR_STEP`/`BREPAIR_PERCENT_NUM`/`_DEN`); pinned in
+> `ra-sim/tests/repair_suite.rs` (full-cycle cost, insolvency stop/resume,
+> sell-mid-repair, destroyed-mid-repair). The unit
+> (service-depot) repair constants (`UREPAIR_STEP=10`, `UREPAIR_PERCENT=20%`)
+> already matched rules.ini and needed no change.
 
 **Hash / golden discipline.** `is_repairing` is folded into the building hash
 **only while `true`**, so a building never ordered to repair (every pre-M7.9

@@ -19,7 +19,7 @@ use ra_data::house::{house_from_name, HOUSE_COUNT};
 use ra_formats::ini::Ini;
 use ra_formats::mix::MixArchive;
 use ra_sim::coords::{CellCoord, Facing};
-use ra_sim::{AiPlayer, Difficulty, OreField, Passability, World};
+use ra_sim::{AiPlayer, Difficulty, Handicap, OreField, Passability, World};
 
 const CREDITS: i32 = 6000;
 /// Sim tick rate (DESIGN.md): 15 ticks/second.
@@ -402,4 +402,93 @@ fn real_hard_ai_reliably_beats_easy_ai() {
              — difficulty stat handicaps should decide it regardless of start position"
         );
     }
+}
+
+// ===========================================================================
+// Audit addendum (ra-tester, post-M7.9/M7.10): pin the exact difficulty
+// handicap *values* the real `redalert.mix` rules.ini loads into
+// `Catalog::econ.difficulty`, confirming both (a) the numbers match the real
+// `[Easy]`/`[Normal]`/`[Difficult]` sections (extracted from the actual asset
+// — ground truth, not the brief) and (b) the label -> section **inversion**
+// QUIRKS Q15 documents: our `Difficulty::Hard` reads rules.ini's `[Easy]`
+// (buffed) section, `Difficulty::Easy` reads `[Difficult]` (nerfed), and
+// `Difficulty::Normal` is the untouched `[Normal]` (neutral).
+//
+// Real rules.ini values (verified via `radump extract redalert.mix rules.ini
+// --in local.mix`):
+//   [Easy]:      FirePower=1.2 Armor=1.2 ROF=.8  Groundspeed=1.2 Cost=.8  BuildTime=.8
+//   [Normal]:    all 1.0
+//   [Difficult]: FirePower=.8  Armor=.8  ROF=1.2 Groundspeed=.8  Cost=1.0 BuildTime=1.0
+//
+// Parsed as raw 16.16 via `ra_data::combat::parse_fixed_raw` (`.8` -> `52428`,
+// `1.2` -> `78643`, `1.0`/`1` -> `65536`).
+#[test]
+fn real_difficulty_handicap_table_matches_rules_ini_with_the_documented_inversion() {
+    if !support::real_assets_available() {
+        eprintln!("SKIP: real assets not found (difficulty handicap table pin)");
+        return;
+    }
+    const BIAS_08: i32 = 52428;
+    const BIAS_12: i32 = 78643;
+    const NEUTRAL: i32 = 65536;
+
+    let dir = support::assets_dir();
+    let main_bytes = std::fs::read(dir.join("main.mix")).expect("main.mix");
+    let redalert_bytes = std::fs::read(dir.join("redalert.mix")).expect("redalert.mix");
+    let game = load_ai_vs_ai_from_bytes(
+        &main_bytes,
+        &redalert_bytes,
+        "scg05ea.ini",
+        CREDITS,
+        Difficulty::Normal,
+        Difficulty::Normal,
+    )
+    .unwrap_or_else(|e| panic!("failed to load a game to inspect its catalog: {e}"));
+
+    let table = game.world.catalog.econ.difficulty;
+
+    // Difficulty::Easy (index 0) -> rules.ini `[Difficult]` (nerfed FirePower/
+    // Armor/Groundspeed, buffed-vs-original ROF; Cost/BuildTime *unchanged*
+    // from neutral in the real asset — confirmed, not assumed).
+    let easy = table[Difficulty::Easy as usize];
+    let want_easy = Handicap {
+        firepower: BIAS_08,
+        armor: BIAS_08,
+        rof: BIAS_12,
+        groundspeed: BIAS_08,
+        cost: NEUTRAL,
+        build_time: NEUTRAL,
+    };
+    assert_eq!(
+        easy, want_easy,
+        "Difficulty::Easy must load rules.ini's [Difficult] section exactly"
+    );
+
+    // Difficulty::Normal (index 1) -> rules.ini `[Normal]`, all neutral.
+    let normal = table[Difficulty::Normal as usize];
+    assert_eq!(
+        normal,
+        Handicap::default(),
+        "Difficulty::Normal must be the all-1.0 neutral handicap"
+    );
+
+    // Difficulty::Hard (index 2) -> rules.ini `[Easy]` (the inversion: a "Hard"
+    // AI opponent is the *player's* easy-mode buffs, QUIRKS Q15).
+    let hard = table[Difficulty::Hard as usize];
+    let want_hard = Handicap {
+        firepower: BIAS_12,
+        armor: BIAS_12,
+        rof: BIAS_08,
+        groundspeed: BIAS_12,
+        cost: BIAS_08,
+        build_time: BIAS_08,
+    };
+    assert_eq!(
+        hard, want_hard,
+        "Difficulty::Hard must load rules.ini's [Easy] section exactly (the inversion)"
+    );
+
+    // The inversion is total: Hard and Easy must not coincide on any field a
+    // real rules.ini biases (a regression here would silently un-invert it).
+    assert_ne!(hard, easy, "Hard and Easy handicaps must differ");
 }

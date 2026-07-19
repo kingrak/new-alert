@@ -1203,9 +1203,9 @@ fn apply_repair(world: &mut World, house: u8, building: Handle) {
 
 /// System 3.6: **building self-repair** (`BuildingClass::Repair_AI`,
 /// `building.cpp:5860`). On the same global repair cadence as the service depot,
-/// each building whose owner has toggled repair heals `Rule.RepairStep = 5` HP,
-/// charging `RepairPercent (=1/4) × (Cost / (MaxStrength / RepairStep))` credits
-/// per step (`TechnoTypeClass::Repair_Cost`, `techno.cpp:6907`, floored to ≥1). It
+/// each building whose owner has toggled repair heals `Rule.RepairStep` HP,
+/// charging `RepairPercent × (Cost / (MaxStrength / RepairStep))` credits per
+/// step (`TechnoTypeClass::Repair_Cost`, `techno.cpp:6907`, floored to ≥1). It
 /// stops (clears the toggle) at full health or when the house cannot pay the step
 /// — exactly the original's two exit conditions.
 fn run_building_repair(world: &mut World) {
@@ -1230,7 +1230,16 @@ fn run_building_repair(world: &mut World) {
             continue;
         }
         // Repair_Cost = (Cost / (MaxStrength / RepairStep)) * RepairPercent, ≥ 1.
-        // RepairStep = 5 HP, RepairPercent = 1/4 (rules.cpp:221-222).
+        // RepairStep = 7 HP, RepairPercent = 20% (1/5) — the *stock rules.ini*
+        // overrides (`[General] RepairStep=7` / `RepairPercent=20%`), NOT the
+        // reference's compile-time defaults (`rules.cpp:221-222`: RepairStep(5),
+        // RepairPercent(1,4)), which rules.ini overwrites at load
+        // (`rules.cpp:487-488`). Verified against the real `redalert.mix`
+        // rules.ini (M7.9.1 audit fix — the constants below previously used the
+        // compile-time defaults, undercharging/underhealing buildings by the
+        // same category of bug M7.9 P0 fixed for BuildSpeedBias). The unit
+        // (service-depot) repair constants below (`UREPAIR_STEP`/`UREPAIR_PERCENT`)
+        // already matched the rules.ini override and are unchanged.
         let denom = (max_health / BREPAIR_STEP).max(1);
         let step_cost = ((cost / denom) * BREPAIR_PERCENT_NUM / BREPAIR_PERCENT_DEN).max(1);
         if world.house_credits(house) < step_cost {
@@ -2046,13 +2055,17 @@ const UREPAIR_STEP: i32 = 10;
 /// Cost is charged per step, proportional to the HP restored.
 const UREPAIR_PERCENT_NUM: i32 = 20;
 
-/// Hit points a **building** self-repair restores per step (`Rule.RepairStep = 5`,
-/// rules.cpp:221).
-const BREPAIR_STEP: i32 = 5;
-/// Building repair cost fraction (`Rule.RepairPercent = 1/4`, rules.cpp:222) as a
-/// `num/den` ratio.
+/// Hit points a **building** self-repair restores per step (`Rule.RepairStep`).
+/// The reference's compile-time default is `5` (rules.cpp:221), but the real
+/// `redalert.mix` rules.ini overrides `[General] RepairStep=7` — ground truth
+/// (M7.9.1 audit fix; the code previously pinned the stale compile-time `5`).
+const BREPAIR_STEP: i32 = 7;
+/// Building repair cost fraction (`Rule.RepairPercent`) as a `num/den` ratio.
+/// The reference's compile-time default is `1/4` (rules.cpp:222), but the real
+/// rules.ini overrides `[General] RepairPercent=20%` = `1/5` — ground truth
+/// (M7.9.1 audit fix).
 const BREPAIR_PERCENT_NUM: i32 = 1;
-const BREPAIR_PERCENT_DEN: i32 = 4;
+const BREPAIR_PERCENT_DEN: i32 = 5;
 
 /// System 3.5: **service depot (FIX)** unit repair. On the global repair cadence,
 /// each FIX heals one friendly, damaged **vehicle** parked on/adjacent to its

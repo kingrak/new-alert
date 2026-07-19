@@ -13,10 +13,12 @@
 
 mod support;
 
+use proptest::prelude::*;
+
 use ra_client::appcore::AppCore;
 use ra_client::input::{InputEvent, Key, MouseButton};
-use ra_sim::coords::CellCoord;
-use ra_sim::{Command, Handle};
+use ra_sim::coords::{CellCoord, Facing};
+use ra_sim::{Command, Handle, MoveStats};
 
 const CELL_PX: i32 = 24; // ICON_WIDTH — one cell edge in map pixels.
 
@@ -263,4 +265,154 @@ fn sell_script_is_deterministic() {
         run(),
         "same sell script twice => identical hash chain"
     );
+}
+
+// ===========================================================================
+// Audit addendum (ra-tester): armed sell/repair monkey — a proptest-fuzzed
+// sequence that arms sell/repair mode and then clicks broadly across the
+// whole viewport (own building, enemy building, an own **wall**, an own
+// unit, an enemy unit, empty ground, negative/out-of-range coordinates), the
+// two mode buttons, and Esc/right-click cancels, interleaved with virtual-
+// time ticks. Invariant: no panic, and every drained `Command::Sell`/
+// `Command::Repair` addresses a **live, own, non-wall** building — never an
+// enemy building, a unit, or a wall (DESIGN.md §4.8 layer 3).
+// ===========================================================================
+
+/// A `640×400` core with: an own PROC (sellable/repairable), an enemy PROC
+/// (must never be targeted), an own **wall** (a building flagged `is_wall`
+/// after spawn — walls are refused by both sell and repair, QUIRKS Q9/Q11c/
+/// Q14), an own unit, and an enemy unit — everything on-screen so a broad
+/// fuzzed click has real, distinct things to (almost) hit.
+fn core_for_action_mode_monkey() -> AppCore {
+    let (mut world, _mcv) = support::synthetic_world_with_econ(0x5E11_0002, 5000);
+    world
+        .spawn_building(support::ECON_B_PROC, 1, CellCoord::new(2, 2))
+        .expect("own PROC spawns");
+    world
+        .spawn_building(support::ECON_B_PROC, 2, CellCoord::new(10, 2))
+        .expect("enemy PROC spawns");
+    let wall = world
+        .spawn_building(support::ECON_B_PROC, 1, CellCoord::new(6, 6))
+        .expect("own wall-stand-in spawns");
+    world.buildings.get_mut(wall).unwrap().is_wall = true;
+    world.spawn_unit(
+        support::ECON_U_TANK,
+        1,
+        CellCoord::new(2, 10),
+        Facing(0),
+        300,
+        MoveStats {
+            max_speed: 40,
+            rot: 10,
+        },
+    );
+    world.spawn_unit(
+        support::ECON_U_TANK,
+        2,
+        CellCoord::new(10, 10),
+        Facing(0),
+        300,
+        MoveStats {
+            max_speed: 40,
+            rot: 10,
+        },
+    );
+
+    let (raster, palette) = support::synthetic_fixture();
+    let mut core = AppCore::with_sim(raster.clone(), *palette, world, Vec::new(), Vec::new());
+    core.enable_sidebar(1, support::econ_buildables());
+    core.handle(InputEvent::Resize {
+        width: 640,
+        height: 400,
+    });
+    core.set_camera(0.0, 0.0);
+    core
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ActionModeOp {
+    Event(InputEvent),
+    Update(u32),
+    ToggleSell,
+    ToggleRepair,
+}
+
+fn action_mode_op_strategy() -> impl Strategy<Value = ActionModeOp> {
+    prop_oneof![
+        // A broad tactical-area click/move, deliberately covering the whole
+        // 640x400 viewport (and a bit beyond, on both axes) so it lands on
+        // every fixture object (own/enemy building, own wall, own/enemy
+        // unit, empty ground) across a run, plus out-of-bounds coordinates.
+        4 => (prop_oneof![Just(MouseButton::Left), Just(MouseButton::Right)], -50i32..=700, -50i32..=450)
+            .prop_map(|(button, x, y)| ActionModeOp::Event(InputEvent::MouseDown { button, x, y })),
+        2 => (-50i32..=700, -50i32..=450)
+            .prop_map(|(x, y)| ActionModeOp::Event(InputEvent::MouseMoved { x, y })),
+        1 => Just(ActionModeOp::Event(InputEvent::KeyDown(Key::Menu))),
+        1 => Just(ActionModeOp::Event(InputEvent::KeyUp(Key::Menu))),
+        2 => Just(ActionModeOp::ToggleSell),
+        2 => Just(ActionModeOp::ToggleRepair),
+        2 => (0u32..=500).prop_map(ActionModeOp::Update),
+    ]
+}
+
+fn action_mode_ops_strategy(
+    len: std::ops::Range<usize>,
+) -> impl Strategy<Value = Vec<ActionModeOp>> {
+    proptest::collection::vec(action_mode_op_strategy(), len)
+}
+
+/// Apply one op and check the invariant: any drained `Sell`/`Repair` must
+/// address a live, own (house 1), non-wall building. No other command kind
+/// is reachable from sell/repair-mode clicks (a mode-armed left click never
+/// falls through to unit selection/move/attack, and a right-click while
+/// armed only cancels the mode — see `AppCore::handle`), but this checks the
+/// full drain generically in case that invariant ever regresses.
+fn apply_action_mode_op(core: &mut AppCore, op: ActionModeOp) {
+    match op {
+        ActionModeOp::Event(ev) => core.handle(ev),
+        ActionModeOp::Update(dt) => core.update(dt),
+        ActionModeOp::ToggleSell => core.toggle_sell_mode(),
+        ActionModeOp::ToggleRepair => core.toggle_repair_mode(),
+    }
+    for cmd in core.drain_commands() {
+        match cmd {
+            Command::Sell { house, building } | Command::Repair { house, building } => {
+                assert_eq!(
+                    house, 1,
+                    "sell/repair must only ever be issued for house 1: {cmd:?}"
+                );
+                let b = core.world().buildings.get(building).unwrap_or_else(|| {
+                    panic!("{cmd:?} addresses a handle that isn't live in the world")
+                });
+                assert!(b.is_alive(), "{cmd:?} addressed a dead building");
+                assert_eq!(b.house, 1, "{cmd:?} must never target an enemy building");
+                assert!(!b.is_wall, "{cmd:?} must never target a wall");
+            }
+            // Sell/repair-mode clicks cannot produce any other command kind;
+            // if one ever does, that is itself worth knowing about via a
+            // clean panic rather than silently ignoring it.
+            other => {
+                panic!("sell/repair-armed monkey drained an unexpected command kind: {other:?}")
+            }
+        }
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(64))]
+
+    #[test]
+    fn sell_repair_armed_monkey_never_panics_and_never_targets_enemy_unit_or_wall(
+        ops in action_mode_ops_strategy(150..400)
+    ) {
+        let mut core = core_for_action_mode_monkey();
+        // Arm sell mode up front so the very first fuzzed clicks are already
+        // "live" (the strategy also toggles modes mid-sequence, covering
+        // sell<->repair<->neither transitions).
+        core.toggle_sell_mode();
+        core.drain_commands();
+        for &op in &ops {
+            apply_action_mode_op(&mut core, op);
+        }
+    }
 }

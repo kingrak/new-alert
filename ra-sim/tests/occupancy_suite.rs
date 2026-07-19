@@ -474,7 +474,9 @@ fn factory_catalog() -> Catalog {
             max_health: 500,
             armor: 0,
             power: 0,
-            cost: 20, // cheap: time_to_build = 20*900/1000 = 18 ticks
+            cost: 20, // cheap: floors to one STEP_COUNT (54 ticks); the loop
+            // below runs well past that either way, so the exact
+            // figure isn't load-bearing here.
             prereq: vec![],
             is_refinery: false,
             is_construction_yard: false,
