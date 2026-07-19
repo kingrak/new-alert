@@ -1325,7 +1325,14 @@ fn spawn_free_harvester(
 /// what makes a mammoth tank use its 120mm cannon (AP, high vs. heavy) against
 /// tanks and its MammothTusk missiles (HE, high vs. none) against infantry, all
 /// from the `Verses` table with no per-unit special-casing.
-fn select_weapon(
+///
+/// `pub` (not the file-private `fn` this started as) solely so
+/// `ra-sim/tests/weapon_selection_matrix.rs` — an external-crate integration
+/// test — can hand this a hand-derived truth table directly, the way the
+/// task brief asks for. A visibility-only change, no logic touched; flagged
+/// per ra-tester convention as a production-code edit made while writing
+/// tests.
+pub fn select_weapon(
     primary: WeaponProfile,
     secondary: Option<WeaponProfile>,
     armor: u8,

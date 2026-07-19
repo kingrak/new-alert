@@ -421,3 +421,617 @@ fn weighted_random_unit_production_is_seed_deterministic_and_seed_sensitive() {
          proving the pick is live and seed-derived rather than accidentally constant"
     );
 }
+
+// ===========================================================================
+// M7.7 coverage: full ground roster (infantry, defenses, DOME/tech, walls-
+// adjacent buildings) exercising chunk A (vehicle weighting — already covered
+// above via TANK/ARTY), chunk B (defense tier / build-order priority), and
+// chunk C (DOME radar-dome build priority + offensive-infantry filter).
+// `ai.rs`/`house.rs` have zero colocated unit tests, so this is the only
+// coverage for these code paths; see the ra-tester report for what was
+// found while reading the source to derive each expectation below.
+// ===========================================================================
+
+// Building ids in the full-roster fixture (see `full_roster_catalog`).
+const FR_FACT: u32 = 0;
+const FR_POWR: u32 = 1;
+const FR_PROC: u32 = 2;
+const FR_WEAP: u32 = 3;
+const FR_BARR: u32 = 4;
+const FR_DOME: u32 = 5;
+const FR_PBOX: u32 = 6;
+const FR_TSLA: u32 = 7;
+const FR_ATEK: u32 = 8;
+const FR_BUILDING_COUNT: usize = 9;
+
+// Unit-proto ids in the full-roster fixture. Ids 2/3 (TANK/ARTY) are the
+// armed vehicles that give the weighted-random vehicle pick a real choice
+// (chunk A, already covered by `weighted_random_unit_production_is_seed_*`
+// against the smaller fixture above) — referenced only positionally here.
+const FR_U_MCV: u32 = 0;
+const FR_U_HARV: u32 = 1;
+const FR_U_E1: u32 = 4;
+const FR_U_MEDIC: u32 = 5;
+const FR_U_ENGINEER: u32 = 6;
+
+/// The M7.7 ground roster: construction yard / power / refinery / war
+/// factory / barracks / radar dome / two base-defense tiers (a cheap `PBOX`
+/// and a stronger `TSLA` gated behind an `ATEK`-like tech building that the
+/// AI never builds on its own — `next_structure` has no role/name branch for
+/// it, only `DOME` gets that treatment, `ai.rs:254-268`) / vehicles / three
+/// infantry archetypes: an offensive rifleman (`E1`), a medic (heal weapon,
+/// non-positive damage), and an unarmed engineer (`weapon: None`). The last
+/// two exist specifically to exercise the `AI_Infantry`-derived filter added
+/// in M7.7 chunk C (`ai.rs` `produce_units`'s infantry lane, `p.weapon.map(|w|
+/// w.damage > 0)`), which is completely untested prior to this suite.
+fn full_roster_catalog() -> Catalog {
+    let bproto = |name: &str,
+                  w: u8,
+                  h: u8,
+                  power: i32,
+                  cost: i32,
+                  prereq: Vec<u32>,
+                  cy: bool,
+                  refin: bool,
+                  wf: bool,
+                  barracks: bool,
+                  weapon: Option<WeaponProfile>| BuildingProto {
+        is_barracks: barracks,
+        name: name.to_string(),
+        foot_w: w,
+        foot_h: h,
+        max_health: 500,
+        armor: 0,
+        power,
+        cost,
+        prereq,
+        is_refinery: refin,
+        is_construction_yard: cy,
+        is_war_factory: wf,
+        free_harvester_unit: if refin { Some(FR_U_HARV) } else { None },
+        sight: 5,
+        sprite_id: 0,
+        weapon,
+        has_turret: false,
+        charges: false,
+        is_wall: false,
+        storage: 0,
+    };
+    let uproto = |name: &str,
+                  sprite_id: u32,
+                  is_infantry: bool,
+                  harv: bool,
+                  deploys: Option<u32>,
+                  weapon: Option<WeaponProfile>,
+                  cost: i32,
+                  prereq: Vec<u32>| UnitProto {
+        is_infantry,
+        locomotor: if is_infantry { 0 } else { 1 },
+        name: name.to_string(),
+        sprite_id,
+        max_health: 400,
+        stats: stats(),
+        armor: 0,
+        weapon,
+        secondary: None,
+        has_turret: weapon.is_some(),
+        is_harvester: harv,
+        deploys_to: deploys,
+        cost,
+        prereq,
+        sight: 4,
+    };
+    Catalog {
+        buildings: vec![
+            bproto(
+                "FACT",
+                3,
+                3,
+                0,
+                100,
+                vec![],
+                true,
+                false,
+                false,
+                false,
+                None,
+            ),
+            bproto(
+                "POWR",
+                2,
+                2,
+                100,
+                30,
+                vec![FR_FACT],
+                false,
+                false,
+                false,
+                false,
+                None,
+            ),
+            bproto(
+                "PROC",
+                3,
+                3,
+                -30,
+                50,
+                vec![FR_POWR],
+                false,
+                true,
+                false,
+                false,
+                None,
+            ),
+            bproto(
+                "WEAP",
+                3,
+                3,
+                -20,
+                60,
+                vec![FR_POWR],
+                false,
+                false,
+                true,
+                false,
+                None,
+            ),
+            bproto(
+                "BARR",
+                2,
+                2,
+                -10,
+                40,
+                vec![FR_POWR],
+                false,
+                false,
+                false,
+                true,
+                None,
+            ),
+            bproto(
+                "DOME",
+                2,
+                2,
+                -30,
+                50,
+                vec![FR_POWR],
+                false,
+                false,
+                false,
+                false,
+                None,
+            ),
+            // Cheap defense: always buildable once a war factory is up.
+            bproto(
+                "PBOX",
+                1,
+                1,
+                0,
+                25,
+                vec![],
+                false,
+                false,
+                false,
+                false,
+                Some(weapon(10)),
+            ),
+            // Strong defense: gated behind ATEK, which the AI never builds on
+            // its own (no role/name branch picks it) — only reachable in
+            // these tests via a direct `World::spawn_building`.
+            bproto(
+                "TSLA",
+                1,
+                1,
+                -10,
+                150,
+                vec![FR_ATEK],
+                false,
+                false,
+                false,
+                false,
+                Some(weapon(100)),
+            ),
+            bproto(
+                "ATEK",
+                2,
+                2,
+                -10,
+                75,
+                vec![FR_DOME],
+                false,
+                false,
+                false,
+                false,
+                None,
+            ),
+        ],
+        units: vec![
+            uproto("MCV", 0, false, false, Some(FR_FACT), None, 100, vec![]),
+            uproto("HARV", 1, false, true, None, None, 140, vec![]),
+            uproto(
+                "TANK",
+                2,
+                false,
+                false,
+                None,
+                Some(weapon(25)),
+                80,
+                vec![FR_WEAP],
+            ),
+            uproto(
+                "ARTY",
+                3,
+                false,
+                false,
+                None,
+                Some(weapon(40)),
+                90,
+                vec![FR_WEAP],
+            ),
+            // Offensive infantry: positive-damage weapon, admitted by the filter.
+            uproto(
+                "E1",
+                4,
+                true,
+                false,
+                None,
+                Some(weapon(15)),
+                30,
+                vec![FR_BARR],
+            ),
+            // Medic: a "heal" weapon modeled as non-positive damage, excluded by
+            // the filter (`ai.rs`: `w.damage > 0`).
+            uproto(
+                "MEDIC",
+                5,
+                true,
+                false,
+                None,
+                Some(weapon(-10)),
+                40,
+                vec![FR_BARR],
+            ),
+            // Engineer: unarmed, excluded by the filter (`weapon.map(...)`
+            // is `None` -> `unwrap_or(false)`).
+            uproto("ENGINEER", 6, true, false, None, None, 40, vec![FR_BARR]),
+        ],
+        econ: EconRules::default(),
+    }
+}
+
+fn full_roster_skirmish(seed: u32, difficulty: Difficulty) -> World {
+    let mut w = World::new(Passability::all_passable(), seed);
+    w.set_catalog(full_roster_catalog());
+    w.init_houses(3, CREDITS);
+    w.spawn_unit(FR_U_MCV, 1, home1(), Facing(0), 400, stats());
+    w.spawn_unit(FR_U_MCV, 2, home2(), Facing(0), 400, stats());
+    w.set_ai(vec![
+        AiPlayer::new(1, difficulty),
+        AiPlayer::new(2, difficulty),
+    ]);
+    w
+}
+
+#[derive(Default)]
+struct FullRosterOutcome {
+    hashes: Vec<u64>,
+    first_owned: [[Option<u32>; FR_BUILDING_COUNT]; 2],
+}
+
+/// Drive a full-roster two-house AI skirmish for `ticks`, recording the
+/// per-tick hash chain and the first tick each house owned each building
+/// type — mirrors `run`/`run_impl` above but sized for the bigger roster.
+fn run_full_roster(seed: u32, difficulty: Difficulty, ticks: u32) -> FullRosterOutcome {
+    let mut w = full_roster_skirmish(seed, difficulty);
+    let mut outcome = FullRosterOutcome::default();
+    for t in 0..ticks {
+        let hash = w.tick(&[]);
+        outcome.hashes.push(hash);
+        for (idx, house) in [1u8, 2u8].into_iter().enumerate() {
+            if let Some(hs) = w.house(house) {
+                for (b, slot) in outcome.first_owned[idx].iter_mut().enumerate() {
+                    if slot.is_none() && hs.owns_building(b as u32) {
+                        *slot = Some(t);
+                    }
+                }
+            }
+        }
+    }
+    outcome
+}
+
+// ---------------------------------------------------------------------------
+// 6. Full-roster determinism, same seed twice, at every difficulty. Catches
+//    nondeterminism newly introduced anywhere in M7.7 (radar-dome pick,
+//    defense-tier scan, infantry filter, vehicle weighting) that the smaller
+//    pre-M7.7 fixture above cannot reach because it has no barracks/DOME/
+//    defense/infantry buildings at all.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn full_roster_determinism_holds_at_each_difficulty() {
+    // Smaller than the pre-M7.7 fixture's 2000-tick budget: the full roster's
+    // extra combat (base defenses firing, more units alive at once) makes
+    // each tick noticeably more expensive in a debug build. 900 ticks (~1
+    // in-game minute) still covers several `next_structure`/`produce_units`
+    // decision cycles per house (DECIDE_PERIOD = 15 ticks) plus the start of
+    // combat, which is where nondeterminism (HashMap iteration order, etc.)
+    // would most likely show up.
+    const TICKS: u32 = 900;
+    for &d in &[Difficulty::Easy, Difficulty::Normal, Difficulty::Hard] {
+        let a = run_full_roster(0xF0F0_0001, d, TICKS);
+        let b = run_full_roster(0xF0F0_0001, d, TICKS);
+        assert_eq!(
+            a.hashes, b.hashes,
+            "{d:?}: full-roster hash chain diverged between two runs of the identical seed/setup"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 7. Build-order priority over the FULL roster, derived by reading
+//    `next_structure` (`ai.rs:213-307`) rather than assumed from the M7.7-B/C
+//    commit messages:
+//
+//      1) power (`ai.rs:229-233`)
+//      2) refinery, if none owned (`ai.rs:235-239`)
+//      3) war factory (`ai.rs:241-245`)
+//      3b) barracks, once the war factory is up (`ai.rs:247-253`)
+//      3b2) DOME (radar), once the war factory is up — checked AFTER
+//           barracks in source order (`ai.rs:257-268`)
+//      3c) base defense (strongest buildable), also gated on the war
+//          factory, checked AFTER DOME (`ai.rs:276-294`)
+//
+//    So the naive read of the M7.7-B commit message ("AI defense tier")
+//    could suggest defenses come right after the war factory; the actual
+//    code interleaves barracks and the radar dome ahead of any defense
+//    structure. This test pins that observed (not assumed) order. TSLA is
+//    excluded from natural build order here (its ATEK prereq is never
+//    self-built by the AI, see `full_roster_catalog`'s doc comment), so the
+//    only defense either house can complete via ordinary play is PBOX.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn ai_builds_full_roster_in_next_structure_priority_order() {
+    const MAX_TICKS: u32 = 6000;
+    let mut w = full_roster_skirmish(0xB0B0_0002, Difficulty::Normal);
+    let mut outcome = FullRosterOutcome::default();
+    for t in 0..MAX_TICKS {
+        w.tick(&[]);
+        for (idx, house) in [1u8, 2u8].into_iter().enumerate() {
+            if let Some(hs) = w.house(house) {
+                for (b, slot) in outcome.first_owned[idx].iter_mut().enumerate() {
+                    if slot.is_none() && hs.owns_building(b as u32) {
+                        *slot = Some(t);
+                    }
+                }
+            }
+        }
+        if outcome.first_owned[0][FR_PBOX as usize].is_some()
+            && outcome.first_owned[1][FR_PBOX as usize].is_some()
+        {
+            break;
+        }
+    }
+
+    for (house_idx, house_label) in [(0, "house 1"), (1, "house 2")] {
+        let owned = &outcome.first_owned[house_idx];
+        let powr =
+            owned[FR_POWR as usize].unwrap_or_else(|| panic!("{house_label}: POWR never built"));
+        let proc =
+            owned[FR_PROC as usize].unwrap_or_else(|| panic!("{house_label}: PROC never built"));
+        let weap =
+            owned[FR_WEAP as usize].unwrap_or_else(|| panic!("{house_label}: WEAP never built"));
+        let barr =
+            owned[FR_BARR as usize].unwrap_or_else(|| panic!("{house_label}: BARR never built"));
+        let dome =
+            owned[FR_DOME as usize].unwrap_or_else(|| panic!("{house_label}: DOME never built"));
+        let pbox =
+            owned[FR_PBOX as usize].unwrap_or_else(|| panic!("{house_label}: PBOX never built"));
+        // ATEK is never self-built by the AI: no role/name branch selects it
+        // (only "DOME" gets a name match, `ai.rs:257-268`).
+        assert!(
+            owned[FR_ATEK as usize].is_none(),
+            "{house_label}: AI built ATEK, but next_structure has no branch that selects it \
+             (a role/name match must have been added without updating this test's premise)"
+        );
+        assert!(
+            owned[FR_TSLA as usize].is_none(),
+            "{house_label}: AI built TSLA despite its ATEK prereq never being self-built"
+        );
+        assert!(
+            powr < proc,
+            "{house_label}: POWR ({powr}) should precede PROC ({proc})"
+        );
+        assert!(
+            proc < weap,
+            "{house_label}: PROC ({proc}) should precede WEAP ({weap})"
+        );
+        assert!(
+            weap < barr,
+            "{house_label}: WEAP ({weap}) should precede BARR ({barr})"
+        );
+        assert!(
+            barr < dome,
+            "{house_label}: BARR ({barr}) should precede DOME ({dome}) — barracks (3b) is \
+             checked before the radar dome (3b2) in next_structure's source order"
+        );
+        assert!(
+            dome < pbox,
+            "{house_label}: DOME ({dome}) should precede the first base defense ({pbox}) — \
+             the radar dome (3b2) is checked before base defense (3c) in next_structure's \
+             source order"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 8. Defense-tier preference: when a stronger defense (TSLA) is ALREADY
+//    buildable (its tech prereq pre-granted), `next_structure`'s reverse
+//    catalog scan (`ai.rs:280-287`, "we prefer the *strongest* buildable
+//    defense … reverse catalog order") must pick it over the cheap PBOX —
+//    and PBOX should never get built while TSLA remains available, since the
+//    scan always finds TSLA first and stops there.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn ai_prefers_the_strongest_buildable_defense() {
+    const MAX_TICKS: u32 = 6000;
+    let mut w = full_roster_skirmish(0xADEF_0003, Difficulty::Normal);
+    // Pre-grant house 1 an ATEK far off in a corner of the map (off the
+    // natural base-placement spiral) so TSLA is buildable from the start,
+    // without going through production (the AI itself never builds ATEK —
+    // see the roster doc comment).
+    w.spawn_building(FR_ATEK, 1, CellCoord::new(2, 2));
+
+    let mut first_tsla: Option<u32> = None;
+    let mut first_pbox: Option<u32> = None;
+    for t in 0..MAX_TICKS {
+        w.tick(&[]);
+        if first_tsla.is_none() {
+            if let Some(hs) = w.house(1) {
+                if hs.owns_building(FR_TSLA) {
+                    first_tsla = Some(t);
+                }
+                if hs.owns_building(FR_PBOX) {
+                    first_pbox.get_or_insert(t);
+                }
+            }
+        }
+        if first_tsla.is_some() {
+            break;
+        }
+    }
+
+    first_tsla.unwrap_or_else(|| {
+        panic!("house 1 never built TSLA within {MAX_TICKS} ticks despite ATEK being pre-granted")
+    });
+    assert!(
+        first_pbox.is_none(),
+        "house 1 built PBOX (tick {first_pbox:?}) before/instead of the stronger \
+         already-buildable TSLA — the reverse-catalog-order 'prefer strongest' logic in \
+         next_structure (ai.rs:280-287) is not behaving as documented"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 9. Offensive-infantry filter (M7.7 chunk C): the barracks lane must only
+//    ever queue infantry with a positive-damage weapon (E1 here). The medic
+//    (heal weapon, non-positive damage) and the unarmed engineer must never
+//    be self-built by the skirmish AI, across several seeds.
+// ---------------------------------------------------------------------------
+
+/// The sequence of infantry-proto ids house 1's barracks *starts* producing.
+fn infantry_production_sequence(seed: u32, max_ticks: u32, want: usize) -> Vec<u32> {
+    let mut w = full_roster_skirmish(seed, Difficulty::Normal);
+    let mut seq = Vec::new();
+    let mut prev: Option<u32> = None;
+    for _ in 0..max_ticks {
+        w.tick(&[]);
+        let cur = w
+            .house(1)
+            .and_then(|hs| hs.infantry_prod)
+            .and_then(|p| match p.item {
+                BuildItem::Unit(id) => Some(id),
+                BuildItem::Building(_) => None,
+            });
+        if let Some(id) = cur {
+            if cur != prev {
+                seq.push(id);
+                if seq.len() >= want {
+                    break;
+                }
+            }
+        }
+        prev = cur;
+    }
+    seq
+}
+
+#[test]
+fn ai_never_builds_non_offensive_infantry() {
+    const MAX_TICKS: u32 = 6000;
+    const WANT: usize = 6;
+    let mut any_nonempty = false;
+    for seed in [0x1EE1_0001u32, 0x1EE1_0002, 0x1EE1_0003, 0x1EE1_0004] {
+        let seq = infantry_production_sequence(seed, MAX_TICKS, WANT);
+        if !seq.is_empty() {
+            any_nonempty = true;
+        }
+        for id in &seq {
+            assert_eq!(
+                *id, FR_U_E1,
+                "seed {seed:#x}: AI queued infantry id {id} (expected only E1={FR_U_E1}); \
+                 MEDIC={FR_U_MEDIC} and ENGINEER={FR_U_ENGINEER} must be filtered out by the \
+                 offensive-infantry filter (ai.rs produce_units, `w.damage > 0`), sequence={seq:?}"
+            );
+        }
+    }
+    assert!(
+        any_nonempty,
+        "no seed among the tried set ever queued any infantry within {MAX_TICKS} ticks — \
+         weakens this test to a tautology; widen the seed set or tick budget"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 10. "AI radar-awareness" finding: despite the M7.7-C commit message
+//    ("AI radar + offensive-infantry filter"), reading `ai.rs` end to end
+//    shows the ONLY radar-related AI change is that `next_structure` now
+//    builds a DOME building (tested above) — there is no shroud/visibility
+//    gate anywhere in `launch_attack`/`nearest_enemy_target`, and
+//    `World::apply`'s `Command::Attack` handling (`world.rs:840-872`) has no
+//    shroud check either. This test pins that the AI attacks and lands hits
+//    on a totally unexplored (never revealed to it) enemy base once a
+//    shroud is enabled, proving the AI's targeting is fully omniscient
+//    regardless of whether it has actually "seen" the enemy via radar or
+//    scouting. This does not contradict DESIGN.md §3.10 ("difficulty is
+//    stat handicap, not information cheating" — a statement about
+//    difficulty tiers, not about baseline omniscience) but it does mean the
+//    commit's "AI radar-awareness" description is misleading: nothing in the
+//    AI actually *reads* shroud state. Flagged for ra-coder to confirm
+//    intent; not weakened to hide it either way.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn ai_attacks_the_enemy_base_even_when_it_is_never_shroud_revealed() {
+    const MAX_TICKS: u32 = 3000;
+    let mut w = full_roster_skirmish(0x5AD0_5AD0, Difficulty::Hard);
+    w.enable_shroud();
+
+    let mut incursion_tick: Option<u32> = None;
+    for t in 0..MAX_TICKS {
+        w.tick(&[]);
+        // House 1 must never have explored house 2's home cell (no scout
+        // ever got there, no building of house 1's ever had it in sight
+        // range) for this to prove omniscient targeting rather than "the AI
+        // happened to see it first."
+        assert!(
+            !w.shroud.is_explored(1, home2()),
+            "tick {t}: house 1 explored house 2's home cell — this test's premise (never \
+             revealed) no longer holds, rerun with a setup that keeps it shrouded"
+        );
+        if incursion_tick.is_none() {
+            for (_, u) in w.units.iter() {
+                if u.house == 1 {
+                    let dx = (u.cell().x - home2().x) as i64;
+                    let dy = (u.cell().y - home2().y) as i64;
+                    if dx * dx + dy * dy <= INCURSION_RADIUS_SQ {
+                        incursion_tick = Some(t);
+                        break;
+                    }
+                }
+            }
+        }
+        if incursion_tick.is_some() {
+            break;
+        }
+    }
+    incursion_tick.unwrap_or_else(|| {
+        panic!(
+            "house 1 never reached house 2's (permanently shrouded-to-it) base within \
+             {MAX_TICKS} ticks — either the omniscient-targeting premise is wrong or the \
+             tick budget is too small"
+        )
+    });
+}

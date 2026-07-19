@@ -1008,3 +1008,194 @@ fn scrolling_the_units_column_shifts_which_row0_builds() {
         "a non-overflowing column stays put"
     );
 }
+
+// ===========================================================================
+// 5. DOME radar gating changes click-to-jump sanely (M7.7 Chunk C).
+//
+// The radar minimap is now gated on owning a **live, powered radar dome**
+// (`AppCore::has_radar`, above) -- `load_skirmish` starts every house with no
+// DOME (see `ui_shroud_golden.rs`'s "Chunk C" re-pin comment: "the radar
+// panel is absent -- a deliberate skirmish-default"), so the panel's absence
+// is the *normal* skirmish starting state, not an edge case. This section
+// pins the click-to-jump behavior on both sides of that gate at the exact
+// same pixel coordinates: absent, a click where the panel would be must not
+// jump the camera (`sidebar_click`'s `radar_cell_at` returns `None`, so it
+// falls through to the scroll-arrow / buildable-row checks -- still the
+// *sidebar* path, since `x >= tactical_width()` unconditionally routes
+// there, never the tactical click path); present, the identical pixel must
+// jump, proving the absent-case assertion isn't vacuously true because
+// nothing ever happens at that pixel.
+// ===========================================================================
+
+/// A house-1 construction yard plus a catalog that models a DOME, with
+/// `enable_radar()` called unconditionally -- exactly like the real client
+/// (`ui_shroud_golden.rs`: `load_skirmish` always calls it; `has_radar()` is
+/// what actually gates the panel on DOME ownership). `own_dome = false`
+/// leaves the house without one (the skirmish default), so `has_radar()`
+/// resolves to `false` even though the UI layer asked for the panel.
+/// `enable_sidebar`'s buildables list is deliberately empty: this fixture
+/// isolates the radar-panel-presence question from build-row hit-testing
+/// (exhaustively covered elsewhere in this file and in
+/// `ui_sidebar_scripted_drive.rs`), so a click that misses the (absent)
+/// panel has nothing else in the sidebar to accidentally land on either.
+fn radar_gating_core(seed: u32, own_dome: bool) -> AppCore {
+    use ra_sim::{BuildingProto, Catalog, EconRules, Passability, World};
+
+    let fact = BuildingProto {
+        is_barracks: false,
+        name: "FACT".to_string(),
+        foot_w: 3,
+        foot_h: 3,
+        max_health: 400,
+        armor: 0,
+        power: 0,
+        cost: 100,
+        prereq: vec![],
+        is_refinery: false,
+        is_construction_yard: true,
+        is_war_factory: false,
+        free_harvester_unit: None,
+        sight: 4,
+        sprite_id: 0,
+        weapon: None,
+        has_turret: false,
+        charges: false,
+        is_wall: false,
+        storage: 0,
+    };
+    let dome = BuildingProto {
+        is_barracks: false,
+        name: "DOME".to_string(),
+        foot_w: 2,
+        foot_h: 2,
+        max_health: 400,
+        armor: 0,
+        power: 0, // no drain -> never low-power, isolates the DOME-ownership gate alone
+        cost: 10,
+        prereq: vec![],
+        is_refinery: false,
+        is_construction_yard: false,
+        is_war_factory: false,
+        free_harvester_unit: None,
+        sight: 4,
+        sprite_id: 0,
+        weapon: None,
+        has_turret: false,
+        charges: false,
+        is_wall: false,
+        storage: 0,
+    };
+
+    let mut world = World::new(Passability::all_passable(), seed);
+    world.set_catalog(Catalog {
+        buildings: vec![fact, dome],
+        units: vec![],
+        econ: EconRules::default(),
+    });
+    world.init_houses(3, 1000);
+    world.spawn_building(0, 1, CellCoord::new(20, 20)).unwrap();
+    if own_dome {
+        world.spawn_building(1, 1, CellCoord::new(25, 25)).unwrap();
+    }
+
+    let (raster, palette) = support::synthetic_fixture();
+    let mut core = AppCore::with_sim(raster.clone(), *palette, world, Vec::new(), Vec::new());
+    core.enable_sidebar(1, Vec::new());
+    core.enable_radar();
+    core
+}
+
+#[test]
+fn radar_absent_click_at_would_be_panel_coords_does_not_jump_camera() {
+    // A DOME-owning twin, only to compute the panel geometry a present radar
+    // would occupy (`radar_rect` is pure viewport/constant math, independent
+    // of `has_radar()`, so this is the same rectangle the absent core's
+    // panel *would* have used).
+    let mut core_present = radar_gating_core(0x7ADA_0101, true);
+    core_present.handle(InputEvent::Resize {
+        width: 900,
+        height: 600,
+    });
+    assert!(
+        core_present.has_radar(),
+        "test setup: the DOME-owning twin should report radar active"
+    );
+    let (rx, ry, size) = radar_rect(&core_present);
+
+    let mut core = radar_gating_core(0x7ADA_0102, false);
+    core.handle(InputEvent::Resize {
+        width: 900,
+        height: 600,
+    });
+    assert!(
+        !core.has_radar(),
+        "test setup: a house with no DOME must report radar inactive"
+    );
+
+    // The whole would-be panel: both corners, the centre, and the interior
+    // point the existing radar-jump test (§1) uses.
+    let points = [
+        (rx, ry),
+        (rx + size - 1, ry + size - 1),
+        (rx + size / 2, ry + size / 2),
+        (rx + 40, ry + 70),
+    ];
+    for &(x, y) in &points {
+        core.set_camera(777.0, 888.0);
+        core.handle(InputEvent::MouseDown {
+            button: MouseButton::Left,
+            x,
+            y,
+        });
+        let r = core.camera_rect();
+        assert_eq!(
+            (r.x, r.y),
+            (777, 888),
+            "a click at ({x},{y}) -- where the radar panel would be if present -- must not jump \
+             the camera once the panel is absent (no DOME owned)"
+        );
+        assert!(
+            core.drain_commands().is_empty(),
+            "a click at ({x},{y}) with the radar absent and no buildables must emit no command"
+        );
+    }
+    // The render path must not panic with the panel absent either.
+    let _ = core.compose_game();
+}
+
+#[test]
+fn radar_present_click_at_same_coords_does_jump_camera_positive_control() {
+    // Positive control for the test above: the identical pixel, the only
+    // difference being DOME ownership, must actually jump the camera --
+    // proving the absent-case assertions aren't vacuously true because
+    // nothing ever happens at those pixels regardless of radar state.
+    let mut core = radar_gating_core(0x7ADA_0103, true);
+    core.handle(InputEvent::Resize {
+        width: 900,
+        height: 600,
+    });
+    assert!(core.has_radar(), "test setup: should be terminal");
+    let (rx, ry, _) = radar_rect(&core);
+    let (cx, cy) = (rx + 40, ry + 70);
+    let cell = expected_radar_cell(&core, cx, cy)
+        .expect("test setup: this click should land inside the radar panel");
+    let (want_x, want_y) = expected_camera_after_radar_jump(&core, cell);
+
+    core.set_camera(777.0, 888.0);
+    core.handle(InputEvent::MouseDown {
+        button: MouseButton::Left,
+        x: cx,
+        y: cy,
+    });
+    let r = core.camera_rect();
+    assert_eq!(
+        (r.x, r.y),
+        (want_x.round() as i64, want_y.round() as i64),
+        "with a live, powered DOME (radar present), the exact same pixel that was a no-op when \
+         absent must jump the camera"
+    );
+    assert!(
+        core.drain_commands().is_empty(),
+        "a radar click must never emit a sim command"
+    );
+}

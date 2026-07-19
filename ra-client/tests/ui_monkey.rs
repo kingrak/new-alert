@@ -444,6 +444,15 @@ fn econ_event_strategy() -> impl Strategy<Value = InputEvent> {
         // slower than its siblings for no extra sequencing coverage).
         1 => (1u32..=200, 1u32..=200)
             .prop_map(|(width, height)| InputEvent::Resize { width, height }),
+        // M7.7 P6: the two-strip sidebar's scroll event, both columns, both
+        // directions -- mixed into the same fuzzed sequences as sidebar
+        // clicks/resizes/deploys above so scrolling interleaves with every
+        // other econ/UI action a real session could produce. `econ_buildables`
+        // gives column 0 (POWR/PROC/WEAP) 3 rows and column 1 (TANK) 1 row, so
+        // depending on the fuzzed `Resize` this suite already exercises both
+        // an overflowing and a never-overflowing column across the run.
+        2 => (prop_oneof![Just(0u8), Just(1u8)], any::<bool>())
+            .prop_map(|(column, up)| InputEvent::SidebarScroll { column, up }),
     ]
 }
 
@@ -591,5 +600,409 @@ proptest! {
     fn synthetic_monkey_with_econ_never_panics(ops in econ_ops_strategy(200..800)) {
         let (mut core, _mcv) = support::synthetic_core_with_econ_radar_cameo(0xE58E_C0E1, 5000);
         apply_ops_with_econ(&mut core, &ops);
+    }
+}
+
+// ===========================================================================
+// Dedicated two-strip sidebar scroll monkey (M7.7 P6, ra-tester adversarial
+// pass): the econ variant above now mixes `SidebarScroll` into its fuzzed
+// sequences, but `econ_buildables` never gives either column a genuinely
+// *empty* column (0 rows) nor a heavily overflowing one across the whole
+// run -- both scenarios the task brief calls out explicitly. These two
+// purpose-built fixtures close that gap, plus fuzz the shell's mouse-wheel
+// -> `SidebarScroll` mapping (`shell.rs`'s `mouse_wheel()` handling) directly
+// rather than only the `InputEvent` it produces, since `InputEvent` itself
+// has no wheel variant (grepped: wheel is shell-side only, mapped via
+// `AppCore::sidebar_column_at_x`/`tactical_width`/`sidebar_enabled`).
+// ===========================================================================
+
+/// One fuzzed operation for this suite: an `InputEvent`, a virtual-time tick,
+/// or a synthetic "mouse wheel at this pixel" event -- reproducing the
+/// shell's exact gating (`shell.rs`: only routed to `SidebarScroll` when
+/// `core.sidebar_enabled() && x >= core.tactical_width()`, column resolved
+/// via `core.sidebar_column_at_x(x)`) so this suite fuzzes that real mapping
+/// path, not just the `InputEvent` it happens to produce.
+#[derive(Debug, Clone, Copy)]
+enum SidebarMonkeyOp {
+    Event(InputEvent),
+    Update(u32),
+    Wheel { x: i32, y: i32, up: bool },
+}
+
+fn apply_wheel(core: &mut AppCore, x: i32, y: i32, up: bool) {
+    // Exactly `shell.rs`'s mouse-wheel block, replicated black-box (the
+    // wheel itself is a macroquad-shell-only concept -- `InputEvent` has no
+    // wheel variant -- so there is nothing to call but this same sequence of
+    // public `AppCore` queries the real shell makes).
+    let _ = y; // the shell's column lookup only uses x; y only ever informed `mx`/`my` tracking
+    if core.sidebar_enabled() && x >= core.tactical_width() as i32 {
+        let col = core.sidebar_column_at_x(x);
+        core.handle(InputEvent::SidebarScroll { column: col, up });
+    }
+}
+
+/// Mouse x/y biased at generation time toward the two sidebar columns of a
+/// fixed 900x170 viewport (`tactical_width() == 770`, `COLUMN_W == 64`,
+/// `SIDEBAR_W == 130`, none of which are public constants -- replicated here
+/// the same way every other UI suite duplicates this geometry): column 0 is
+/// `[771, 835)`, column 1 is `[835, 899]`, plus explicit boundary pixels (the
+/// tactical/sidebar seam, the column 0/1 seam) and a wide out-of-bounds net
+/// (negative and far-past-the-window), matching `event_strategy`'s existing
+/// "wide enough to cover negative and far-outside-viewport" rationale.
+fn sidebar_xy_strategy() -> impl Strategy<Value = (i32, i32)> {
+    prop_oneof![
+        4 => (771i32..835, -50i32..300),
+        4 => (835i32..900, -50i32..300),
+        // Boundary pixels: 1px either side of the tactical/sidebar seam
+        // (770/771) and the column 0/1 seam (834/835), plus the sidebar's
+        // right edge (899/900).
+        2 => prop_oneof![
+            Just(769), Just(770), Just(771),
+            Just(834), Just(835),
+            Just(899), Just(900),
+        ]
+        .prop_flat_map(|x| (Just(x), -50i32..300)),
+        1 => (-1000i32..2000, -1000i32..2000),
+    ]
+}
+
+fn sidebar_scroll_event_strategy() -> impl Strategy<Value = InputEvent> {
+    prop_oneof![
+        // Valid columns, both directions -- the common case.
+        4 => (prop_oneof![Just(0u8), Just(1u8)], any::<bool>())
+            .prop_map(|(column, up)| InputEvent::SidebarScroll { column, up }),
+        // Out-of-range columns (`SIDEBAR_COLUMNS == 2`): `scroll_sidebar`
+        // must no-op (its `if col >= SIDEBAR_COLUMNS { return; }` guard),
+        // never index out of bounds.
+        1 => (2u8..=255, any::<bool>())
+            .prop_map(|(column, up)| InputEvent::SidebarScroll { column, up }),
+    ]
+}
+
+fn sidebar_monkey_event_strategy() -> impl Strategy<Value = InputEvent> {
+    prop_oneof![
+        3 => econ_key_strategy().prop_map(InputEvent::KeyDown),
+        3 => econ_key_strategy().prop_map(InputEvent::KeyUp),
+        2 => sidebar_xy_strategy().prop_map(|(x, y)| InputEvent::MouseMoved { x, y }),
+        1 => Just(InputEvent::MouseLeft),
+        4 => (mouse_button_strategy(), sidebar_xy_strategy())
+            .prop_map(|(button, (x, y))| InputEvent::MouseDown { button, x, y }),
+        4 => (mouse_button_strategy(), sidebar_xy_strategy())
+            .prop_map(|(button, (x, y))| InputEvent::MouseUp { button, x, y }),
+        6 => sidebar_scroll_event_strategy(),
+    ]
+}
+
+fn sidebar_monkey_op_strategy() -> impl Strategy<Value = SidebarMonkeyOp> {
+    prop_oneof![
+        5 => sidebar_monkey_event_strategy().prop_map(SidebarMonkeyOp::Event),
+        1 => (0u32..=20_000).prop_map(SidebarMonkeyOp::Update),
+        3 => (sidebar_xy_strategy(), any::<bool>())
+            .prop_map(|((x, y), up)| SidebarMonkeyOp::Wheel { x, y, up }),
+    ]
+}
+
+fn sidebar_monkey_ops_strategy(
+    len: std::ops::Range<usize>,
+) -> impl Strategy<Value = Vec<SidebarMonkeyOp>> {
+    proptest::collection::vec(sidebar_monkey_op_strategy(), len)
+}
+
+/// Apply one op and check the invariants: no panic (implicit); every drained
+/// command scoped to the controlled house 1; `PlaceBuilding` only for the
+/// building that was actually `ready_building` just before this op (same
+/// rationale as `apply_op_with_econ`); and — the task brief's explicit
+/// ask — every `StartProduction`/`item` is actually present in `buildables`
+/// (the fixture's own declared buildable list), never an index the sidebar
+/// was never told about.
+fn apply_sidebar_monkey_op(
+    core: &mut AppCore,
+    buildables: &[ra_sim::BuildItem],
+    op: SidebarMonkeyOp,
+    index: usize,
+) {
+    let ready_before = core.world().house(1).and_then(|h| h.ready_building);
+
+    match op {
+        SidebarMonkeyOp::Event(ev) => core.handle(ev),
+        SidebarMonkeyOp::Update(dt) => core.update(dt),
+        SidebarMonkeyOp::Wheel { x, y, up } => apply_wheel(core, x, y, up),
+    }
+
+    for cmd in core.drain_commands() {
+        match cmd {
+            Command::Move { unit, house, .. }
+            | Command::Stop { unit, house }
+            | Command::Attack { unit, house, .. }
+            | Command::Deploy { unit, house } => {
+                assert_eq!(
+                    house, 1,
+                    "drained {cmd:?} was not issued for the controlled house"
+                );
+                let owner = core.world().units.get(unit).unwrap_or_else(|| {
+                    panic!("drained {cmd:?} addresses a handle that isn't live in the world")
+                });
+                assert_eq!(house, owner.house);
+            }
+            Command::StartProduction { house, item } => {
+                assert_eq!(
+                    house, 1,
+                    "drained {cmd:?} was not issued for the controlled house"
+                );
+                assert!(
+                    buildables.contains(&item),
+                    "drained StartProduction for {item:?}, but the sidebar's buildables list is \
+                     {buildables:?} -- a click/scroll must never start production for an item \
+                     the sidebar was never told about"
+                );
+            }
+            Command::CancelProduction { house, .. } | Command::Sell { house, .. } => {
+                assert_eq!(
+                    house, 1,
+                    "drained {cmd:?} was not issued for the controlled house"
+                );
+            }
+            Command::PlaceBuilding {
+                house, building, ..
+            } => {
+                assert_eq!(
+                    house, 1,
+                    "drained {cmd:?} was not issued for the controlled house"
+                );
+                assert_eq!(
+                    Some(building),
+                    ready_before,
+                    "drained {cmd:?}, but building {building} was not the ready building just \
+                     before this op (ready was {ready_before:?})"
+                );
+            }
+        }
+    }
+    if index.is_multiple_of(COMPOSE_EVERY) {
+        let frame = core.compose_camera();
+        let (vw, vh) = core.viewport_size();
+        assert_eq!(frame.width, vw);
+        assert_eq!(frame.height, vh);
+    }
+}
+
+fn apply_sidebar_monkey_ops(
+    core: &mut AppCore,
+    buildables: &[ra_sim::BuildItem],
+    ops: &[SidebarMonkeyOp],
+) {
+    // Fixed viewport: `sidebar_xy_strategy`'s column geometry is computed
+    // for exactly this size (see its docs) -- this suite fuzzes sidebar
+    // interaction, not resize/geometry interplay, which the econ/units
+    // variants above already fuzz.
+    core.handle(InputEvent::Resize {
+        width: 900,
+        height: 170,
+    });
+    for (i, &op) in ops.iter().enumerate() {
+        apply_sidebar_monkey_op(core, buildables, op, i);
+    }
+}
+
+/// Fixture A: column 0 (structures) is genuinely empty -- **0 rows** -- for
+/// the entire run (nothing in `buildables` is a `BuildItem::Building`), and
+/// column 1 (units) has 12 rows against this fixture's ~5 visible rows (`170`
+/// tall, no cameo art -> `SIDEBAR_ROW_H == 22`), so it reliably overflows:
+/// `SidebarScroll` past either end must clamp, never panic, regardless of
+/// which of the two very different columns a fuzzed op targets. A single
+/// war factory (both a construction yard and the producer, mirroring
+/// `ui_radar_cameo_f1_suite.rs`'s `two_strip_core` pattern) is placed
+/// directly so every unit row is genuinely buildable, not gated on a
+/// deploy dance this suite isn't about.
+fn zero_and_overflow_columns_core(seed: u32) -> (AppCore, Vec<ra_sim::BuildItem>) {
+    use ra_sim::{BuildingProto, Catalog, EconRules, MoveStats, Passability, UnitProto, World};
+    let weap = BuildingProto {
+        is_barracks: false,
+        name: "WEAP".into(),
+        foot_w: 2,
+        foot_h: 2,
+        max_health: 400,
+        armor: 0,
+        power: 0,
+        cost: 10,
+        prereq: vec![],
+        is_refinery: false,
+        is_construction_yard: true,
+        is_war_factory: true,
+        free_harvester_unit: None,
+        sight: 4,
+        sprite_id: 0,
+        weapon: None,
+        has_turret: false,
+        charges: false,
+        is_wall: false,
+        storage: 0,
+    };
+    let uproto = |i: usize| UnitProto {
+        is_infantry: false,
+        locomotor: 1,
+        name: format!("U{i}"),
+        sprite_id: i as u32,
+        max_health: 100,
+        stats: MoveStats {
+            max_speed: 20,
+            rot: 8,
+        },
+        armor: 0,
+        weapon: None,
+        secondary: None,
+        has_turret: false,
+        is_harvester: false,
+        deploys_to: None,
+        cost: 10,
+        prereq: vec![],
+        sight: 2,
+    };
+    let n_units = 12;
+    let units: Vec<UnitProto> = (0..n_units).map(uproto).collect();
+
+    let mut world = World::new(Passability::all_passable(), seed);
+    world.set_catalog(Catalog {
+        buildings: vec![weap],
+        units,
+        econ: EconRules::default(),
+    });
+    world.init_houses(3, 5000);
+    world
+        .spawn_building(0, 1, ra_sim::coords::CellCoord::new(20, 20))
+        .unwrap();
+
+    let (raster, palette) = support::synthetic_fixture();
+    let mut core = AppCore::with_sim(raster.clone(), *palette, world, Vec::new(), Vec::new());
+    let buildables: Vec<ra_sim::BuildItem> = (0..n_units)
+        .map(|i| ra_sim::BuildItem::Unit(i as u32))
+        .collect();
+    core.enable_sidebar(1, buildables.clone());
+    (core, buildables)
+}
+
+/// Fixture B: both columns non-empty but small enough (1 structure, 2 units
+/// against ~5 visible rows) to never overflow at this suite's fixed
+/// viewport -- `max_scroll(col) == 0` for both, so every `SidebarScroll`
+/// here is the "column that doesn't overflow" case the task brief calls
+/// out, for the whole run (not just incidentally, the way the econ variant's
+/// fuzzed `Resize` might hit it).
+fn small_non_overflow_columns_core(seed: u32) -> (AppCore, Vec<ra_sim::BuildItem>) {
+    use ra_sim::{BuildingProto, Catalog, EconRules, MoveStats, Passability, UnitProto, World};
+    let weap = BuildingProto {
+        is_barracks: false,
+        name: "WEAP".into(),
+        foot_w: 2,
+        foot_h: 2,
+        max_health: 400,
+        armor: 0,
+        power: 0,
+        cost: 10,
+        prereq: vec![],
+        is_refinery: false,
+        is_construction_yard: true,
+        is_war_factory: true,
+        free_harvester_unit: None,
+        sight: 4,
+        sprite_id: 0,
+        weapon: None,
+        has_turret: false,
+        charges: false,
+        is_wall: false,
+        storage: 0,
+    };
+    let extra_structure = BuildingProto {
+        is_barracks: false,
+        name: "S0".into(),
+        foot_w: 2,
+        foot_h: 2,
+        max_health: 400,
+        armor: 0,
+        power: 0,
+        cost: 10,
+        prereq: vec![],
+        is_refinery: false,
+        is_construction_yard: false,
+        is_war_factory: false,
+        free_harvester_unit: None,
+        sight: 4,
+        sprite_id: 0,
+        weapon: None,
+        has_turret: false,
+        charges: false,
+        is_wall: false,
+        storage: 0,
+    };
+    let uproto = |i: usize| UnitProto {
+        is_infantry: false,
+        locomotor: 1,
+        name: format!("U{i}"),
+        sprite_id: i as u32,
+        max_health: 100,
+        stats: MoveStats {
+            max_speed: 20,
+            rot: 8,
+        },
+        armor: 0,
+        weapon: None,
+        secondary: None,
+        has_turret: false,
+        is_harvester: false,
+        deploys_to: None,
+        cost: 10,
+        prereq: vec![],
+        sight: 2,
+    };
+    let units: Vec<UnitProto> = (0..2).map(uproto).collect();
+
+    let mut world = World::new(Passability::all_passable(), seed);
+    world.set_catalog(Catalog {
+        buildings: vec![weap, extra_structure],
+        units,
+        econ: EconRules::default(),
+    });
+    world.init_houses(3, 5000);
+    world
+        .spawn_building(0, 1, ra_sim::coords::CellCoord::new(20, 20))
+        .unwrap();
+
+    let (raster, palette) = support::synthetic_fixture();
+    let mut core = AppCore::with_sim(raster.clone(), *palette, world, Vec::new(), Vec::new());
+    let buildables = vec![
+        ra_sim::BuildItem::Building(1),
+        ra_sim::BuildItem::Unit(0),
+        ra_sim::BuildItem::Unit(1),
+    ];
+    core.enable_sidebar(1, buildables.clone());
+    (core, buildables)
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(64))]
+
+    /// Column 0 has 0 rows and column 1 heavily overflows, for the whole
+    /// run: scrolling either end (up past the top, down past the bottom, a
+    /// column that structurally has nothing to scroll at all), clicking
+    /// every sidebar/tactical pixel including out-of-bounds, and fuzzing the
+    /// shell's wheel->SidebarScroll mapping must never panic and never
+    /// start production for an item outside `buildables`.
+    #[test]
+    fn sidebar_scroll_monkey_zero_and_overflowing_columns_never_panics(
+        ops in sidebar_monkey_ops_strategy(300..1000)
+    ) {
+        let (mut core, buildables) = zero_and_overflow_columns_core(0x51DE_5C01);
+        apply_sidebar_monkey_ops(&mut core, &buildables, &ops);
+    }
+
+    /// Both columns non-empty but never overflowing, for the whole run: the
+    /// "scroll a column that doesn't overflow" case the task brief calls
+    /// out explicitly, fuzzed for thousands of ops rather than left to
+    /// chance.
+    #[test]
+    fn sidebar_scroll_monkey_small_non_overflowing_columns_never_panics(
+        ops in sidebar_monkey_ops_strategy(300..1000)
+    ) {
+        let (mut core, buildables) = small_non_overflow_columns_core(0x51DE_5C02);
+        apply_sidebar_monkey_ops(&mut core, &buildables, &ops);
     }
 }
