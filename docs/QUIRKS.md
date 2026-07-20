@@ -230,6 +230,43 @@ at its attacker (`FootClass::Take_Damage → Assign_Target(source)`,
      `ra-sim/tests/scatter_suite.rs` (parked-friendly-in-corridor resolves,
      enemy-blocker-not-scattered, single-unit determinism, and the user's
      harvester-docks-past-a-parked-friendly-and-banks-credits end-to-end).
+   - **Chain propagation (M7.12 audit P0a).** The single-link scatter above
+     could *create* a new deadlock the old "wait forever" never had: a mover
+     pushing blocker *b1* east into blocker *b2* left *b1* boxed (mover to its
+     west, *b2* to its east) with nobody ever asking *b1* to re-scatter against
+     *b2* — a permanent multi-blocker gridlock. Fixed by porting the original's
+     **`CellClass::Incoming` cascade** (`cell.cpp:2013`): `Incoming` scatters
+     *each* occupier, and a unit asked to scatter that cannot move because a
+     friendly boxes it is, on the next entry attempt, itself `Incoming`'d by
+     whoever now needs its cell — so a file of parked allies unclogs from the far
+     end. `scatter_blocker` now, when it finds **no free adjacent cell**,
+     propagates the request to any **friendly, stationary, non-dumping**
+     neighbour boxing it in (recursively, `visited`-guarded in slot/face order),
+     eagerly within the same request rather than one link per tick. So *b1*
+     boxed by *b2* now scatters *b2* first; the chain marches and the deadlock is
+     gone. **Determinism / RNG:** the recursion is `visited`-guarded (each unit
+     scattered at most once per tick), so the per-tick sync draw count stays
+     bounded by the number of distinct friendly units in the scene — the
+     `scatter_livelock_proptest` RNG bound (`TICKS·blockers·8+64`) and the
+     `fully_boxed`/`three_packed` per-tick draw pins stay green (a blocker boxed
+     by an *enemy* has no friendly neighbour to cascade to, so it still draws
+     exactly once). No new golden churn (cascade only fires on a real
+     multi-friendly block, absent from every golden fixture). **Pin geometry
+     corrected (ra-tester, M7.12 audit).** The regression test
+     `multi_blocker_chain_..._mover_gets_through` originally used a plain 1-wide
+     dead-end corridor and asserted the mover reaches `x ≥ 22`, which is
+     geometrically impossible there (two blockers pushed east pile at x22/x23, so
+     the mover reaches at most x21 — a test-authoring error, not a production
+     bug). Rather than weaken the `reached` bound, the geometry was rebuilt: a
+     1-wide corridor that dead-ends at its east edge with a pair of one-cell
+     **alcoves** carved north and south of the dead-end cell (the only
+     off-corridor escapes on the map). The mover still pushes *b1* flush into
+     *b2* (b1 fully boxed → the cascade is the *only* way forward), but now each
+     blocker steps **off** the corridor row into an alcove, clearing the path so
+     the mover genuinely reaches the dead-end. The test asserts both blockers
+     scatter, no overlap ever, and the mover arrives *because* they stepped
+     aside; reverting this cascade returns it to the permanent gridlock (verified
+     in the M7.12 revert-sensitivity pass), so the fix is proven load-bearing.
 2. **Closest-free-spot centre fallback** uses the fixed `_sequence[0]` order rather
    than the RNG-picked `_alternate` row (`cell.cpp:1948`), avoiding a new sim-RNG
    draw in the movement path (determinism, and it keeps existing goldens' RNG

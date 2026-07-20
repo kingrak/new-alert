@@ -1951,8 +1951,25 @@ impl AppCore {
 
     /// Y offset (px) where the buildable rows begin (below the readout header).
     /// Header height (credits + power lines) before the radar / rows.
-    fn sidebar_header_h(&self) -> i32 {
-        2 + (font::GLYPH_H + 2) + font::GLYPH_H + 4
+    // `pub`: read-only accessor for the radar panel's `y0` so UI layout tests
+    // assert real geometry instead of re-deriving it (ra-tester, M7.12 audit).
+    pub fn sidebar_header_h(&self) -> i32 {
+        // Text header: the credits + power readout lines (font-derived, = 22).
+        let text_h = 2 + (font::GLYPH_H + 2) + font::GLYPH_H + 4;
+        // When real SELL/REPAIR button *art* is installed (Q14 M7.12 art pass)
+        // it renders at native SHP height (34×28 hires) side-by-side in the
+        // top-right of the header. The header band — whose height is the radar
+        // panel's `y0` (`radar_rect`) and gates `sidebar_rows_top` — must clear
+        // the buttons so the radar sits *below* them, never under them (matching
+        // the original sidebar, where Repair/Sell sit above the radar). With no
+        // art the fallback text buttons are 9px and already fit inside the text
+        // header, so this `max` is a no-op and every no-asset golden is
+        // byte-identical; only the real-asset (`hires`) frames move (radar +
+        // cameo rows shift down by the extra band — a rendering-only re-pin).
+        match self.mode_btn_art_dims() {
+            Some((_, h)) => text_h.max(1 + h + 1),
+            None => text_h,
+        }
     }
 
     /// The radar panel rectangle `(x0, y0, size)` in viewport pixels, if the

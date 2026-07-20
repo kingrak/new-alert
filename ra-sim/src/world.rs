@@ -5181,6 +5181,14 @@ fn scatter_friendly_blockers(world: &mut World, mover: Handle, cell: CellCoord, 
             }
         }
     }
+    // Visited guard shared across the whole request. `scatter_blocker` cascades
+    // the scatter to a boxed blocker's own friendly, stationary neighbours (the
+    // multi-blocker chain fix, P0), so a unit could otherwise be reached twice
+    // in one tick. Seeding with the mover keeps the cascade from looping back
+    // onto it, and the guard makes the recursion terminate (each unit asked at
+    // most once per tick) — which also keeps the per-tick scatter RNG draw count
+    // bounded by the number of distinct units in the scene.
+    let mut visited: Vec<Handle> = vec![mover];
     for b in blockers {
         // `Can_Enter_Cell` returns MOVE_TEMP only for a *friendly*, *stationary*
         // occupier (`unit.cpp:3336`: `is_moving == false`, i.e. no NavCom / not
@@ -5190,8 +5198,9 @@ fn scatter_friendly_blockers(world: &mut World, mover: Handle, cell: CellCoord, 
             .units
             .get(b)
             .is_some_and(|u| world.are_allies(mover_house, u.house) && u.path.is_empty());
-        if ask {
-            scatter_blocker(world, b, grid);
+        if ask && !visited.contains(&b) {
+            visited.push(b);
+            scatter_blocker(world, b, grid, &mut visited);
         }
     }
 }
@@ -5210,13 +5219,25 @@ fn scatter_friendly_blockers(world: &mut World, mover: Handle, cell: CellCoord, 
 /// **RNG discipline:** exactly one sync draw per scattered blocker (the toface
 /// jitter). The `Random_Pick(1, 4)` "1-in-4" gate is skipped because `forced`
 /// short-circuits it (`drive.cpp:194`), matching the original at these call sites.
-fn scatter_blocker(world: &mut World, blocker: Handle, grid: &UnitGrid) -> Option<CellCoord> {
-    let (start, facing, loco, is_inf, dumping) = {
+fn scatter_blocker(
+    world: &mut World,
+    blocker: Handle,
+    grid: &UnitGrid,
+    visited: &mut Vec<Handle>,
+) -> Option<CellCoord> {
+    let (start, facing, loco, is_inf, dumping, house) = {
         let u = world.units.get(blocker)?;
         // A harvester actively dumping at the dock never scatters
         // (`IsDumping`, drive.cpp:191).
         let dumping = u.is_harvester && u.harvest.status == HarvStatus::Unloading;
-        (u.cell(), u.facing, u.locomotor, u.is_infantry(), dumping)
+        (
+            u.cell(),
+            u.facing,
+            u.locomotor,
+            u.is_infantry(),
+            dumping,
+            u.house,
+        )
     };
     if dumping {
         return None;
@@ -5252,8 +5273,59 @@ fn scatter_blocker(world: &mut World, blocker: Handle, grid: &UnitGrid) -> Optio
             u.dest = Some(cell);
             u.path = vec![cell];
         }
+        return Some(cell);
     }
-    chosen
+
+    // Boxed: no free adjacent cell. Propagate the scatter request to any
+    // friendly, stationary neighbour that is itself boxing us in — the
+    // original's `CellClass::Incoming` cascade (`cell.cpp:2013`). In the
+    // original, `Incoming` scatters *each* occupier of the cell, and a unit
+    // that is asked to scatter but cannot move because a friendly blocks it is,
+    // on the *next* tick, itself `Incoming`'d by whoever is now trying to enter
+    // its cell — so a file of parked allies unclogs from the far end. We port
+    // that propagation eagerly within the same request (chaining to the boxing
+    // friendly now, rather than waiting a tick per link) so a two-or-more
+    // blocker chain in a one-wide corridor resolves instead of deadlocking
+    // (the old single-link scatter could *create* a permanent multi-blocker
+    // gridlock — the M7.12 P0 regression this closes). Deterministic: faces in
+    // rotation order, slot order within a cell, `visited`-guarded so each unit
+    // is scattered at most once per tick and the recursion always terminates.
+    for face in 0..8i32 {
+        let ncell = adjacent_cell(start, (face & 7) as u8);
+        if !ncell.on_map() {
+            continue;
+        }
+        // Neighbours occupying `ncell`: a vehicle, or (if none) infantry.
+        let mut neighbours: Vec<Handle> = Vec::new();
+        if let Some(v) = grid.vehicle_at(ncell).filter(|&h| h != blocker) {
+            neighbours.push(v);
+        } else {
+            for h in world.units.handles() {
+                if let Some(u) = world.units.get(h) {
+                    if h != blocker && u.is_infantry() && u.cell() == ncell {
+                        neighbours.push(h);
+                    }
+                }
+            }
+        }
+        for nb in neighbours {
+            if visited.contains(&nb) {
+                continue;
+            }
+            // Only a *friendly, stationary* (non-dumping) neighbour is MOVE_TEMP
+            // and thus scatter-able — the same gate the mover applied to us.
+            let eligible = world.units.get(nb).is_some_and(|u| {
+                world.are_allies(house, u.house)
+                    && u.path.is_empty()
+                    && !(u.is_harvester && u.harvest.status == HarvStatus::Unloading)
+            });
+            if eligible {
+                visited.push(nb);
+                scatter_blocker(world, nb, grid, visited);
+            }
+        }
+    }
+    None
 }
 
 /// Advance `coord` along the cell-centre waypoints of `path` by up to `budget`
