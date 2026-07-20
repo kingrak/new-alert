@@ -509,7 +509,18 @@ fn real_hard_ai_reliably_beats_easy_ai() {
 /// dominated** (it does not lose all four) — and prints the full per-orientation
 /// record for the report. It deliberately does **not** assert an Expert sweep,
 /// because that would be false.
+///
+/// **`#[ignore]`d (run-on-demand): ~4 min (4 full real-asset games).** Per the
+/// ra-tester rule "anything slow or asset-dependent goes behind `#[ignore]`",
+/// this one-time acceptance *measurement* is not part of the default suite. The
+/// profile knob's liveness is guarded by default by the fast (~2 s) synthetic
+/// smoke `ai_ratio_suite::ab_profile_knob_is_live_legacy_replaces_a_sub_iq_
+/// harvester_but_expert_does_not`, and the per-difficulty decisiveness of the
+/// real maps by the (non-ignored) `real_scg05ea_ai_vs_ai_decisive_at_*` tests.
+/// Run this record explicitly with:
+///   `cargo test -p ra-client --test ui_ai_vs_ai real_expert_vs_legacy_ai_ab_record -- --ignored --nocapture`
 #[test]
+#[ignore = "~4 min, 4 full real-asset games; run-on-demand acceptance measurement (see doc comment)"]
 fn real_expert_vs_legacy_ai_ab_record() {
     if !support::real_assets_available() {
         eprintln!("SKIP: real assets not found (Expert-vs-Legacy A/B)");
@@ -786,4 +797,63 @@ fn real_symmetric_ai_vs_ai_building_count_stays_bounded() {
         "the loser's building count should trend only downward across its terminal-collapse \
          tail (last {tail_len} samples before elimination), not tick back upward: {tail:?}"
     );
+}
+
+// ===========================================================================
+// Audit addendum (ra-tester, M7.15): pin the real-asset dodge data-correction.
+// The brief said "arty/V2" dodge; the coder corrected it to "only genuinely slow
+// projectiles" (grenade + 8Inch). This pins the ACTUAL loaded values: stock
+// `Incoming=10` scales to 25 on the shared 0..255 proj-speed scale, so among the
+// simulated ground units only the E2 grenadier (155mm=30, SCUD=64 are ABOVE the
+// threshold) trips the artillery/grenade-dodge reflex. Locks the fidelity
+// correction against the real redalert.mix so it can't silently regress.
+#[test]
+fn real_incoming_threshold_and_dodge_eligibility_matches_the_data_correction() {
+    if !support::real_assets_available() {
+        eprintln!("SKIP: real assets not found (incoming/dodge data-correction pin)");
+        return;
+    }
+    let dir = support::assets_dir();
+    let redalert_bytes = std::fs::read(dir.join("redalert.mix")).expect("redalert.mix");
+    let main_bytes = std::fs::read(dir.join("main.mix")).expect("main.mix");
+    let redalert = MixArchive::parse(&redalert_bytes).unwrap();
+    let main = MixArchive::parse(&main_bytes).unwrap();
+    let local = redalert.open_nested("local.mix").unwrap();
+    let rules = Ini::parse(&String::from_utf8_lossy(local.get("rules.ini").unwrap()));
+    let conquer = main.open_nested("conquer.mix").unwrap();
+    let content = build_content(&rules, &conquer, None).unwrap();
+
+    let inc = content.catalog.econ.incoming_speed;
+    assert_eq!(inc, 25, "stock `[General] Incoming=10` must scale to 25");
+
+    // Look each unit's resolved proj_speed up by catalog name and check whether it
+    // trips the reflex (`proj_speed < Incoming`).
+    let dodges = |name: &str| -> bool {
+        let u = content
+            .catalog
+            .units
+            .iter()
+            .find(|u| u.name.eq_ignore_ascii_case(name))
+            .unwrap_or_else(|| panic!("unit {name} not in catalog"));
+        let wp = u
+            .weapon
+            .unwrap_or_else(|| panic!("unit {name} has no weapon"));
+        inc > 0 && wp.proj_speed < inc
+    };
+
+    // The E2 grenadier (Grenade Speed 5 -> 12 < 25) is the one simulated ground
+    // unit that dodges.
+    assert!(dodges("E2"), "E2 grenadier (proj 12) must dodge (12 < 25)");
+    // ARTY (155mm 12 -> 30) and the V2 (SCUD 25 -> 64) are ABOVE the threshold —
+    // the brief's "arty/V2 dodge" was wrong; they do NOT.
+    assert!(
+        !dodges("ARTY"),
+        "ARTY 155mm (proj 30) must NOT dodge (30 >= 25)"
+    );
+    assert!(
+        !dodges("V2RL"),
+        "V2 SCUD (proj 64) must NOT dodge (64 >= 25)"
+    );
+    // Tank cannon (90mm 40 -> 102) is far above.
+    assert!(!dodges("3TNK"), "heavy tank 90mm (proj 102) must NOT dodge");
 }

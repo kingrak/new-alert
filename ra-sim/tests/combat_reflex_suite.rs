@@ -280,3 +280,59 @@ fn human_produced_unit_stays_plain_guard() {
         "a human house's produced unit must stay plain Guard (IQ 0 < IQGuardArea)"
     );
 }
+
+/// The dodge is directional, not random: the dodger flees *away* from the firer
+/// (`Scatter` seeds `toface` from `Dir_Facing(Direction8(threat, Coord))`,
+/// drive.cpp:201 — the direction from the firer toward us). With the attacker due
+/// WEST of the target, the target must never flee toward/past the firer, so its
+/// cell x must not decrease. (Audit P2b: pins "away from firer, not random".)
+#[test]
+fn dodge_flees_away_from_the_firer() {
+    let mut w = World::new(Passability::all_passable(), 0xD0D6_E1EE);
+    w.set_catalog(catalog());
+    w.init_houses(2, CREDITS);
+    // Attacker WEST (x=30) of the target (x=35): fleeing away = x increases (east).
+    let attacker = spawn_armed(&mut w, 0, CellCoord::new(30, 40), weapon(20));
+    let target = spawn_unarmed(&mut w, 1, CellCoord::new(35, 40));
+    w.set_house_iq(1, 5);
+    let start = w.units.get(target).unwrap().cell();
+    w.tick(&[Command::Attack {
+        unit: attacker,
+        target: Target::Unit(target),
+        house: 0,
+    }]);
+    let mut fled_to = None;
+    for _ in 0..60 {
+        w.tick(&[]);
+        let c = w.units.get(target).unwrap().cell();
+        if c != start {
+            fled_to = Some(c);
+            break;
+        }
+    }
+    let c = fled_to.expect("a computer unit must dodge the slow shell");
+    assert!(
+        c.x >= start.x,
+        "the dodger must flee AWAY from the firer (west), never toward/past it: \
+         start.x={}, fled.x={}",
+        start.x,
+        c.x
+    );
+}
+
+/// The dodge threshold is a strict `<` (`MaxSpeed < Rule.Incoming`): a projectile
+/// whose speed exactly equals the incoming threshold does NOT trigger the reflex,
+/// even for a computer unit — only a genuinely *slower* projectile does. (Audit
+/// P2b: pins the exact boundary the real 155mm(30)/SCUD(64)-vs-Incoming(25) data
+/// correction turns on.)
+#[test]
+fn dodge_boundary_is_strict_less_than() {
+    assert!(
+        !ran_from_shell(INCOMING_THRESHOLD, 5),
+        "proj_speed == Incoming must NOT dodge (strict `<`)"
+    );
+    assert!(
+        ran_from_shell(INCOMING_THRESHOLD - 1, 5),
+        "proj_speed one below Incoming must dodge"
+    );
+}

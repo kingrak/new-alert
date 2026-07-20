@@ -566,3 +566,62 @@ fn a_zero_iq_blocker_is_still_force_scattered_from_a_committed_movers_cell() {
          site must be the nokidding=true forced variant (IQ-independent), cell.cpp:2025"
     );
 }
+
+// ---------------------------------------------------------------------------
+// 5. AiProfile A/B knob (M7.15) — a fast, default-running smoke that the
+//    Expert-vs-Legacy profile switch is genuinely LIVE (both branches
+//    reachable), so the ~4-min real-asset A/B
+//    (`ui_ai_vs_ai::real_expert_vs_legacy_ai_ab_record`) can stay `#[ignore]`d.
+// ---------------------------------------------------------------------------
+
+/// The crisp, deterministic divergence between the two A/B profiles: the
+/// auto-harvester replacement gate. Below `IQHarvester`, the shipping **Expert**
+/// policy gates replacement OFF (M7.14 fidelity), while **Legacy** (the verbatim
+/// pre-M7.14 baseline) replaces a lost harvester *unconditionally*. On the same
+/// seed/catalog/sub-threshold IQ, Legacy re-mines and Expert does not — proving
+/// both `AiProfile` branches are exercised by default, without the 4-min real
+/// A/B. (Complements the Expert-only `harvester_replacement_fires_exactly_at_the
+/// _iq_harvester_threshold` above with its Legacy counterpart.)
+#[test]
+fn ab_profile_knob_is_live_legacy_replaces_a_sub_iq_harvester_but_expert_does_not() {
+    let drive = |profile: ra_sim::AiProfile| -> bool {
+        let mut w = World::new(Passability::all_passable(), 0x11A2_0AB0);
+        let mut cat = catalog();
+        cat.econ.ai.refinery_limit = 1;
+        w.set_catalog(cat);
+        w.init_houses(2, CREDITS);
+        w.spawn_unit(U_MCV, 1, CellCoord::new(40, 40), Facing(0), 400, stats());
+        w.set_ai(vec![
+            AiPlayer::new(1, Difficulty::Normal).with_profile(profile)
+        ]);
+        let threshold = w.catalog.econ.iq.harvester;
+        let ready = run_until(&mut w, 6000, |w| {
+            owns(w, 1, B_PROC) && owns(w, 1, B_WEAP) && count_units(w, 1, |u| u.is_harvester) >= 1
+        });
+        assert!(
+            ready.is_some(),
+            "AI ({profile:?}) never reached refinery + war factory + harvester"
+        );
+        // Pin IQ one below the harvester threshold — the gate Expert fails and
+        // Legacy ignores — then kill the harvester and see who re-mines.
+        w.houses[1].iq = threshold - 1;
+        let harv = w
+            .units
+            .iter()
+            .find(|(_, u)| u.house == 1 && u.is_harvester)
+            .map(|(h, _)| h)
+            .unwrap();
+        w.units.remove(harv);
+        run_until(&mut w, 6000, |w| count_units(w, 1, |u| u.is_harvester) >= 1).is_some()
+    };
+    assert!(
+        drive(ra_sim::AiProfile::Legacy),
+        "Legacy profile must replace a lost harvester UNCONDITIONALLY (sub-IQ) — \
+         the pre-M7.14 baseline behaviour"
+    );
+    assert!(
+        !drive(ra_sim::AiProfile::Expert),
+        "Expert profile must NOT replace the harvester below IQHarvester — the \
+         M7.14 gate; the two profiles must diverge here (knob is live)"
+    );
+}

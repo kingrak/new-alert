@@ -253,11 +253,15 @@ pub struct AiPlayer {
     /// Repair-throttle cooldown (M7.14 audit P1 — `HouseClass::RepairTimer`,
     /// house.h:354). Counts down each tick; the AI may only *begin* a repair when it
     /// reaches 0, and it re-arms to a random multi-tick delay after each repair
-    /// (`Repair_AI`, building.cpp:5842). This is what makes the faithful stock
-    /// `CreditReserve=100` repair floor safe — without it, repairing every pass
-    /// drains the economy to the floor and starves production (the old hardcoded
-    /// 1000 band-aid). `0` (armed) until the first repair fires. Folded into the
-    /// hash only when non-zero (like the other AI decision state).
+    /// (`Repair_AI`, building.cpp:5842). This is a faithful port of the original's
+    /// repair pacing, and it lets us use the stock `[AI] CreditReserve=100` floor
+    /// instead of the earlier hardcoded 1000. NOTE (M7.15 audit): the throttle is
+    /// *fidelity*, not load-bearing for decisiveness — the M7.15 audit disabled it
+    /// (repair every pass at CreditReserve=100) and no starvation deadlock returned
+    /// on the current M7.10/M7.11-tuned economy, so the earlier "prevents a deadlock"
+    /// justification is unsubstantiated by the suite; kept purely for faithfulness.
+    /// `0` (armed) until the first repair fires. Folded into the hash only when
+    /// non-zero (like the other AI decision state).
     repair_timer: u32,
 }
 

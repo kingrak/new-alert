@@ -1522,12 +1522,17 @@ faithfully (ai.rs `economic_reflexes`):
   are now wrapped in `IQ >= Rule.IQRepairSell` (building.cpp:5829), matching the
   reference — a house below the threshold does neither.
 
-**Decisiveness confirmed.** The throttle is what makes the real `CreditReserve=100`
-safe (without it, repairing every pass drains a symmetric Normal game to the floor
-and starves production — the deadlock the `1000` band-aid papered over). Verified
-`ui_ai_vs_ai` stays decisive at **every** difficulty on **both** scenarios (scg05ea
-Hard 4 997 t / Normal 22 602 t / Easy 31 632 t; scm01ea Hard 19 757 t) and
-Hard-beats-Easy still holds start-independently. No starvation deadlock returned.
+**Decisiveness confirmed; the throttle is fidelity, not the cause.** `ui_ai_vs_ai`
+stays decisive at **every** difficulty on **both** scenarios (scg05ea Hard 4 997 t /
+Normal 22 602 t / Easy 31 632 t; scm01ea Hard 19 757 t) and Hard-beats-Easy holds
+start-independently. **Correction (M7.15 audit):** an earlier draft of this note
+claimed the throttle "makes CreditReserve=100 safe / papers a deadlock the 1000
+band-aid hid." The audit disabled the throttle (repair every pass at
+CreditReserve=100) and **no starvation deadlock returned** — repair count moved
+127→130 and the game stayed decisive (tick 22 571 vs 22 602). So the throttle is a
+faithful port of the original's repair pacing, but it is **not** load-bearing for
+decisiveness on the current M7.10/M7.11-tuned economy; the "prevents a deadlock"
+justification is withdrawn as unsubstantiated.
 
 ### P2 — combat reflexes (activate the dead IQ scatter arm)
 
