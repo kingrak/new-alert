@@ -175,6 +175,10 @@ struct DragBox {
 /// rate). Purely presentation; never touches the sim clock.
 const FX_FRAME_MS: u64 = 55;
 
+/// Blink period (ms) of the repairing-building wrench overlay and its cursor.
+/// Purely presentation (the original toggles `IsWrenchVisible` per repair step).
+const WRENCH_BLINK_MS: u64 = 180;
+
 /// A client-side cosmetic animation instance (DESIGN.md §4.2: the cosmetic layer
 /// is derived from sim state and driven by a *virtual* clock, never feeding back
 /// into the sim). Spawned by diffing sim state across a tick (a vanished unit /
@@ -189,6 +193,21 @@ struct Effect {
     start_ms: u64,
 }
 
+/// Pre-tick snapshot of one building, used by `step_tick` to diff sim state and
+/// spawn the right cosmetic feedback (explosion vs. sell-deconstruct, repair
+/// cue) after the tick. Purely presentation — never written back to the sim.
+#[derive(Clone, Copy, Debug)]
+struct PrevBuilding {
+    handle: Handle,
+    /// Footprint-centre coord (explosion anchor).
+    center: WorldCoord,
+    /// Top-left coord (buildup/deconstruct anchor, like the building sprite).
+    top_left: WorldCoord,
+    type_id: u32,
+    house: u8,
+    is_repairing: bool,
+}
+
 /// Which animation an [`Effect`] plays.
 #[derive(Clone, Copy, Debug)]
 enum EffectKind {
@@ -196,6 +215,12 @@ enum EffectKind {
     Explosion,
     /// A structure's construction buildup, keyed by building type id.
     Buildup(u32),
+    /// A structure's **de**construction — the same `<NAME>MAKE.SHP` buildup art
+    /// played in *reverse*, keyed by building type id. This is the original's
+    /// sell-back visual (`Mission_Deconstruction` → `Begin_Mode(BSTATE_CONSTRUCTION)`
+    /// which reverses the shape sequence, `building.cpp:602-606`). Falls back to
+    /// the shared explosion when the building has no MAKE art.
+    Deconstruct(u32),
 }
 
 /// A logical sound cue the UI wants played (DESIGN.md §4.2: cosmetic, derived
@@ -218,6 +243,42 @@ pub enum SoundEvent {
     Victory,
     /// The player lost the skirmish.
     Defeat,
+    /// A building was sold — the cash-register "sell back" SFX
+    /// (`VOC_CASHTURN`, `building.cpp:3840` `Mission_Deconstruction`).
+    Sell,
+    /// EVA "Structure sold" voice line, played once when a **player**-owned
+    /// building finishes selling (`VOX_STRUCTURE_SOLD`, `building.cpp:3972`).
+    StructureSold,
+    /// Repair toggled **on** for an own building — the repair/click SFX
+    /// (`VOC_CLICK`, `BuildingClass::Repair` → `Sound_Effect(soundid)`,
+    /// `building.cpp:2770`). RA plays no EVA line for building self-repair
+    /// (`VOX_REPAIRING` is the service-depot path only, `building.cpp:4313`).
+    Repair,
+}
+
+/// The logical mouse-cursor the UI wants shown, derived from the armed action
+/// mode and the object under the pointer (DESIGN.md §4.2: cosmetic, never fed
+/// back into the sim). The shell (or `compose_game`) maps each to a cursor
+/// glyph. Mirrors the original's `MouseType` states for the sidebar cursor
+/// (`mouse.cpp:346` `MouseControl`): the sell/repair cursors and their
+/// "prohibited" variants.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CursorKind {
+    /// Default pointer (no action mode armed, or over the sidebar/UI).
+    /// `MOUSE_NORMAL` (MOUSE.SHP frame 0).
+    Normal,
+    /// Sell mode, hovering a sellable own building — the "$"/dollar cursor.
+    /// `MOUSE_SELL_BACK` (MOUSE.SHP frames 68..79, `mouse.cpp:358`).
+    Sell,
+    /// Sell mode, but not over a sellable own building — the prohibited "$".
+    /// `MOUSE_NO_SELL_BACK` (MOUSE.SHP frame 119, `mouse.cpp:362`).
+    NoSell,
+    /// Repair mode, hovering a repairable own building — the wrench cursor.
+    /// `MOUSE_REPAIR` (MOUSE.SHP frames 35..58, `mouse.cpp:360`).
+    Repair,
+    /// Repair mode, but not over a repairable own building — the prohibited
+    /// wrench. `MOUSE_NO_REPAIR` (MOUSE.SHP frame 120, `mouse.cpp:361`).
+    NoRepair,
 }
 
 /// The windowless client core: terrain raster + camera + the sim view.
@@ -351,7 +412,16 @@ pub struct AppCore {
     /// Original REPAIR button art (`REPAIR.SHP` from hires.mix), same frame
     /// convention. `None` = text fallback ("REP").
     repair_button_art: Option<UnitSprite>,
+    /// Selection-overlay art (`SELECT.SHP` from conquer.mix). Frame 2 is
+    /// `SELECT_WRENCH` (`defines.h:2525`), the pulsing wrench drawn over a
+    /// repairing building (`building.cpp:520`) and reused as the repair-mode
+    /// cursor glyph. `None` = a synthetic wrench primitive is drawn instead.
+    wrench_art: Option<UnitSprite>,
 }
+
+/// Frame index of the wrench in `SELECT.SHP` (`SELECT_WRENCH`, `defines.h:2525`:
+/// `SELECT_INFANTRY=0, SELECT_UNIT=1, SELECT_WRENCH=2`).
+const SELECT_WRENCH_FRAME: usize = 2;
 
 impl AppCore {
     /// Build a terrain-only core (no units), exactly as M2. Camera starts at the
@@ -425,6 +495,7 @@ impl AppCore {
             repair_mode: false,
             sell_button_art: None,
             repair_button_art: None,
+            wrench_art: None,
         }
     }
 
@@ -469,6 +540,15 @@ impl AppCore {
         self.repair_button_art = repair;
     }
 
+    /// Install the selection-overlay art (`SELECT.SHP`, conquer.mix). Frame
+    /// [`SELECT_WRENCH_FRAME`] is drawn (pulsing) over a repairing building and
+    /// reused as the repair-mode cursor glyph. Optional — a synthetic wrench
+    /// primitive is drawn when this is absent, so no-asset paths still show the
+    /// repair indicator/cursor.
+    pub fn set_indicator_art(&mut self, wrench: Option<UnitSprite>) {
+        self.wrench_art = wrench;
+    }
+
     /// Turn the radar minimap panel on (drawn at the top of the sidebar strip).
     pub fn enable_radar(&mut self) {
         self.radar_enabled = true;
@@ -484,6 +564,36 @@ impl AppCore {
     /// Whether repair mode is armed.
     pub fn repair_mode(&self) -> bool {
         self.repair_mode
+    }
+
+    /// The logical cursor the UI should show right now (the sell/repair-mode
+    /// cursor and its prohibited variants, or the default pointer). Derived
+    /// purely from the armed mode plus what sits under the pointer — the *same*
+    /// own-building gate that decides whether a click would act
+    /// ([`Self::own_building_at_map`]), so the cursor can never imply an illegal
+    /// action. Over the sidebar/UI or with no mode armed it is
+    /// [`CursorKind::Normal`]. This is the shell-facing accessor the shell maps
+    /// to a cursor shape (and that `compose_game` draws), pinned by tests.
+    pub fn cursor_kind(&self) -> CursorKind {
+        if !self.sell_mode && !self.repair_mode {
+            return CursorKind::Normal;
+        }
+        // Over the sidebar strip or off-screen: the mode cursor reverts to the
+        // default pointer (the original shows the sidebar/normal cursor there).
+        let tw = self.tactical_width() as i32;
+        if !self.mouse_inside || self.mouse_x < 0 || self.mouse_x >= tw {
+            return CursorKind::Normal;
+        }
+        let over_own = self.player_house.is_some_and(|house| {
+            let (mx, my) = self.viewport_to_map(self.mouse_x, self.mouse_y);
+            self.own_building_at_map(mx, my, house).is_some()
+        });
+        match (self.sell_mode, over_own) {
+            (true, true) => CursorKind::Sell,
+            (true, false) => CursorKind::NoSell,
+            (false, true) => CursorKind::Repair,
+            (false, false) => CursorKind::NoRepair,
+        }
     }
 
     /// Arm/disarm sell mode. Arming it clears repair mode and any active
@@ -720,6 +830,13 @@ impl AppCore {
         })
     }
 
+    /// Number of live cosmetic effects (explosions / buildups / deconstructs).
+    /// Debug/observation seam so tests can confirm a visual effect spawned (e.g.
+    /// the sell-back deconstruct anim) without reaching into private state.
+    pub fn cosmetic_effect_count(&self) -> usize {
+        self.effects.len()
+    }
+
     /// Full map width in pixels.
     pub fn map_width(&self) -> u32 {
         self.raster.width
@@ -894,7 +1011,7 @@ impl AppCore {
         self.effects.retain(|e| {
             let frames = match e.kind {
                 EffectKind::Explosion => expl_frames,
-                EffectKind::Buildup(id) => buildups
+                EffectKind::Buildup(id) | EffectKind::Deconstruct(id) => buildups
                     .get(id as usize)
                     .and_then(|o| o.as_ref())
                     .map(|s| s.frames.len() as u64)
@@ -950,16 +1067,34 @@ impl AppCore {
             self.prev_coords.insert(h.index, u.coord);
             prev_units.push((h, u.coord));
         }
-        // Pre-tick building snapshot: handle + centre coord + top-left cell.
-        let prev_buildings: Vec<(Handle, WorldCoord, WorldCoord)> = self
+        // Pre-tick building snapshot: handle + centre coord + top-left cell +
+        // type/house/repair state (for the sell-back and repair feedback below).
+        let prev_buildings: Vec<PrevBuilding> = self
             .world
             .buildings
             .iter()
-            .map(|(h, b)| (h, b.center_cell().center(), b.cell.center()))
+            .map(|(h, b)| PrevBuilding {
+                handle: h,
+                center: b.center_cell().center(),
+                top_left: b.cell.center(),
+                type_id: b.type_id,
+                house: b.house,
+                is_repairing: b.is_repairing,
+            })
             .collect();
         let prev_bullets: Vec<Handle> = self.world.bullets.iter().map(|(h, _)| h).collect();
 
         let cmds = std::mem::take(&mut self.pending);
+        // Buildings the player asked to sell this tick: a building that vanishes
+        // and was a Sell target deconstructs (reverse buildup + cash SFX) rather
+        // than exploding like a combat death.
+        let sold: Vec<Handle> = cmds
+            .iter()
+            .filter_map(|c| match c {
+                Command::Sell { building, .. } => Some(*building),
+                _ => None,
+            })
+            .collect();
         self.world.tick(&cmds);
 
         // New projectiles → a fire cue (covers visible cannon shots; hitscan
@@ -973,6 +1108,8 @@ impl AppCore {
             self.push_sound(SoundEvent::Fire);
         }
 
+        let player = self.player_house;
+
         // Deaths → explosions (visual + audio).
         let mut any_death = false;
         for (h, coord) in prev_units {
@@ -981,24 +1118,63 @@ impl AppCore {
                 any_death = true;
             }
         }
-        for (h, center, _tl) in &prev_buildings {
-            if !self.world.buildings.contains(*h) {
-                self.spawn_effect(EffectKind::Explosion, *center);
+        // Buildings that vanished this tick: a *sold* one deconstructs (reverse
+        // buildup + cash-register SFX + EVA "Structure sold" for the player); any
+        // other loss is a combat death → explosion. Faithful to the split between
+        // `Mission_Deconstruction` (building.cpp:3722) and combat destruction.
+        let mut any_sold = false;
+        for pb in &prev_buildings {
+            if self.world.buildings.contains(pb.handle) {
+                continue;
+            }
+            if sold.contains(&pb.handle) {
+                // Reverse-buildup deconstruct at the building's top-left; falls
+                // back to a plain explosion (centre-anchored) if the type has no
+                // MAKE art, so a sale is never fully invisible.
+                if self.effect_frame_count(EffectKind::Deconstruct(pb.type_id)) > 0 {
+                    self.spawn_effect(EffectKind::Deconstruct(pb.type_id), pb.top_left);
+                } else {
+                    self.spawn_effect(EffectKind::Explosion, pb.center);
+                }
+                any_sold = true;
+                if Some(pb.house) == player {
+                    self.push_sound(SoundEvent::StructureSold);
+                }
+            } else {
+                self.spawn_effect(EffectKind::Explosion, pb.center);
                 any_death = true;
             }
         }
         if any_death {
             self.push_sound(SoundEvent::Explosion);
         }
+        if any_sold {
+            self.push_sound(SoundEvent::Sell);
+        }
+
+        // Repair toggled **on** for an own building this tick → the repair SFX
+        // (`VOC_CLICK`, building.cpp:2770). Detected as a false→true transition
+        // of `is_repairing` on a still-live building the player owns.
+        let repair_started = prev_buildings.iter().any(|pb| {
+            !pb.is_repairing
+                && Some(pb.house) == player
+                && self
+                    .world
+                    .buildings
+                    .get(pb.handle)
+                    .is_some_and(|b| b.is_repairing)
+        });
+        if repair_started {
+            self.push_sound(SoundEvent::Repair);
+        }
 
         // New buildings → construction buildup (anchored at the building
         // top-left); a new *player* building also plays the EVA cue.
-        let player = self.player_house;
         let fresh: Vec<(u32, WorldCoord, u8)> = self
             .world
             .buildings
             .iter()
-            .filter(|(h, _)| !prev_buildings.iter().any(|(ph, _, _)| ph == h))
+            .filter(|(h, _)| !prev_buildings.iter().any(|pb| pb.handle == *h))
             .map(|(_, b)| (b.type_id, b.cell.center(), b.house))
             .collect();
         let mut player_built = false;
@@ -1042,7 +1218,7 @@ impl AppCore {
                 .first()
                 .map(|s| s.frames.len() as u32)
                 .unwrap_or(0),
-            EffectKind::Buildup(id) => self
+            EffectKind::Buildup(id) | EffectKind::Deconstruct(id) => self
                 .buildup_sprites
                 .get(id as usize)
                 .and_then(|o| o.as_ref())
@@ -1188,6 +1364,8 @@ impl AppCore {
         self.draw_placement_preview(&mut frame, cam, tw);
         // Sell/repair-mode hover tint over the own building under the cursor.
         self.draw_action_hover(&mut frame, cam, tw);
+        // Pulsing wrench over every building currently repairing (own or not).
+        self.draw_repair_indicators(&mut frame, cam);
         if let Some(d) = &self.drag {
             draw_rect_outline(
                 &mut frame, d.start.0, d.start.1, d.cur.0, d.cur.1, SELECT_RGB,
@@ -1196,6 +1374,10 @@ impl AppCore {
         self.draw_sidebar(&mut frame);
         self.draw_game_over(&mut frame);
         self.draw_help_overlay(&mut frame);
+        // Sell/repair mode reminders, drawn topmost: a mode banner near the top
+        // of the tactical area and the mode cursor glyph at the pointer.
+        self.draw_mode_banner(&mut frame);
+        self.draw_mode_cursor(&mut frame);
         frame
     }
 
@@ -2350,7 +2532,7 @@ impl AppCore {
             let fi = (elapsed / FX_FRAME_MS) as usize;
             let (sprite, centered) = match e.kind {
                 EffectKind::Explosion => (self.explosion_sprite.first(), true),
-                EffectKind::Buildup(id) => (
+                EffectKind::Buildup(id) | EffectKind::Deconstruct(id) => (
                     self.buildup_sprites
                         .get(id as usize)
                         .and_then(|o| o.as_ref()),
@@ -2358,6 +2540,12 @@ impl AppCore {
                 ),
             };
             let Some(sprite) = sprite else { continue };
+            // Deconstruct plays the buildup band in *reverse* (the original's
+            // BSTATE_CONSTRUCTION reverse sequence, building.cpp:602-606).
+            let fi = match e.kind {
+                EffectKind::Deconstruct(_) => sprite.frames.len().saturating_sub(1 + fi),
+                _ => fi,
+            };
             let Some(sframe) = sprite.frames.get(fi) else {
                 continue;
             };
@@ -2503,6 +2691,136 @@ impl AppCore {
                 110,
             );
         }
+    }
+
+    /// Pulsing wrench over every building currently repairing — the original's
+    /// `IsRepairing && IsWrenchVisible` overlay (`building.cpp:520`,
+    /// `CC_Draw_Shape(SelectShapes, SELECT_WRENCH, ...)`). The wrench blinks (the
+    /// original toggles `IsWrenchVisible` each repair step); we blink it on the
+    /// cosmetic clock so it draws without any sim coupling.
+    fn draw_repair_indicators(&self, frame: &mut RgbaImage, cam: Rect) {
+        // Blink: on for two of every three ~180ms phases (a clear pulse).
+        if (self.anim_ms / WRENCH_BLINK_MS) % 3 == 2 {
+            return;
+        }
+        let tw = self.tactical_width() as i32;
+        for (_h, b) in self.world.buildings.iter() {
+            if !b.is_repairing || !b.is_alive() {
+                continue;
+            }
+            let cx = ((b.cell.x * CELL_PIXELS + b.foot_w as i32 * CELL_PIXELS / 2) as i64 - cam.x)
+                as i32;
+            let cy = ((b.cell.y * CELL_PIXELS + b.foot_h as i32 * CELL_PIXELS / 2) as i64 - cam.y)
+                as i32;
+            if cx < 0 || cx >= tw {
+                continue;
+            }
+            self.draw_wrench(frame, cx, cy);
+        }
+    }
+
+    /// Draw the wrench glyph centred at `(cx, cy)`: the real `SELECT.SHP`
+    /// wrench frame when installed, else a synthetic spanner primitive.
+    fn draw_wrench(&self, frame: &mut RgbaImage, cx: i32, cy: i32) {
+        if let Some(w) = self
+            .wrench_art
+            .as_ref()
+            .and_then(|s| s.frames.get(SELECT_WRENCH_FRAME))
+        {
+            draw_sprite_centered(frame, cx, cy, w, &identity_remap(), &self.palette);
+            return;
+        }
+        // Synthetic spanner: a light diagonal shaft with a blob at each end,
+        // dark-outlined for legibility over any background.
+        let outline = [20, 20, 24];
+        let steel = [210, 215, 225];
+        draw_line(frame, cx - 6, cy + 6, cx + 6, cy - 6, outline);
+        draw_line(frame, cx - 5, cy + 6, cx + 7, cy - 6, steel);
+        for (ex, ey) in [(cx - 6, cy + 6), (cx + 6, cy - 6)] {
+            fill_rect(frame, ex - 2, ey - 2, ex + 2, ey + 2, outline);
+            fill_rect(frame, ex - 1, ey - 1, ex + 1, ey + 1, steel);
+        }
+    }
+
+    /// Draw the "SELL MODE" / "REPAIR MODE" reminder banner near the top of the
+    /// tactical area while a mode is armed. The explicit state reminder the
+    /// player asked for (the cursor is the primary signal); nothing draws when no
+    /// mode is armed, so no existing frame is affected.
+    fn draw_mode_banner(&self, frame: &mut RgbaImage) {
+        let (text, rgb) = if self.sell_mode {
+            ("SELL MODE", [235, 80, 70])
+        } else if self.repair_mode {
+            ("REPAIR MODE", [80, 205, 95])
+        } else {
+            return;
+        };
+        let scale = 2;
+        let tw = self.tactical_width() as i32;
+        let pad = 4;
+        let text_w = font::text_width(text) * scale;
+        let text_h = font::GLYPH_H * scale;
+        let bx = ((tw - text_w) / 2 - pad).max(0);
+        let by = 6;
+        fill_rect(
+            frame,
+            bx,
+            by,
+            bx + text_w + pad * 2,
+            by + text_h + pad * 2,
+            [14, 14, 18],
+        );
+        draw_rect_outline(
+            frame,
+            bx,
+            by,
+            bx + text_w + pad * 2,
+            by + text_h + pad * 2,
+            rgb,
+        );
+        font::draw_text_scaled(frame, bx + pad, by + pad, text, rgb, scale);
+    }
+
+    /// Draw the mode cursor glyph at the pointer — the primary sell/repair-mode
+    /// signal. Sell shows a gold "$" (`MOUSE_SELL_BACK`), repair shows the wrench
+    /// (`MOUSE_REPAIR`); the "no" variants overlay a red prohibition slash when
+    /// the pointer is not over a valid own building. Nothing draws when no mode is
+    /// armed (`CursorKind::Normal`), so existing frames are untouched.
+    ///
+    /// **Deviation (documented):** the original's cursor art lives in `MOUSE.SHP`,
+    /// a legacy variable-size shape container our `SHP` decoder does not read
+    /// (each frame carries its own dimensions; no global width/height). The frame
+    /// indices are cited on [`CursorKind`]. We render a faithful stand-in: the
+    /// real `SELECT.SHP` wrench for repair and a bitmap-font "$" for sell.
+    fn draw_mode_cursor(&self, frame: &mut RgbaImage) {
+        let kind = self.cursor_kind();
+        let (cx, cy) = (self.mouse_x, self.mouse_y);
+        match kind {
+            CursorKind::Normal => {}
+            CursorKind::Sell | CursorKind::NoSell => {
+                self.draw_glyph_cursor(frame, cx, cy, "$", [245, 210, 70]);
+                if kind == CursorKind::NoSell {
+                    draw_prohibit(frame, cx, cy);
+                }
+            }
+            CursorKind::Repair | CursorKind::NoRepair => {
+                self.draw_wrench(frame, cx, cy);
+                if kind == CursorKind::NoRepair {
+                    draw_prohibit(frame, cx, cy);
+                }
+            }
+        }
+    }
+
+    /// Draw a scale-2 bitmap-font glyph centred at `(cx, cy)` with a dark
+    /// outline, so it reads as a cursor over any background.
+    fn draw_glyph_cursor(&self, frame: &mut RgbaImage, cx: i32, cy: i32, text: &str, rgb: [u8; 3]) {
+        let scale = 2;
+        let x = cx - font::text_width(text) * scale / 2;
+        let y = cy - font::GLYPH_H * scale / 2;
+        for (dx, dy) in [(-1, 0), (1, 0), (0, -1), (0, 1)] {
+            font::draw_text_scaled(frame, x + dx, y + dy, text, [12, 12, 14], scale);
+        }
+        font::draw_text_scaled(frame, x, y, text, rgb, scale);
     }
 
     /// Draw the build sidebar: credits + power header, then buildable rows with
@@ -2868,6 +3186,17 @@ fn offset_pixels(x: i32, y: i32, dir: Facing, dist: i32) -> (i32, i32) {
 }
 
 /// Draw a bright line between two pixel points (Bresenham), clipped to `dst`.
+/// Draw a red "prohibited" mark centred at `(cx, cy)` — a ring outline plus a
+/// diagonal slash — over a cursor glyph to signal an invalid target (the
+/// original's `MOUSE_NO_SELL_BACK` / `MOUSE_NO_REPAIR` cursors).
+fn draw_prohibit(dst: &mut RgbaImage, cx: i32, cy: i32) {
+    const R: i32 = 9;
+    const RED: [u8; 3] = [235, 45, 45];
+    draw_rect_outline(dst, cx - R, cy - R, cx + R, cy + R, RED);
+    draw_line(dst, cx - R, cy - R, cx + R, cy + R, RED);
+    draw_line(dst, cx - R, cy - R + 1, cx + R - 1, cy + R, RED);
+}
+
 fn draw_line(dst: &mut RgbaImage, x0: i32, y0: i32, x1: i32, y1: i32, rgb: [u8; 3]) {
     let dx = (x1 - x0).abs();
     let dy = -(y1 - y0).abs();

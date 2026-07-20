@@ -1585,7 +1585,7 @@ pub fn load_sound_bank(dir: &Path) -> Vec<(SoundEvent, Vec<u8>)> {
     // (event, source mix, AUD name). Weapon/UI SFX live in sounds.mix; EVA voice
     // lines in speech.mix. Names verified present in the shipped archives; any
     // that are absent (e.g. a mission-failed line) are skipped.
-    let spec: [(SoundEvent, Option<&MixArchive>, &str); 7] = [
+    let spec: [(SoundEvent, Option<&MixArchive>, &str); 10] = [
         (SoundEvent::Fire, sounds.as_ref(), "CANNON1.AUD"),
         (SoundEvent::Explosion, sounds.as_ref(), "KABOOM1.AUD"),
         (SoundEvent::Select, sounds.as_ref(), "RABEEP1.AUD"),
@@ -1597,6 +1597,12 @@ pub fn load_sound_bank(dir: &Path) -> Vec<(SoundEvent, Vec<u8>)> {
         (SoundEvent::LowPower, speech.as_ref(), "NOPOWR1.AUD"),
         (SoundEvent::Victory, speech.as_ref(), "MISNWON1.AUD"),
         (SoundEvent::Defeat, speech.as_ref(), "MISNLST1.AUD"),
+        // Sell/repair feedback (M7.9 art pass). The sell "cash turn" SFX and the
+        // EVA "Structure sold" line (`building.cpp:3840`/`:3972`); repair-toggle
+        // uses the generic click (`VOC_CLICK` = RAMENU1, `building.cpp:2770`).
+        (SoundEvent::Sell, sounds.as_ref(), "CASHTURN.AUD"),
+        (SoundEvent::StructureSold, speech.as_ref(), "STRUSLD1.AUD"),
+        (SoundEvent::Repair, sounds.as_ref(), "RAMENU1.AUD"),
     ];
     let mut out = Vec::new();
     for (ev, mix, name) in spec {
@@ -1667,6 +1673,10 @@ fn install_cosmetic_art(
         .map(|b| load_shp_opt(conquer, &format!("{}MAKE.SHP", b.name.to_ascii_uppercase())))
         .collect();
     core.set_effect_art(explosion, buildups);
+    // Selection overlay art (`SELECT.SHP`, conquer.mix) — frame 2 is the wrench
+    // drawn over a repairing building and used as the repair-mode cursor
+    // (`object.cpp:2334`, `building.cpp:520`). Optional (synthetic fallback).
+    core.set_indicator_art(load_shp_opt(conquer, "SELECT.SHP"));
     // Sidebar cameos (<NAME>ICON.SHP from hires.mix), parallel to `buildables`.
     if let Some(h) = hires {
         let cameos: Vec<Option<UnitSprite>> = buildables

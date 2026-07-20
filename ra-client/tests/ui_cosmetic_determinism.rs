@@ -210,3 +210,84 @@ fn combat_heavy_script_cosmetic_layer_on_vs_off_yields_identical_sim_hashes() {
         "sanity: this script should have killed the unarmed target (explosion cue)"
     );
 }
+
+/// Sell/repair effects (deconstruct anim + cash/EVA/repair cues + mode cursor +
+/// wrench overlay + banner) are cosmetic: firing them must not perturb the sim
+/// hash chain. Both cores issue the **same** sim commands (Sell/Repair are real
+/// sim input); only the "on" core composes/drains the cosmetic layer.
+#[test]
+fn sell_repair_cosmetic_layer_on_vs_off_yields_identical_sim_hashes() {
+    use ra_client::input::InputEvent;
+    use ra_client::unit_render::{SpriteFrame, UnitSprite};
+    use ra_sim::coords::CellCoord;
+
+    let build = || {
+        let (mut world, _mcv) = support::synthetic_world_with_econ(0x5E11_D077, 6000);
+        let a = world
+            .spawn_building(support::ECON_B_PROC, 1, CellCoord::new(2, 2))
+            .unwrap();
+        let b = world
+            .spawn_building(support::ECON_B_PROC, 1, CellCoord::new(10, 2))
+            .unwrap();
+        // Damage the second so repair has work; the first will be sold.
+        let max = world.buildings.get(b).unwrap().max_health;
+        world.buildings.get_mut(b).unwrap().health = max / 2;
+        let (raster, palette) = support::synthetic_fixture();
+        let mut core = AppCore::with_sim(raster.clone(), *palette, world, Vec::new(), Vec::new());
+        core.enable_sidebar(1, support::econ_buildables());
+        core.handle(InputEvent::Resize {
+            width: 640,
+            height: 400,
+        });
+        core.set_camera(0.0, 0.0);
+        (core, a, b)
+    };
+    let (mut on, on_sell, on_rep) = build();
+    let (mut off, off_sell, off_rep) = build();
+    // "on": real (fake) buildup art so the deconstruct effect actually spawns.
+    let mut buildups: Vec<Option<UnitSprite>> = vec![None; (support::ECON_B_PROC + 1) as usize];
+    buildups[support::ECON_B_PROC as usize] = Some(UnitSprite {
+        frames: (0..5)
+            .map(|_| SpriteFrame {
+                width: 24,
+                height: 24,
+                pixels: vec![9u8; 24 * 24],
+            })
+            .collect(),
+    });
+    on.set_effect_art(vec![fake_explosion_sprite()], buildups);
+
+    // Identical command scripts on both cores (Repair the damaged PROC, then
+    // Sell the other) — Sell/Repair are real sim input, applied to both.
+    for (core, sell, rep) in [(&mut on, on_sell, on_rep), (&mut off, off_sell, off_rep)] {
+        core.inject_command(ra_sim::Command::Repair {
+            house: 1,
+            building: rep,
+        });
+        core.update(support::TICK_MS);
+        core.inject_command(ra_sim::Command::Sell {
+            house: 1,
+            building: sell,
+        });
+    }
+
+    let mut h_on = Vec::new();
+    let mut h_off = Vec::new();
+    for _ in 0..120 {
+        on.update(support::TICK_MS);
+        let _ = on.compose_game();
+        let _ = on.drain_sounds();
+        h_on.push(on.sim_hash());
+
+        off.update(support::TICK_MS);
+        h_off.push(off.sim_hash());
+    }
+    assert_eq!(
+        h_on, h_off,
+        "sell/repair cosmetic effects perturbed the sim hash chain"
+    );
+    assert!(
+        h_on.windows(2).any(|w| w[0] != w[1]),
+        "sim never advanced — determinism check was vacuous"
+    );
+}

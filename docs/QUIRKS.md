@@ -1588,3 +1588,98 @@ justification is withdrawn as unsubstantiated.
   non-zero — so no real game / pre-follow-up AI golden changed. The repair-throttle
   RNG draw only fires when an AI actually repairs (and at MaxIQ ≥ IQRepairSell); the
   synthetic AI suites don't damage buildings in their windows, so they stayed green.
+
+---
+
+## Q23 — Sell/repair mode cursors + reminder banner, sell/repair effects (sound + visual)
+
+**Milestone:** live-playtest polish (P0 cursors + state reminder, P1 sell effect,
+P2 repair effect). All client-side and **sim-inert** — same input script with
+effects on vs. off yields identical sim hash chains (`ui_cosmetic_determinism::
+sell_repair_cosmetic_layer_on_vs_off_yields_identical_sim_hashes`).
+
+### P0 — mode cursors + reminder banner
+
+**Cursor frames (cited).** The original's sidebar cursor states are in the
+`MouseControl` table (`mouse.cpp:346`, `{StartFrame, Count, Rate, Small, HotX,
+HotY}`), keyed by `MouseType` (`defines.h:2578`):
+- `MOUSE_SELL_BACK` → MOUSE.SHP frame **68** (12-frame animated `$`), `mouse.cpp:358`.
+- `MOUSE_REPAIR` → frame **35** (24-frame animated wrench), `mouse.cpp:360`.
+- `MOUSE_NO_SELL_BACK` → frame **119** (`mouse.cpp:362`).
+- `MOUSE_NO_REPAIR` → frame **120** (`mouse.cpp:361`).
+- `MOUSE_NORMAL` → frame **0**.
+
+`AppCore::cursor_kind()` (a new [`CursorKind`] accessor) maps the armed mode +
+the object under the pointer to `Sell`/`NoSell`/`Repair`/`NoRepair`/`Normal`,
+using the *same* own-alive-non-wall gate (`own_building_at_map`) that decides
+whether a click acts — so the cursor never implies an illegal action, and reverts
+to `Normal` over the sidebar. `compose_game` draws the cursor glyph at the pointer
+(topmost) and a "SELL MODE"/"REPAIR MODE" reminder banner near the top of the
+tactical area; the windowed shell hides the OS cursor while a mode is armed
+(`show_mouse(false)`) so our glyph is the sole pointer. All pinned in
+`ui_sell_repair_effects::cursor_kind_tracks_mode_and_hover_target`.
+
+> **Deviation (documented): MOUSE.SHP is not decoded.** `MOUSE.SHP` (hires.mix /
+> lores.mix) is a **legacy variable-size shape container** — a `u16 count` then a
+> `u32` offset table, each frame carrying its own dimensions, with no global
+> width/height — which our RA-format `SHP` decoder (`ra-formats/src/shp.rs`, header
+> `count@0, width@6, height@8`) cannot read (it resolves width `0x03f1`, height `0`
+> → "zero dimension"). Writing a decoder for that container was out of scope for a
+> polish pass, so we render a **faithful stand-in**: the repair cursor and the
+> repairing-building overlay both use the real `SELECT.SHP` wrench (frame 2,
+> `SELECT_WRENCH`, decodes cleanly — it is a normal RA SHP), and the sell cursor is
+> a gold bitmap-font "$". The "no" variants overlay a red prohibition slash. The
+> frame indices above are cited so a future MOUSE.SHP-container decoder can swap in
+> the exact art with no interface change (the `CursorKind` seam already carries the
+> logical state).
+
+### P1 — sell effect (sound + visual)
+
+Faithful to `BuildingClass::Mission_Deconstruction` (`building.cpp:3722`). A
+building removed by `Command::Sell` this tick is detected in `step_tick` (the tick's
+`Command::Sell` targets that vanished) and given **sell-back** feedback instead of a
+combat explosion:
+- **Visual — reverse buildup.** `EffectKind::Deconstruct(type_id)` plays the
+  building's `<NAME>MAKE.SHP` buildup band in *reverse* (the original's
+  `Begin_Mode(BSTATE_CONSTRUCTION)` reversal, `building.cpp:602-606`), anchored at
+  the top-left. Falls back to the shared explosion when a type has no MAKE art, so a
+  sale is never fully invisible.
+- **Sound.** `SoundEvent::Sell` → `CASHTURN.AUD` (the cash-turn SFX, `VOC_CASHTURN`,
+  `building.cpp:3840`) and, for a **player**-owned sale, `SoundEvent::StructureSold`
+  → `STRUSLD1.AUD` (EVA "Structure sold", `VOX_STRUCTURE_SOLD`, `building.cpp:3972`).
+  A sale deliberately does **not** queue the combat-death `Explosion` cue.
+
+Pinned: `ui_sell_repair_effects::selling_queues_cash_and_eva_and_spawns_deconstruct`.
+
+### P2 — repair effect (sound + visual)
+
+- **Sound.** Toggling repair **on** (a false→true `is_repairing` transition on a
+  player building) queues `SoundEvent::Repair` → `RAMENU1.AUD`. This is the
+  original's building self-repair toggle sound: `BuildingClass::Repair` plays
+  `VOC_CLICK` (= RAMENU1, `building.cpp:2770`). **RA plays no EVA for building
+  self-repair** — `VOX_REPAIRING` (`building.cpp:4313`) is the service-depot
+  (`FIX`) unit-repair path only, so we do not queue one (faithful).
+- **Visual — pulsing wrench.** `compose_game` draws the real `SELECT.SHP` wrench
+  (frame 2, `SELECT_WRENCH`) centred over every building with `is_repairing == true`,
+  blinking on the cosmetic clock — the original's `IsRepairing && IsWrenchVisible`
+  overlay (`building.cpp:520`, `CC_Draw_Shape(SelectShapes, SELECT_WRENCH,…)`; the
+  original toggles `IsWrenchVisible` per repair step). Synthetic spanner primitive
+  when `SELECT.SHP` is absent.
+
+Pinned: `ui_sell_repair_effects::toggling_repair_queues_sfx_and_renders_wrench`.
+
+### Determinism / goldens (re-pin inventory: **ZERO**)
+
+All of the above lives in `ra-client` and only reads sim state (in `step_tick`'s
+post-tick diff and `compose_game`); it never mutates the sim or draws the sim RNG.
+- **No sim change at all** — `ra-sim`, `ra-formats`, `ra-data`, `ra-net` untouched,
+  so every sim/determinism/AI/campaign golden is byte-identical (full suites green).
+- **No `compose_game` golden moved.** The cursor, banner, wrench overlay, and
+  sell/repair effects only render when a mode is armed / a building is repairing /
+  an effect is live — none of which any existing golden fixture sets. Every
+  `ui_shroud_golden`, `ui_menu_golden_frames`, `ui_mode_button_art_suite`, and
+  `ui_golden_frames` frame is unchanged (verified: full `ra-client --no-fail-fast`
+  green, **zero** re-pins). New rendering is exercised only by the new
+  `ui_sell_repair_effects` PNGs/asserts and the extended `ui_cosmetic_determinism`.
+- New `SoundEvent` variants (`Sell`/`StructureSold`/`Repair`) and `EffectKind::
+  Deconstruct` are additive; the audio queue and effect layer stay §4.2-cosmetic.
