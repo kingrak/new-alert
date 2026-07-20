@@ -87,6 +87,38 @@ impl Difficulty {
     }
 }
 
+/// Which base-building/economy *policy* an [`AiPlayer`] runs — a
+/// **test/measurement** knob (M7.14 audit P0), NOT a gameplay setting. `Expert`
+/// (the default) is the current, faithful ratio-driven policy; `Legacy` restores
+/// the exact pre-M7.14 fixed-priority ladder so the two can be raced head-to-head
+/// in an honest A/B ("does the new AI actually beat the old one?"). Real play
+/// **always** uses `Expert` — `Legacy` is only ever installed by the acceptance
+/// harness (`ai_profile` / `ui_ai_vs_ai`'s Expert-vs-Legacy record).
+///
+/// The two policies differ in exactly the M7.14 building/economy delta, and share
+/// **everything else** (Expert_AI enemy scoring, rubber-band caps, composed teams,
+/// economic reflexes, combat, movement) — so a race isolates the value of the
+/// ratio-driven base composition, not incidental differences:
+///
+/// - **`next_structure`** — `Expert` uses the ratio×limit self-limiting composition
+///   ([`AiPlayer::next_structure`], `AI_Building`, house.cpp:5696); `Legacy` uses the
+///   fixed power→refinery→war→barracks→radar→defense→expand ladder
+///   ([`AiPlayer::next_structure_legacy`], the verbatim pre-M7.14 snapshot at
+///   git `9155fce^`).
+/// - **auto-harvester replacement** — `Expert` gates it on `IQ >= IQHarvester`
+///   (M7.14); `Legacy` replaces a lost harvester unconditionally (the pre-M7.14
+///   `refineries > harvesters` test — which the git archaeology shows *did* exist,
+///   a correction to the brief's "Legacy has no replacement": stripping it would
+///   only rig the A/B in Expert's favour, so the faithful snapshot keeps it).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum AiProfile {
+    /// The pre-M7.14 fixed-ladder policy (baseline for the A/B). Never used in real play.
+    Legacy,
+    /// The current faithful ratio-driven policy (the shipping default).
+    #[default]
+    Expert,
+}
+
 /// Expert_AI re-evaluation cadence (`HouseClass::Expert_AI` returns
 /// `TICKS_PER_SECOND * 10`, house.cpp:4877 — "relatively time consuming, call
 /// periodically"). Enemy re-selection and rubber-band caps run on this timer, not
@@ -162,11 +194,15 @@ impl Team {
 /// the rally cell.
 const STAGE_TIMEOUT: u32 = 200;
 
-/// Money floor at/above which the AI may auto-repair a damaged building (the
-/// reference `Rule.RepairThreshhold` compile-time default, rules.cpp:263 = 1000).
-/// See [`AiPlayer::economic_reflexes`] for why the stock `CreditReserve=100`
-/// override is deliberately not used with our simplified repair reflex.
-const REPAIR_THRESHOLD: i32 = 1000;
+/// `RepairDelay` in hundredths (`Rule.Diff[].RepairDelay`, rules.cpp:316 = `.02`
+/// fixed default) — the difficulty handicap that scales the repair-throttle re-arm
+/// window (`RepairTimer`, building.cpp:5842). Kept in integer hundredths so the
+/// re-arm math is deterministic (matching the reference `(int)(fixed × int)`).
+const REPAIR_DELAY_HUNDREDTHS: i32 = 2; // 0.02
+
+/// `TICKS_PER_MINUTE` (defines.h:3122 = `TICKS_PER_SECOND(15) × 60`), used for the
+/// repair-throttle re-arm window.
+const TICKS_PER_MINUTE: i32 = 900;
 
 /// Money floor below which a moneyless AI sells a non-essential building to raise
 /// cash (`Check_Raise_Money` `< 100`, house.cpp:5288, taken as the emergency
@@ -210,6 +246,19 @@ pub struct AiPlayer {
     /// attack urgency (`Check_Attack`/`Attack` counters, house.cpp:5226) — no
     /// single mechanism maps 1:1, so this is documented as tuning.
     failed_attacks: u32,
+    /// Base-building/economy policy (M7.14 audit P0). [`AiProfile::Expert`] (the
+    /// default) is the shipping ratio-driven policy; [`AiProfile::Legacy`] restores
+    /// the pre-M7.14 fixed ladder for the honest A/B. Real play is always Expert.
+    profile: AiProfile,
+    /// Repair-throttle cooldown (M7.14 audit P1 — `HouseClass::RepairTimer`,
+    /// house.h:354). Counts down each tick; the AI may only *begin* a repair when it
+    /// reaches 0, and it re-arms to a random multi-tick delay after each repair
+    /// (`Repair_AI`, building.cpp:5842). This is what makes the faithful stock
+    /// `CreditReserve=100` repair floor safe — without it, repairing every pass
+    /// drains the economy to the floor and starves production (the old hardcoded
+    /// 1000 band-aid). `0` (armed) until the first repair fires. Folded into the
+    /// hash only when non-zero (like the other AI decision state).
+    repair_timer: u32,
 }
 
 /// Cap on the consecutive-failure escalation counter (M7.11 P1a). Once reached,
@@ -244,7 +293,21 @@ impl AiPlayer {
             max_buildings: 0,
             team: None,
             failed_attacks: 0,
+            profile: AiProfile::Expert,
+            repair_timer: 0,
         }
+    }
+
+    /// Set this controller's base-building/economy [`AiProfile`] (M7.14 audit P0).
+    /// Only the acceptance harness calls this with `Legacy`; real play never does.
+    pub fn with_profile(mut self, profile: AiProfile) -> AiPlayer {
+        self.profile = profile;
+        self
+    }
+
+    /// The base-building/economy policy this controller runs.
+    pub fn profile(&self) -> AiProfile {
+        self.profile
     }
 
     pub(crate) fn hash_into(&self, h: &mut Fnv1a) {
@@ -276,6 +339,19 @@ impl AiPlayer {
         if self.failed_attacks != 0 {
             h.write_u8(0xFA);
             h.write_u32(self.failed_attacks);
+        }
+        // Profile is folded in ONLY when it is not the shipping default (Expert),
+        // so every real game / pre-M7.14-audit AI golden (all Expert) appends no
+        // bytes and hashes byte-identically — the flag is pure test infrastructure.
+        if self.profile != AiProfile::Expert {
+            h.write_u8(0x9F);
+            h.write_u8(self.profile as u8);
+        }
+        // Repair throttle timer — folded only when armed (non-zero), so an AI that
+        // has never repaired (and every pre-M7.14-audit golden) is unchanged.
+        if self.repair_timer != 0 {
+            h.write_u8(0x8D);
+            h.write_u32(self.repair_timer);
         }
     }
 
@@ -319,6 +395,9 @@ impl AiPlayer {
         self.decide_timer = self.decide_timer.saturating_sub(1);
         self.attack_timer = self.attack_timer.saturating_sub(1);
         self.expert_timer = self.expert_timer.saturating_sub(1);
+        // Repair-throttle cooldown (`RepairTimer` CDTimerClass counts down each
+        // frame; `DidRepair` is cleared only once it hits 0, house.cpp:1433).
+        self.repair_timer = self.repair_timer.saturating_sub(1);
 
         // 0) Expert_AI pass (M7.10 b+c): re-pick the designated enemy by the
         // weighted score and raise the rubber-band unit cap to match the enemies'
@@ -373,7 +452,7 @@ impl AiPlayer {
         if (self.decide_timer == DECIDE_PERIOD || self.decide_timer == 0)
             && (self.has_construction_yard(world) || self.has_any_building(world))
         {
-            self.economic_reflexes(world, out);
+            self.economic_reflexes(world, rng, out);
         }
 
         // 3) Composed attack teams (M7.10 d): advance the active team's lifecycle
@@ -517,6 +596,10 @@ impl AiPlayer {
     /// (we model no aircraft, and pick the strongest buildable armed building), and
     /// skip Helipad/Airstrip (no aircraft sim). Ratios/limits are 100% rules.ini.
     fn next_structure(&self, world: &World, hs: &House, cat: &Catalog) -> Option<u32> {
+        // A/B baseline (M7.14 audit P0): the pre-M7.14 fixed-priority ladder.
+        if self.profile == AiProfile::Legacy {
+            return self.next_structure_legacy(world, hs, cat);
+        }
         let ai = &cat.econ.ai;
         // `Available_Money` (house.cpp): the spendable pool. `hasincome` is the
         // original's refinery+harvester+not-short gate that lets a category build
@@ -667,6 +750,108 @@ impl AiPlayer {
             .map(|(_, id)| id)
     }
 
+    /// The **pre-M7.14 fixed-priority ladder** — a verbatim snapshot of
+    /// `next_structure` at git `9155fce^` (M7.11 tip), used ONLY by
+    /// [`AiProfile::Legacy`] as the A/B baseline (M7.14 audit P0). It builds in a
+    /// fixed order (power → refinery → war factory → barracks → radar → defense →
+    /// discretionary expand), with the M7.10/M7.11 rubber-band **building** cap and
+    /// the low-power-gated spare-power tail. It is deliberately *not* kept in sync
+    /// with `next_structure` — it is a frozen historical policy for measurement.
+    fn next_structure_legacy(&self, world: &World, hs: &House, cat: &Catalog) -> Option<u32> {
+        let owns = |id: u32| hs.owns_building(id);
+        let can_afford = world.house_credits(self.house) > 0;
+        if !can_afford {
+            return None;
+        }
+        let power_id = self.role_building(cat, Role::Power);
+        let refinery_id = self.role_building(cat, Role::Refinery);
+        let factory_id = self.role_building(cat, Role::WarFactory);
+
+        let has_power_building = power_id.map(owns).unwrap_or(false);
+        let has_refinery = refinery_id.map(owns).unwrap_or(false);
+        let has_factory = factory_id.map(owns).unwrap_or(false);
+        let low_power = hs.low_power();
+
+        // 1) Power: build the first plant, or another when running a deficit.
+        if let Some(p) = power_id {
+            if (!has_power_building || low_power) && self.buildable(world, hs, p) {
+                return Some(p);
+            }
+        }
+        // 2) Refinery (economy).
+        if let Some(r) = refinery_id {
+            if !has_refinery && self.buildable(world, hs, r) {
+                return Some(r);
+            }
+        }
+        // 3) War factory.
+        if let Some(f) = factory_id {
+            if !has_factory && self.buildable(world, hs, f) {
+                return Some(f);
+            }
+        }
+        // 3b) Barracks once the war factory is up.
+        if has_factory {
+            if let Some(bar) = self.role_building(cat, Role::Barracks) {
+                if !owns(bar) && self.buildable(world, hs, bar) {
+                    return Some(bar);
+                }
+            }
+        }
+        // 3b2) Radar dome once the economy runs. Matched by catalog name.
+        if has_factory {
+            if let Some(dome) = cat
+                .buildings
+                .iter()
+                .position(|p| p.name.eq_ignore_ascii_case("DOME"))
+                .map(|i| i as u32)
+            {
+                if !owns(dome) && self.buildable(world, hs, dome) {
+                    return Some(dome);
+                }
+            }
+        }
+        // 3c) Base defense: keep 2 + refineries combat defenses, strongest first.
+        if has_factory {
+            let refineries = refinery_id.map(|r| self.count_owned(world, r)).unwrap_or(0);
+            let mut owned_def = 0i32;
+            let mut pick: Option<u32> = None;
+            for (id, p) in cat.buildings.iter().enumerate().rev() {
+                if p.weapon.is_some() && !p.is_wall {
+                    owned_def += self.count_owned(world, id as u32);
+                    if pick.is_none() && self.buildable(world, hs, id as u32) {
+                        pick = Some(id as u32);
+                    }
+                }
+            }
+            if owned_def < 2 + refineries {
+                if let Some(d) = pick {
+                    return Some(d);
+                }
+            }
+        }
+        // 4) Discretionary expand: a second refinery, then a spare power plant —
+        // up to the rubber-band building cap, spare-power gated on a real deficit
+        // (the M7.11 runaway fix). `0` cap means uncapped.
+        let under_bcap = self.max_buildings == 0
+            || self.building_size(world, self.house) < self.max_buildings as i32;
+        if under_bcap {
+            if let Some(r) = refinery_id {
+                if self.count_owned(world, r) < 2 && self.buildable(world, hs, r) {
+                    return Some(r);
+                }
+            }
+            if low_power {
+                if let Some(p) = power_id {
+                    if self.buildable(world, hs, p) {
+                        return Some(p);
+                    }
+                }
+            }
+        }
+        None
+    }
+
     // ---- Unit production (AI_Unit skirmish mode, house.cpp:6166) ------------
 
     fn produce_units(&self, world: &World, rng: &mut RandomLcg, out: &mut Vec<Command>) {
@@ -695,7 +880,13 @@ impl AiPlayer {
             // (Q15), and the acceptance bar requires economic recovery at *every*
             // difficulty, so a killed AI harvester is always replaced.
             let iq = hs.iq;
-            let iq_ok = iq >= cat.econ.iq.harvester;
+            // Expert IQ-gates the replacement (M7.14); Legacy replaces
+            // unconditionally (the verbatim pre-M7.14 `refineries > harvesters`
+            // policy — the honest A/B baseline, git `9155fce^`).
+            let iq_ok = match self.profile {
+                AiProfile::Expert => iq >= cat.econ.iq.harvester,
+                AiProfile::Legacy => true,
+            };
             let refineries = self
                 .role_building(cat, Role::Refinery)
                 .map(|r| self.count_owned(world, r))
@@ -1239,7 +1430,7 @@ impl AiPlayer {
     /// Repair damaged buildings, sell when broke, and fire-sale + all-out attack
     /// in the endgame (`HouseClass::Expert_AI` money/state block, house.cpp:5030 +
     /// `Repair_AI`/`AI_Raise_Money`/`Fire_Sale`/`Do_All_To_Hunt`).
-    fn economic_reflexes(&mut self, world: &World, out: &mut Vec<Command>) {
+    fn economic_reflexes(&mut self, world: &World, rng: &mut RandomLcg, out: &mut Vec<Command>) {
         // Fire-sale endgame first: if we can no longer produce anything (no
         // construction yard, war factory, or barracks) AND no MCV left to redeploy
         // one, but still hold buildings, the game is effectively lost — sell
@@ -1263,26 +1454,35 @@ impl AiPlayer {
         }
 
         let money = world.house_credits(self.house);
+        let cat = &world.catalog;
+        let iq = world.house(self.house).map(|h| h.iq).unwrap_or(0);
 
-        // Building auto-repair (`Repair_AI`, building.cpp:5834): if we can afford it
-        // (`Available_Money >= Rule.RepairThreshhold`), start repairing the
-        // most-damaged own building not already repairing. One per pass
-        // (`House->DidRepair`). Reuses the P1 `Command::Repair` machinery.
+        // **RepairSell IQ gate (M7.14 audit P2c).** `Repair_AI` wraps both the
+        // repair and the sell-back reflexes in `if (House->IQ >= Rule.IQRepairSell
+        // && …)` (building.cpp:5829). A house below the threshold does neither; a
+        // computer house (IQ = MaxIQ) is above stock `RepairSell=1`. Gate both our
+        // repair and our sell-when-broke reflexes consistently.
+        if iq < cat.econ.iq.repair_sell {
+            return;
+        }
+
+        // Building auto-repair (`Repair_AI`, building.cpp:5834), now **faithfully
+        // throttled** (M7.14 audit P1). Two fidelity fixes over the old band-aid:
         //
-        // **Threshold = 1000 (tuning, not the stock CreditReserve — cited).** The
-        // real rules.ini `[AI] CreditReserve=100` overrides `RepairThreshhold`
-        // (rules.cpp:AI()), but our *simplified* repair reflex (repair the most-
-        // damaged building whenever affordable, no per-building nuance) repairs far
-        // more eagerly than the original's `Repair_AI`; wiring it to 100 made a
-        // symmetric Normal AI-vs-AI grind repair its base down to ~100 credits every
-        // pass and **starve its own army production**, deadlocking scg05ea
-        // Normal-vs-Normal (verified: froze at ~2-3 units/side). We keep the
-        // reference *compile-time* `RepairThreshhold` default (1000) as the repair
-        // floor so the AI only auto-repairs when genuinely flush, preserving the
-        // M7.10/M7.11 decisiveness. `CreditReserve` is parsed into `AiRules` and
-        // available; it is deliberately **not** applied to this simplified gate.
-        let repair_threshold = REPAIR_THRESHOLD;
-        if money >= repair_threshold {
+        // 1. **Real `CreditReserve` floor.** The repair-affordability floor is the
+        //    stock `[AI] CreditReserve` (`cat.econ.ai.credit_reserve` — 100 on real
+        //    assets, overriding `RepairThreshhold`, rules.cpp:724). The synthetic
+        //    default stays 1000, so synthetic AI repair economics are unchanged.
+        // 2. **`RepairTimer` cooldown.** We only *begin* a repair when the throttle
+        //    is armed (`repair_timer == 0`, the `!DidRepair` gate), then re-arm it
+        //    to a random multi-tick delay (`Repair_AI`, building.cpp:5842) drawn
+        //    from the sync RNG. This is what makes `CreditReserve=100` safe: without
+        //    it, the old reflex repaired the most-damaged building *every* pass,
+        //    draining a symmetric Normal AI-vs-AI down to the floor and starving
+        //    production (the exact deadlock the hardcoded 1000 papered over). The
+        //    throttle repairs at most one building per cooldown window, so the
+        //    economy recovers between repairs and stays decisive at the real floor.
+        if self.repair_timer == 0 && money >= cat.econ.ai.credit_reserve {
             let mut worst: Option<(i32, crate::Handle)> = None;
             for (h, b) in world.buildings.iter() {
                 if b.house == self.house && b.is_alive() && !b.is_wall && !b.is_repairing {
@@ -1297,6 +1497,15 @@ impl AiPlayer {
                     house: self.house,
                     building,
                 });
+                // Re-arm the throttle: `RepairTimer = Random_Pick(RepairDelay *
+                // (TICKS_PER_MINUTE/4), RepairDelay * TICKS_PER_MINUTE * 2)`
+                // (building.cpp:5842). `RepairDelay` is the difficulty handicap's
+                // `.02` default (rules.cpp:316) — expressed here in hundredths for
+                // integer/deterministic math, matching the reference `(int)(fixed *
+                // int)` truncation.
+                let low = REPAIR_DELAY_HUNDREDTHS * (TICKS_PER_MINUTE / 4) / 100;
+                let high = REPAIR_DELAY_HUNDREDTHS * (TICKS_PER_MINUTE * 2) / 100;
+                self.repair_timer = rng.range(low, high).max(1) as u32;
                 return; // one economic action per pass
             }
         }
@@ -1304,7 +1513,7 @@ impl AiPlayer {
         // Sell-when-broke (`AI_Raise_Money`, house.cpp:5552 / `Check_Raise_Money`,
         // house.cpp:5283): when money is critically low AND we can't make more,
         // sell one **non-essential** building (defenses/tech/silos before the core
-        // economy) to raise cash.
+        // economy) to raise cash. Also gated on `IQ >= IQRepairSell` above.
         let can_make_money = self.owns_role(world, Role::Refinery) && self.has_harvester(world);
         if money < RAISE_MONEY_FLOOR && !can_make_money {
             if let Some(building) = self.least_essential_sellable(world) {

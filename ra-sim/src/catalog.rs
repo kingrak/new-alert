@@ -243,6 +243,17 @@ pub struct EconRules {
     /// The `[AI]` base-composition + cadence table (M7.14 P1) — the ratios/limits
     /// that drive ratio-based `AI_Building`.
     pub ai: AiRules,
+    /// The **incoming-projectile scatter threshold** (`Rule.Incoming`, from
+    /// `[General] Incoming`, rules.cpp:477 `Get_MPHType`, default `MPH_IMMOBILE=0`).
+    /// A weapon whose projectile speed is *below* this value lets the units in its
+    /// target cell run away when it fires — the artillery/grenade-dodge reflex
+    /// (`Fire_At` → `Map[As_Cell(TarCom)].Incoming(Coord,true)`, infantry.cpp:3841;
+    /// cell.cpp:2013, IQ-gated). Stored on the **same 0..255 `scale_to_256` scale**
+    /// as [`crate::combat::WeaponProfile::proj_speed`] so the two compare directly.
+    /// The compile-time default `0` disables the reflex entirely (no weapon is
+    /// slower than 0), so every synthetic catalog is byte-identical; the real-asset
+    /// loader reads the stock `Incoming=10`. **Not hashed** (a `Catalog` constant).
+    pub incoming_speed: i32,
 }
 
 impl Default for EconRules {
@@ -272,6 +283,9 @@ impl Default for EconRules {
             urepair_percent_den: 100,
             iq: IqRules::default(),
             ai: AiRules::default(),
+            // MPH_IMMOBILE (defines.h:1104) — the reflex is off until rules.ini
+            // sets a real `Incoming=`, so synthetic catalogs never scatter.
+            incoming_speed: 0,
         }
     }
 }

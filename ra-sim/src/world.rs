@@ -443,6 +443,18 @@ impl World {
         self.player_house = Some(house);
     }
 
+    /// Directly set a house's **IQ rating** (`HouseClass::IQ`, house.h). Normally
+    /// [`World::set_ai`] does this (an AI house runs at `Rule.MaxIQ`); this seam
+    /// lets a test give a house the IQ that gates its automatic behaviours (scatter,
+    /// guard-area, harvester replacement) **without** installing an active
+    /// controller — so the behaviour under test isn't perturbed by the AI issuing
+    /// its own commands. `0` is the human default.
+    pub fn set_house_iq(&mut self, house: u8, iq: i32) {
+        if let Some(h) = self.houses.get_mut(house as usize) {
+            h.iq = iq;
+        }
+    }
+
     /// The tracked player house, if one was designated.
     pub fn player_house(&self) -> Option<u8> {
         self.player_house
@@ -4013,6 +4025,19 @@ fn fire(
         riser,
     };
     world.bullets.insert(bullet);
+
+    // Artillery/grenade-dodge (M7.14 audit P2b): a slow projectile lets its target
+    // cell's occupiers run away (`MaxSpeed < Rule.Incoming` → `Incoming` on the
+    // TarCom cell, infantry.cpp:3826-3842). `econ.incoming_speed` is 0 for synthetic
+    // catalogs, so this is inert there — no RNG draw, no golden churn. Real assets
+    // ship `Incoming=10` (scaled 25): the E2 grenade (Speed 5 → 12) and the cruiser
+    // 8Inch shell (6 → 15) trip it, but ARTY's 155mm (12 → 30) and the V2's SCUD
+    // (25 → 64) are *faster* than the threshold and do NOT (a fidelity correction to
+    // the brief's "arty/V2" — only genuinely slow projectiles dodge, per rules.ini).
+    let incoming = world.catalog.econ.incoming_speed;
+    if incoming > 0 && weapon.proj_speed < incoming {
+        incoming_scatter(world, target_coord.cell(), muzzle);
+    }
 }
 
 /// Leptons within which a warhead's detonation damages nearby objects — the
@@ -4627,6 +4652,25 @@ fn spawn_produced_unit(world: &mut World, unit_id: u32, house: u8, cell: CellCoo
         }
     }
     world.set_unit_sight(handle, proto.sight);
+
+    // Area-Guard on produce (M7.14 audit P2a). A **computer** house at `IQ >=
+    // IQGuardArea` starts each produced, weapon-equipped unit in **Guard Area**
+    // mode instead of plain Guard — it guards a zone (2× weapon range) around its
+    // factory-exit post rather than leashing at exactly weapon range
+    // (`Enter_Idle_Mode`: `IQ >= Rule.IQGuardArea && Is_Weapon_Equipped →
+    // MISSION_GUARD_AREA`, infantry.cpp:1849-1856; the same idle-mode rule governs
+    // vehicles via `DriveClass`/`FootClass`). A human (IQ 0 < IQGuardArea) keeps
+    // plain Guard. Harvesters and unarmed/healer units are unaffected. The
+    // spawn-exit cell is the guard post it leashes to. Inert for every synthetic
+    // house (IQ 0), so no non-AI golden moves.
+    let iq = world.houses.get(house as usize).map(|h| h.iq).unwrap_or(0);
+    let armed = proto.weapon.map(|w| w.damage >= 0).unwrap_or(false);
+    if !proto.is_harvester && armed && iq >= world.catalog.econ.iq.guard_area {
+        if let Some(u) = world.units.get_mut(handle) {
+            u.mission = crate::unit::Mission::AreaGuard;
+            u.guard_post = Some(cell);
+        }
+    }
 }
 
 // ===========================================================================
@@ -5236,7 +5280,72 @@ fn scatter_friendly_blockers(world: &mut World, mover: Handle, cell: CellCoord, 
         });
         if ask && !visited.contains(&b) {
             visited.push(b);
-            scatter_blocker(world, b, grid, &mut visited);
+            scatter_blocker(world, b, grid, &mut visited, None);
+        }
+    }
+}
+
+/// Build a fresh [`UnitGrid`] from every unit's current cell/sub-cell, in slot
+/// order — the per-tick occupancy snapshot [`move_units`] also constructs. Used
+/// by the combat threat-scatter ([`incoming_scatter`]) to pick free flee cells.
+fn build_unit_grid(world: &World) -> UnitGrid {
+    let (gw, gh) = (world.passable.width(), world.passable.height());
+    let mut grid = UnitGrid::new(gw, gh);
+    for h in world.units.handles() {
+        if let Some(u) = world.units.get(h) {
+            if u.is_infantry() {
+                grid.claim_spot(u.cell(), u.sub_cell);
+            } else {
+                grid.claim_vehicle(u.cell(), h);
+            }
+        }
+    }
+    grid
+}
+
+/// Artillery/grenade-dodge (M7.14 audit P2b) — the IQ-gated **combat** threat
+/// scatter, the classic "run away from a slow incoming shell" trick. When a unit
+/// fires a slow projectile (`weapon.proj_speed < Rule.Incoming`), the engine lets
+/// the occupiers of the *target* cell run away, at fire time: `Fire_At` →
+/// `Map[As_Cell(TarCom)].Incoming(Coord, true)` (infantry.cpp:3841 and the
+/// `DriveClass`/`UnitClass` fire sites), then `CellClass::Incoming` (cell.cpp:2013)
+/// scatters *each* occupier — but only through the IQ gate
+/// `nokidding || Rule.IsScatter || House->IQ >= Rule.IQScatter`. Here `nokidding ==
+/// false`, so a **computer** occupier (IQ ≥ IQScatter) dodges and a **human** (IQ 0)
+/// stands its ground — the human/computer differentiation the M7.14 scatter arm was
+/// built for. `threat` is the firer's muzzle; each dodger flees away from it
+/// (`Scatter(threat, forced=true, nokidding=false)`, drive.cpp:181), drawing one
+/// sync-RNG jitter per dodger. Inert when `Rule.Incoming == 0` (synthetic catalogs),
+/// so no golden without a real `Incoming=` moves.
+fn incoming_scatter(world: &mut World, target_cell: CellCoord, threat: WorldCoord) {
+    let grid = build_unit_grid(world);
+    // Occupiers of the target cell in slot order: a vehicle, else infantry.
+    let mut occupiers: Vec<Handle> = Vec::new();
+    if let Some(v) = grid.vehicle_at(target_cell) {
+        occupiers.push(v);
+    } else {
+        for h in world.units.handles() {
+            if let Some(u) = world.units.get(h) {
+                if u.is_infantry() && u.cell() == target_cell {
+                    occupiers.push(h);
+                }
+            }
+        }
+    }
+    let mut visited: Vec<Handle> = Vec::new();
+    for occ in occupiers {
+        // Per-occupier IQ gate (`nokidding = false`) + the reference's own-idle
+        // guard: `Scatter` under `nokidding == false` only fires when the unit has
+        // no legal NavCom (`!Target_Legal(NavCom)`, drive.cpp:192) — i.e. it isn't
+        // already driving somewhere. Our empty-path stands in for "no NavCom", so a
+        // unit mid-move is left to its order and an idle guard/attacker dodges.
+        let eligible = world
+            .units
+            .get(occ)
+            .is_some_and(|u| u.path.is_empty() && scatter_gate(world, u.house, false));
+        if eligible && !visited.contains(&occ) {
+            visited.push(occ);
+            scatter_blocker(world, occ, &grid, &mut visited, Some(threat));
         }
     }
 }
@@ -5260,6 +5369,7 @@ fn scatter_blocker(
     blocker: Handle,
     grid: &UnitGrid,
     visited: &mut Vec<Handle>,
+    threat: Option<WorldCoord>,
 ) -> Option<CellCoord> {
     let (start, facing, loco, is_inf, dumping, house) = {
         let u = world.units.get(blocker)?;
@@ -5278,9 +5388,19 @@ fn scatter_blocker(
     if dumping {
         return None;
     }
-    // toface = Dir_Facing(PrimaryFacing.Current()) + (Random_Pick(0,2) - 1).
+    // toface base = Dir_Facing(...) (drive.cpp:201-206). When a `threat` coord is
+    // given (the combat threat-scatter — an incoming projectile's firer), flee
+    // *away* from it: `Dir_Facing(Direction8(threat, Coord))`, the direction from
+    // the threat toward us. Otherwise (the friendly-blocker push, `threat == 0`),
+    // seed from our own facing (`Dir_Facing(PrimaryFacing.Current())`).
     // Dir_Facing: `((dir + 0x10) & 0xFF) >> 5` (inline.h:611), giving 0..7.
-    let base = (((facing.0 as u16 + 0x10) & 0xFF) >> 5) as i32;
+    let base = match threat {
+        Some(t) => {
+            let f = Facing::toward(t, start.center()).unwrap_or(facing);
+            (((f.0 as u16 + 0x10) & 0xFF) >> 5) as i32
+        }
+        None => (((facing.0 as u16 + 0x10) & 0xFF) >> 5) as i32,
+    };
     let jitter = world.rng.range(0, 2) - 1; // -1, 0, +1
     let toface = (base + jitter).rem_euclid(8);
 
@@ -5358,7 +5478,7 @@ fn scatter_blocker(
             });
             if eligible {
                 visited.push(nb);
-                scatter_blocker(world, nb, grid, visited);
+                scatter_blocker(world, nb, grid, visited, threat);
             }
         }
     }

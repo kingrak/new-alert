@@ -1444,14 +1444,142 @@ base-composition ratio/limit bounds).
   as one urgency loop is a substantial refactor with real regression risk to the
   M7.10/M7.11-tuned decisiveness, and the observable "fighting" behaviour is already
   competent, so it is deferred to keep this milestone green and committable.
-- **P3 (combat reflexes) — CUT.** (a) Produced units getting **Area Guard** when
-  `IQ >= IQGuardArea`; (b) the **artillery-dodge** — a unit scattering from an
-  inbound slow/ballistic projectile via the IQ-gated `Incoming(threat,false,false)`
-  (infantry.cpp:3841 / the `nokidding == false` combat path); (c) `RepairSell`
-  IQ-gating of the existing auto repair/sell. The P0 scatter gate is built and ready
-  to host (b), but wiring bullet-in-flight → threat-scatter is its own chunk and is
-  deferred. **New-beats-old baseline harness** (a `AiProfile::Legacy` preserving the
-  pre-M7.14 build path for an AI-vs-AI A/B) is likewise **not** built — the old
-  fixed-priority path was replaced in place; the ratio system's fidelity is validated
-  by `ai_ratio_suite` + the (unchanged) real-asset `ui_ai_vs_ai` decisiveness/
-  Hard-beats-Easy/determinism suite instead.
+- **P3 (combat reflexes) — CUT.** ~~(a) Produced units getting **Area Guard** when
+  `IQ >= IQGuardArea`; (b) the **artillery-dodge**…; (c) `RepairSell` IQ-gating…~~
+  **All three (and the new-beats-old harness) are now LANDED in the M7.14 audit
+  follow-up — see Q22.**
+
+---
+
+## Q22 — M7.14 audit follow-up: honest new-vs-old A/B, faithful repair throttle, IQ-gated combat reflexes
+
+**Milestone:** M7.14 audit follow-up (closes the three debts the M7.14 audit
+surfaced — the CUT items in Q21). Priority order P0 → P1 → P2, cut from the bottom.
+
+### P0 — Expert-vs-Legacy A/B (the "does new actually beat old?" gap)
+
+M7.14 replaced the old fixed-priority AI **in place**, so the claim "the ratio/IQ
+Expert AI beats the pre-M7.14 fixed-ladder AI" was never proven. Built the honest
+head-to-head. New [`AiProfile::{Legacy, Expert}`](../ra-sim/src/ai.rs) on
+`AiPlayer` (default **Expert** = the shipping policy):
+- **`Legacy`** restores the verbatim pre-M7.14 policy — the fixed
+  power→refinery→war→barracks→radar→defense→expand ladder
+  (`next_structure_legacy`, a frozen snapshot of `next_structure` at git
+  `9155fce^`) **plus** the pre-M7.14 unconditional harvester replacement. It is
+  **test/measurement infrastructure only** — never installed in real play, and
+  folded into the AI hash **only when != Expert**, so every real game and every
+  pre-follow-up AI golden is byte-identical.
+- Everything else (combat, movement, teams, economic reflexes) is **shared**, so a
+  race isolates exactly the M7.14 delta: ratio-driven base composition + IQ-gated
+  economy.
+
+**Brief-vs-archaeology correction (documented, not rigged).** The brief described
+pre-M7.14 as having *no* auto-harvester replacement. Git archaeology shows it *did*
+(`refineries > harvesters`, ungated); Q21's "the economic reflex ours lacked" was
+imprecise. Stripping replacement from `Legacy` would only rig the A/B in Expert's
+favour, so the faithful snapshot **keeps** it (rule 3: reference/archaeology is
+ground truth). The A/B therefore measures the base-composition policy honestly.
+
+**THE HONEST FINDING (reported, not tuned away).** At **equal handicap** (both
+Normal), on both real scenarios, both orientations (start-swap), the full record
+(`ui_ai_vs_ai::real_expert_vs_legacy_ai_ab_record`) is:
+
+| scenario | Expert=A          | Expert=B          |
+|----------|-------------------|-------------------|
+| scg05ea  | B wins (Legacy), 15 808 t | B wins (Expert), 18 810 t |
+| scm01ea  | B wins (Legacy), 31 165 t | B wins (Expert), 28 902 t |
+
+**All four games are won by house B, whichever policy sits there.** The winner is
+decided by the **starting seat**, not the AI policy. Each policy wins exactly when
+it holds house B (2/4 apiece) — a perfectly symmetric 1-1 on each scenario. **Expert
+does NOT reliably beat Legacy: the two are at near-parity, and the map's start
+asymmetry dominates the sub-threshold policy difference.** This is expected in
+hindsight — M7.14 was a *fidelity + self-limiting* change (matching the original's
+ratio system; bounding base growth), sharing all combat/team/economy code with the
+already-M7.10/M7.11-tuned Legacy, so it did not make the AI raw-stronger. Per the
+brief ("if Expert does not reliably beat Legacy, report it honestly, do not tune the
+test to pass"), the test asserts only the **true** invariants — every A/B game
+resolves *decisively*, and Expert is **not strictly dominated** (wins ≥1/4) — and
+prints the full record. It deliberately does **not** assert an Expert sweep.
+
+### P1 — faithful repair economics (RepairTimer throttle + real CreditReserve)
+
+The audit found the AI repair reflex hardcoded a `1000` floor because it repaired
+**every** decision pass with no cooldown; the real game throttles. Ported
+faithfully (ai.rs `economic_reflexes`):
+- **`RepairTimer` cooldown** (`Repair_AI`, building.cpp:5842). A new per-controller
+  `repair_timer` counts down each tick; the AI may only *begin* a repair when it is
+  0, then re-arms it to `Random_Pick(RepairDelay·(TICKS_PER_MINUTE/4),
+  RepairDelay·TICKS_PER_MINUTE·2)` — `RepairDelay = .02` (rules.cpp:316 default),
+  `TICKS_PER_MINUTE = 900` → `Random_Pick(4, 36)` ticks — drawn from the **sync
+  RNG** at the cited site (this stands in for the engine's `DidRepair`/`RepairTimer`
+  gate, house.cpp:1433).
+- **Real `CreditReserve` floor.** The dead-until-now `AiRules::credit_reserve` (stock
+  rules.ini `[AI] CreditReserve=100`, overriding `RepairThreshhold`, rules.cpp:724)
+  is now the repair-affordability floor, replacing the hardcoded `1000`. The
+  synthetic default stays `1000`, so synthetic AI repair economics are unchanged.
+- **RepairSell IQ-gate** (P2c). Both the repair reflex and the sell-when-broke reflex
+  are now wrapped in `IQ >= Rule.IQRepairSell` (building.cpp:5829), matching the
+  reference — a house below the threshold does neither.
+
+**Decisiveness confirmed.** The throttle is what makes the real `CreditReserve=100`
+safe (without it, repairing every pass drains a symmetric Normal game to the floor
+and starves production — the deadlock the `1000` band-aid papered over). Verified
+`ui_ai_vs_ai` stays decisive at **every** difficulty on **both** scenarios (scg05ea
+Hard 4 997 t / Normal 22 602 t / Easy 31 632 t; scm01ea Hard 19 757 t) and
+Hard-beats-Easy still holds start-independently. No starvation deadlock returned.
+
+### P2 — combat reflexes (activate the dead IQ scatter arm)
+
+- **(a) Area-Guard on produce** (`Enter_Idle_Mode`: `IQ >= Rule.IQGuardArea &&
+  Is_Weapon_Equipped → MISSION_GUARD_AREA`, infantry.cpp:1849-1856). In
+  `spawn_produced_unit`, a **computer** house (IQ ≥ IQGuardArea = 4) starts each
+  produced, armed unit in `Mission::AreaGuard` (guards a zone around its
+  factory-exit post) instead of plain Guard; a human (IQ 0) keeps Guard. Inert for
+  every synthetic house (IQ 0). Pinned both directions
+  (`combat_reflex_suite::{computer_produced_unit_gets_area_guard,
+  human_produced_unit_stays_plain_guard}`).
+- **(b) Artillery/grenade-dodge** — the IQ-gated combat threat-scatter, the classic
+  trick, now **observable**. At fire time, if the weapon's projectile is slow
+  (`MaxSpeed < Rule.Incoming`), the engine lets the **target cell's occupiers** run
+  away: `Fire_At → Map[As_Cell(TarCom)].Incoming(Coord, true)` (infantry.cpp:3841;
+  the same at the `DriveClass`/`UnitClass` fire sites) → `CellClass::Incoming`
+  (cell.cpp:2013) scatters *each* occupier, gated per-occupier by `nokidding ||
+  Rule.IsScatter || House->IQ >= Rule.IQScatter`. Ported in `fire()` →
+  `incoming_scatter()`, reusing `scatter_blocker` (generalised to take a **threat**
+  coord — the dodger flees *away* from the firer, `Dir_Facing(Direction8(threat,
+  Coord))`, drive.cpp:201) with `scatter_gate(nokidding=false)`. So a **computer**
+  unit (IQ ≥ IQScatter = 3) dodges and a **human** unit (IQ 0) stands its ground —
+  the human/computer differentiation the audit flagged as unobservable, pinned both
+  directions (`combat_reflex_suite::{computer_unit_dodges_an_incoming_slow_projectile,
+  human_unit_does_not_dodge_the_identical_shell}`), plus determinism and a
+  fast-projectile no-dodge pin. Draws one sync-RNG jitter per dodger.
+
+  **Fidelity correction (brief said "arty/V2"; rules.ini says otherwise).** The
+  reflex is `Rule.Incoming` (`[General] Incoming=10`, → scaled 25, parsed into the
+  new `EconRules::incoming_speed`, `MPH_IMMOBILE=0` default). Among ground weapons
+  the **E2 grenade** (Speed 5 → 12) and the cruiser **8Inch** shell (6 → 15) trip
+  it, but ARTY's **155mm** (12 → 30) and the V2's **SCUD** (25 → 64) are *faster*
+  than the threshold and do **not** dodge — so, like the "V2 is not arcing"
+  correction in Q8, only genuinely slow projectiles trigger it, per the data.
+
+### Determinism / goldens (re-pin inventory: **ZERO**)
+
+- `EconRules::incoming_speed` defaults to `0` (MPH_IMMOBILE), so the dodge is
+  **inert for every synthetic catalog** — no synthetic combat golden, no
+  single-unit oracle, and no synthetic-AI hash draws the new RNG. Verified: full
+  `ra-sim` suite green with **zero** re-pins (including `determinism`, `scatter_suite`,
+  the AI suites).
+- `scatter_blocker`'s new `threat` param is `None` on both existing (friendly-blocker)
+  call sites, taking the identical facing-based path — byte-identical.
+- Area-Guard-on-produce is gated on `IQ >= IQGuardArea`, which every synthetic/human
+  house (IQ 0) and every **campaign** house (IQ 0, Q21) fails — so no campaign or
+  synthetic golden moves.
+- Real-asset **campaign** goldens (`incoming_speed = 25`) were re-run and are
+  **byte-identical** — the scripted playthroughs don't fire a scatter-triggering
+  slow weapon at an eligible target, so no campaign trigger/placement/outcome golden
+  moved (none needed re-pinning or a winnability re-check).
+- `AiProfile` folds into the hash only when `!= Expert`; `repair_timer` only when
+  non-zero — so no real game / pre-follow-up AI golden changed. The repair-throttle
+  RNG draw only fires when an AI actually repairs (and at MaxIQ ≥ IQRepairSell); the
+  synthetic AI suites don't damage buildings in their windows, so they stayed green.

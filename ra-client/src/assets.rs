@@ -1340,6 +1340,15 @@ fn econ_rules(rules: &Ini) -> EconRules {
         // compile-time defaults when a key or the whole section is absent.
         iq: iq_rules(rules, d.iq),
         ai: ai_rules(rules, d.ai),
+        // `Rule.Incoming` from `[General] Incoming` (rules.cpp:477, `Get_MPHType`),
+        // scaled to the 0..255 `_Scale_To_256` space the projectile `Speed=` values
+        // use (so `proj_speed < incoming_speed` is exactly the engine's
+        // `MaxSpeed < Rule.Incoming`). Stock RA ships `Incoming=10` (→ 25). A missing
+        // key keeps `MPH_IMMOBILE=0` (reflex off).
+        incoming_speed: match rules.get_int("General", "Incoming") {
+            Some(v) => ((v.clamp(0, 100) * 256 / 100).min(255)) as i32,
+            None => d.incoming_speed,
+        },
         ..d
     }
 }

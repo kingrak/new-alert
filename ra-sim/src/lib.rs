@@ -42,7 +42,7 @@ pub mod shroud;
 pub mod unit;
 pub mod world;
 
-pub use ai::{AiPlayer, Difficulty};
+pub use ai::{AiPlayer, AiProfile, Difficulty};
 pub use arena::{Arena, Handle};
 pub use building::Building;
 pub use bullet::Bullet;

@@ -19,7 +19,7 @@ use ra_data::house::{house_from_name, HOUSE_COUNT};
 use ra_formats::ini::Ini;
 use ra_formats::mix::MixArchive;
 use ra_sim::coords::{CellCoord, Facing};
-use ra_sim::{AiPlayer, Difficulty, Handicap, OreField, Passability, World};
+use ra_sim::{AiPlayer, AiProfile, Difficulty, Handicap, OreField, Passability, World};
 
 const CREDITS: i32 = 6000;
 /// Sim tick rate (DESIGN.md): 15 ticks/second.
@@ -470,6 +470,135 @@ fn real_hard_ai_reliably_beats_easy_ai() {
              — difficulty stat handicaps should decide it regardless of start position"
         );
     }
+}
+
+/// **M7.14 audit P0 — new-vs-old A/B (retire the standing acceptance gap).**
+/// M7.14 replaced the old fixed-priority AI *in place*, so "the ratio/IQ Expert AI
+/// beats the pre-M7.14 fixed-ladder AI" was never proven. This is the honest
+/// head-to-head: [`AiProfile::Expert`] (the shipping ratio-driven policy) vs
+/// [`AiProfile::Legacy`] (the verbatim pre-M7.14 fixed ladder, git `9155fce^`), at
+/// **equal handicap** (both Normal — no difficulty bias tips the scale), on both
+/// real scenarios, in both orientations (which side is Expert is swapped, so each
+/// policy plays from each start). Everything else — combat, movement, teams,
+/// economic reflexes — is identical between the two profiles, so the race isolates
+/// exactly the M7.14 delta: ratio-driven base composition + IQ-gated economy.
+///
+/// ## HONEST FINDING (reported, not tuned away)
+///
+/// **Expert does NOT reliably beat Legacy on these maps.** Measured record (equal
+/// Normal handicap):
+///
+/// | scenario | Expert=A          | Expert=B          |
+/// |----------|-------------------|-------------------|
+/// | scg05ea  | B wins (Legacy)   | B wins (Expert)   |
+/// | scm01ea  | B wins (Legacy)   | B wins (Expert)   |
+///
+/// **All four games are won by house B, whichever policy sits there** — the winner
+/// is decided by the **starting seat**, not the AI policy. Each policy wins exactly
+/// when it holds house B (2/4 apiece): a perfectly symmetric 1-1 on each scenario,
+/// i.e. the profile has *no measurable effect* on the outcome. The two policies are
+/// at **near-parity**: M7.14 was a *fidelity + self-limiting* change (matching the
+/// original's ratio system, bounding base growth), sharing all combat/team/economy
+/// code with the M7.10/M7.11-tuned Legacy — it did not make the AI raw-stronger, so
+/// the map's start asymmetry dominates the sub-threshold policy difference.
+///
+/// Per the brief ("if Expert does NOT reliably beat Legacy, report it honestly, do
+/// not tune the test to pass") this test therefore asserts only the **defensible,
+/// true** invariants — every A/B game resolves *decisively* (both policies are
+/// competent; no stall, no mutual annihilation) and Expert is **not strictly
+/// dominated** (it does not lose all four) — and prints the full per-orientation
+/// record for the report. It deliberately does **not** assert an Expert sweep,
+/// because that would be false.
+#[test]
+fn real_expert_vs_legacy_ai_ab_record() {
+    if !support::real_assets_available() {
+        eprintln!("SKIP: real assets not found (Expert-vs-Legacy A/B)");
+        return;
+    }
+    let dir = support::assets_dir();
+    let main_bytes = std::fs::read(dir.join("main.mix")).expect("main.mix");
+    let redalert_bytes = std::fs::read(dir.join("redalert.mix")).expect("redalert.mix");
+
+    // Load a Normal-vs-Normal game, then reinstall the two houses' controllers with
+    // the requested profiles (both stay Normal → equal handicap). `set_ai` re-copies
+    // each house's Normal (neutral) handicap and MaxIQ, so the only difference
+    // between the two runs is the base-building/economy profile.
+    let run = |scenario: &str, prof_a: AiProfile, prof_b: AiProfile| -> Option<(u32, Outcome)> {
+        let g = load_ai_vs_ai_from_bytes(
+            &main_bytes,
+            &redalert_bytes,
+            scenario,
+            CREDITS,
+            Difficulty::Normal,
+            Difficulty::Normal,
+        )
+        .unwrap_or_else(|e| panic!("failed to load Expert-vs-Legacy game: {e}"));
+        let (mut world, house_a, house_b) = (g.world, g.house_a, g.house_b);
+        world.set_ai(vec![
+            AiPlayer::new(house_a, Difficulty::Normal).with_profile(prof_a),
+            AiPlayer::new(house_b, Difficulty::Normal).with_profile(prof_b),
+        ]);
+        drive_to_decisive(
+            AiVsAiGame {
+                world,
+                house_a,
+                house_b,
+            },
+            MAX_TICKS,
+        )
+    };
+
+    let mut expert_wins = 0u32;
+    let mut games = 0u32;
+    for scenario in ["scg05ea.ini", "scm01ea.ini"] {
+        // Orientation 1: A=Expert, B=Legacy → Expert won iff HouseAWins.
+        // Orientation 2: A=Legacy, B=Expert → Expert won iff HouseBWins.
+        for (i, (pa, pb, expert_is_a)) in [
+            (AiProfile::Expert, AiProfile::Legacy, true),
+            (AiProfile::Legacy, AiProfile::Expert, false),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let (tick, outcome) = run(scenario, pa, pb).unwrap_or_else(|| {
+                panic!(
+                    "Expert-vs-Legacy on {scenario} (orientation {i}) never resolved within \
+                     {MAX_TICKS} ticks (~45 min) — both policies are M7.10/M7.11-tuned to be \
+                     decisive, so a stall here is a real regression"
+                )
+            });
+            // A/B games must still be decisive (the P1 repair-throttle change must
+            // not reintroduce a starvation stall / mutual annihilation).
+            assert_ne!(
+                outcome,
+                Outcome::BothEliminated,
+                "{scenario} orientation {i}: both houses eliminated same tick — not decisive"
+            );
+            let ew = matches!(
+                (outcome, expert_is_a),
+                (Outcome::HouseAWins, true) | (Outcome::HouseBWins, false)
+            );
+            expert_wins += ew as u32;
+            games += 1;
+            eprintln!(
+                "EXPERT-vs-LEGACY {scenario} (Expert={}): resolved tick {tick} (~{:.1} min), \
+                 outcome={outcome:?}, expert_won={ew}",
+                if expert_is_a { "A" } else { "B" },
+                tick as f64 / TICKS_PER_SEC as f64 / 60.0
+            );
+        }
+    }
+    eprintln!(
+        "EXPERT-vs-LEGACY A/B summary: Expert won {expert_wins}/{games} games at equal handicap \
+         (near-parity — the winner is start-seat-dominated, see the module doc comment)."
+    );
+    // Defensible, true invariant: Expert is not *strictly dominated* by the old AI
+    // (it does not lose every game). It is NOT asserted to sweep — the honest
+    // finding is near-parity, documented above.
+    assert!(
+        expert_wins >= 1,
+        "Expert should not be strictly dominated by the Legacy AI (won {expert_wins}/{games})"
+    );
 }
 
 // ===========================================================================
