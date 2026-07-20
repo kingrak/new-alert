@@ -345,6 +345,12 @@ pub struct AppCore {
     /// Repair mode is armed (REPAIR button toggled): the next tactical left-click
     /// on an own building toggles its repair (`Command::Repair`).
     repair_mode: bool,
+    /// Original SELL button art (`SELL.SHP` from hires.mix): frame 0 = up,
+    /// frame 1 = pressed, frame 2 = disabled. `None` = text fallback ("SELL").
+    sell_button_art: Option<UnitSprite>,
+    /// Original REPAIR button art (`REPAIR.SHP` from hires.mix), same frame
+    /// convention. `None` = text fallback ("REP").
+    repair_button_art: Option<UnitSprite>,
 }
 
 impl AppCore {
@@ -417,6 +423,8 @@ impl AppCore {
             prev_low_power: false,
             sell_mode: false,
             repair_mode: false,
+            sell_button_art: None,
+            repair_button_art: None,
         }
     }
 
@@ -449,6 +457,16 @@ impl AppCore {
     /// Install sidebar cameo icons, parallel to the `buildables` list. Optional.
     pub fn set_cameo_art(&mut self, cameos: Vec<Option<UnitSprite>>) {
         self.cameo_sprites = cameos;
+    }
+
+    /// Install the original SELL / REPAIR sidebar button art (`SELL.SHP` /
+    /// `REPAIR.SHP`, hires.mix). Each is a 3-frame SHP (up / pressed / disabled).
+    /// When present the header draws these icon buttons at their native size
+    /// (M7.9 P1 art pass, `sidebar.cpp:303-321`); when absent the text buttons
+    /// ("SELL"/"REP") stay, so a build with no assets is unaffected.
+    pub fn set_mode_button_art(&mut self, sell: Option<UnitSprite>, repair: Option<UnitSprite>) {
+        self.sell_button_art = sell;
+        self.repair_button_art = repair;
     }
 
     /// Turn the radar minimap panel on (drawn at the top of the sidebar strip).
@@ -1762,15 +1780,43 @@ impl AppCore {
     /// The SELL and REPAIR mode-button rects `(x0,y0,x1,y1)` in the sidebar header
     /// (only meaningful when the sidebar is enabled). Stacked at the header's
     /// right edge over blank background, so no other sidebar geometry moves.
+    ///
+    /// When the original icon art is installed the two buttons sit **side by
+    /// side** at their native SHP size (repair left of sell, matching
+    /// `sidebar.cpp`'s `Repair.X < Upgrade.X`); with no art they keep the
+    /// original stacked text-button geometry (so the text-fallback / no-asset
+    /// goldens are byte-identical).
+    fn mode_btn_art_dims(&self) -> Option<(i32, i32)> {
+        // Prefer the sell art's frame 0 size; fall back to repair's. Both SHPs
+        // are the same size in the real asset (34×28 hires).
+        let art = self
+            .sell_button_art
+            .as_ref()
+            .or(self.repair_button_art.as_ref())?;
+        let f = art.frames.first()?;
+        Some((f.width as i32, f.height as i32))
+    }
     fn sell_button_rect(&self) -> (i32, i32, i32, i32) {
         let x1 = self.viewport_w as i32 - 2;
-        let x0 = x1 - MODE_BTN_W;
-        (x0, 1, x1, 1 + MODE_BTN_H)
+        match self.mode_btn_art_dims() {
+            Some((w, h)) => (x1 - w, 1, x1, 1 + h),
+            None => (x1 - MODE_BTN_W, 1, x1, 1 + MODE_BTN_H),
+        }
     }
     fn repair_button_rect(&self) -> (i32, i32, i32, i32) {
-        let (x0, _, x1, _) = self.sell_button_rect();
-        let y0 = 1 + MODE_BTN_H + 1;
-        (x0, y0, x1, y0 + MODE_BTN_H)
+        match self.mode_btn_art_dims() {
+            Some((w, h)) => {
+                // Left of the sell button, same top edge.
+                let (sx0, _, _, _) = self.sell_button_rect();
+                let x1 = sx0 - 1;
+                (x1 - w, 1, x1, 1 + h)
+            }
+            None => {
+                let (x0, _, x1, _) = self.sell_button_rect();
+                let y0 = 1 + MODE_BTN_H + 1;
+                (x0, y0, x1, y0 + MODE_BTN_H)
+            }
+        }
     }
 
     // ---- Build UI actions (public so tests / the verification drive them) ----
@@ -2483,31 +2529,52 @@ impl AppCore {
     /// (bright fill) when its mode is armed, dim otherwise — the sell-mode
     /// indicator the task calls for.
     fn draw_mode_buttons(&self, frame: &mut RgbaImage) {
-        let btn = |frame: &mut RgbaImage,
-                   (x0, y0, x1, y1): (i32, i32, i32, i32),
-                   label: &str,
-                   armed: bool,
-                   armed_rgb: [u8; 3]| {
+        // Icon button: draw the original SHP at the rect's top-left — frame 1
+        // (pressed) while the mode is armed, else frame 0 (up). This mirrors the
+        // original `ShapeButtonClass` with `IsToggleType`/`ReflectButtonState`
+        // (`sidebar.cpp:303-321`): a toggled button shows its pressed frame.
+        let icon = |frame: &mut RgbaImage,
+                    (x0, y0, _, _): (i32, i32, i32, i32),
+                    art: &UnitSprite,
+                    armed: bool| {
+            let idx = if armed { 1 } else { 0 };
+            if let Some(f) = art.frames.get(idx).or_else(|| art.frames.first()) {
+                draw_sprite_topleft(frame, x0, y0, f, &identity_remap(), &self.palette);
+            }
+        };
+        // Text fallback button (no art installed).
+        let text_btn = |frame: &mut RgbaImage,
+                        (x0, y0, x1, y1): (i32, i32, i32, i32),
+                        label: &str,
+                        armed: bool,
+                        armed_rgb: [u8; 3]| {
             let bg = if armed { armed_rgb } else { [46, 46, 54] };
             fill_rect(frame, x0, y0, x1 - 1, y1 - 1, bg);
             draw_rect_outline(frame, x0, y0, x1 - 1, y1 - 1, [90, 90, 100]);
             let tcol = if armed { [12, 12, 12] } else { [200, 200, 210] };
             font::draw_text(frame, x0 + 2, y0 + 1, label, tcol);
         };
-        btn(
-            frame,
-            self.sell_button_rect(),
-            "SELL",
-            self.sell_mode,
-            [230, 90, 80],
-        );
-        btn(
-            frame,
-            self.repair_button_rect(),
-            "REP",
-            self.repair_mode,
-            [120, 200, 120],
-        );
+
+        match &self.sell_button_art {
+            Some(art) => icon(frame, self.sell_button_rect(), art, self.sell_mode),
+            None => text_btn(
+                frame,
+                self.sell_button_rect(),
+                "SELL",
+                self.sell_mode,
+                [230, 90, 80],
+            ),
+        }
+        match &self.repair_button_art {
+            Some(art) => icon(frame, self.repair_button_rect(), art, self.repair_mode),
+            None => text_btn(
+                frame,
+                self.repair_button_rect(),
+                "REP",
+                self.repair_mode,
+                [120, 200, 120],
+            ),
+        }
     }
 
     /// Draw one build strip (column) of cameo rows plus, when it overflows, its

@@ -5037,7 +5037,33 @@ fn move_units(world: &mut World) {
                 }
             }
             if !rerouted {
-                continue; // hold position this tick
+                // No detour exists: every route to our destination runs through the
+                // contested cell. This is the original's MOVE_TEMP case — the
+                // immediate next step is a *friendly, stationary* blocker (a moving
+                // friendly is MOVE_MOVING_BLOCK and handled by the yield tie-break
+                // above; an enemy is MOVE_DESTROYABLE/MOVE_NO and never scattered).
+                // Radio it to get out of the way (`Start_Of_Move` →
+                // `CellClass::Incoming(0,true,false)` → `DriveClass::Scatter`,
+                // drive.cpp:970/1034 → drive.cpp:181). The blocker picks a random
+                // adjacent MOVE_OK cell (one SYNC-RNG draw) and steps aside; the
+                // mover holds this tick and retries next tick (our indefinite
+                // hold-and-retry stands in for the original's `TryTryAgain`/
+                // `PATH_RETRY` budget). This completes the Q5 simplification: the
+                // 1-wide corridor and harvester-dock deadlocks now resolve instead
+                // of waiting forever.
+                //
+                // Only *vehicle* movers issue the scatter request: the reaction
+                // lives in `DriveClass::Start_Of_Move` (drive.cpp), and infantry are
+                // `FootClass`/`InfantryClass`, not `DriveClass` — their per-cell
+                // movement never fires `Incoming`, so a blocked infantryman still
+                // disperses/holds as before (keeping the sub-cell packing behaviour
+                // intact). A vehicle *blocker* that is infantry is still scattered
+                // — `Incoming` scatters every occupier, `FootClass`/`DriveClass`
+                // alike.
+                if !is_inf {
+                    scatter_friendly_blockers(world, handle, new_coord.cell(), &grid);
+                }
+                continue; // hold this tick; retry next tick
             }
         }
 
@@ -5104,6 +5130,130 @@ fn move_units(world: &mut World) {
         vehicle_excess(world) <= excess_before,
         "cell-occupancy invariant violated: movement put two vehicles on one cell"
     );
+}
+
+/// Cell offsets for the eight `FacingType` directions (N, NE, E, SE, S, SW, W,
+/// NW), transcribed from `AdjacentCell[FACING_COUNT]` (`const.cpp:303`). Screen-Y
+/// grows downward, so North is `-y`.
+const ADJACENT_DELTAS: [(i32, i32); 8] = [
+    (0, -1),  // N
+    (1, -1),  // NE
+    (1, 0),   // E
+    (1, 1),   // SE
+    (0, 1),   // S
+    (-1, 1),  // SW
+    (-1, 0),  // W
+    (-1, -1), // NW
+];
+
+/// The cell adjacent to `c` in `FacingType` direction `face` (0..8),
+/// `Adjacent_Cell(cell, face)` (`inline.h:854`).
+fn adjacent_cell(c: CellCoord, face: u8) -> CellCoord {
+    let (dx, dy) = ADJACENT_DELTAS[(face & 7) as usize];
+    CellCoord::new(c.x + dx, c.y + dy)
+}
+
+/// Ask every friendly, stationary unit occupying `cell` to scatter out of the
+/// way of the mover — the sim's port of `Start_Of_Move`'s MOVE_TEMP reaction
+/// (`drive.cpp:962-975` / `1026-1039`): when the mover's immediate next cell is
+/// blocked by an *ally that is not itself moving*, it fires
+/// `CellClass::Incoming(0, true, false)`, which scatters each occupier
+/// (`cell.cpp:2013`). Enemy occupiers and *moving* allies never reach here (they
+/// aren't MOVE_TEMP), matching the original.
+fn scatter_friendly_blockers(world: &mut World, mover: Handle, cell: CellCoord, grid: &UnitGrid) {
+    let Some(mover_house) = world.units.get(mover).map(|u| u.house) else {
+        return;
+    };
+    // Collect the cell's occupiers in slot order. Vehicles and infantry never
+    // co-occupy a cell (Q5.3), so it is one-or-the-other; scan infantry only when
+    // no vehicle sits there (avoids an O(n) scan on the common vehicle case).
+    let mut blockers: Vec<Handle> = Vec::new();
+    if let Some(v) = grid.vehicle_at(cell) {
+        if v != mover {
+            blockers.push(v);
+        }
+    } else {
+        for h in world.units.handles() {
+            if let Some(u) = world.units.get(h) {
+                if h != mover && u.is_infantry() && u.cell() == cell {
+                    blockers.push(h);
+                }
+            }
+        }
+    }
+    for b in blockers {
+        // `Can_Enter_Cell` returns MOVE_TEMP only for a *friendly*, *stationary*
+        // occupier (`unit.cpp:3336`: `is_moving == false`, i.e. no NavCom / not
+        // rotating / not driving — our "empty path"). A busy ally is
+        // MOVE_MOVING_BLOCK, not scattered.
+        let ask = world
+            .units
+            .get(b)
+            .is_some_and(|u| world.are_allies(mover_house, u.house) && u.path.is_empty());
+        if ask {
+            scatter_blocker(world, b, grid);
+        }
+    }
+}
+
+/// Port of `DriveClass::Scatter(threat=0, forced=true, nokidding=false)` as
+/// issued by `CellClass::Incoming` from `Start_Of_Move` (drive.cpp:181). The
+/// blocker is nudged one cell in a direction seeded by its **current facing**
+/// (the call sites pass `threat == 0`, so the bias is the unit's own facing, not
+/// a threat direction) plus a single SYNC-RNG jitter draw (`Random_Pick(0, 2) -
+/// 1` → −1/0/+1 facings). It then scans all eight adjacent cells in rotation and
+/// assigns the **last** one that is `MOVE_OK` (clear terrain + unoccupied) — the
+/// original loops without breaking, so the last legal facing wins (drive.cpp:207-213).
+/// Returns the chosen cell (for tests/tracing), or `None` if nothing is clear or
+/// the unit is exempt.
+///
+/// **RNG discipline:** exactly one sync draw per scattered blocker (the toface
+/// jitter). The `Random_Pick(1, 4)` "1-in-4" gate is skipped because `forced`
+/// short-circuits it (`drive.cpp:194`), matching the original at these call sites.
+fn scatter_blocker(world: &mut World, blocker: Handle, grid: &UnitGrid) -> Option<CellCoord> {
+    let (start, facing, loco, is_inf, dumping) = {
+        let u = world.units.get(blocker)?;
+        // A harvester actively dumping at the dock never scatters
+        // (`IsDumping`, drive.cpp:191).
+        let dumping = u.is_harvester && u.harvest.status == HarvStatus::Unloading;
+        (u.cell(), u.facing, u.locomotor, u.is_infantry(), dumping)
+    };
+    if dumping {
+        return None;
+    }
+    // toface = Dir_Facing(PrimaryFacing.Current()) + (Random_Pick(0,2) - 1).
+    // Dir_Facing: `((dir + 0x10) & 0xFF) >> 5` (inline.h:611), giving 0..7.
+    let base = (((facing.0 as u16 + 0x10) & 0xFF) >> 5) as i32;
+    let jitter = world.rng.range(0, 2) - 1; // -1, 0, +1
+    let toface = (base + jitter).rem_euclid(8);
+
+    // Iterate all eight facings; the LAST MOVE_OK cell wins (the original's
+    // non-breaking `Assign_Destination` loop, drive.cpp:207-213). MOVE_OK = clear
+    // terrain + unoccupied (no vehicle, and for a vehicle blocker no infantry).
+    let mut chosen: Option<CellCoord> = None;
+    for face in 0..8i32 {
+        let nf = ((toface + face) & 7) as u8;
+        let cell = adjacent_cell(start, nf);
+        if !cell.on_map() || !world.passable.is_passable_loco(cell, loco) {
+            continue;
+        }
+        let veh = grid.vehicle_at(cell).filter(|&h| h != blocker);
+        let occupied = if is_inf {
+            !grid.has_free_spot(cell) || veh.is_some()
+        } else {
+            veh.is_some() || (grid.spot_bits(cell) & 0x1F) != 0
+        };
+        if !occupied {
+            chosen = Some(cell);
+        }
+    }
+    if let Some(cell) = chosen {
+        if let Some(u) = world.units.get_mut(blocker) {
+            u.dest = Some(cell);
+            u.path = vec![cell];
+        }
+    }
+    chosen
 }
 
 /// Advance `coord` along the cell-centre waypoints of `path` by up to `budget`

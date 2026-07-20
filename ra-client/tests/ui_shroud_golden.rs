@@ -340,12 +340,20 @@ fn real_skirmish_compose_game_map_sweep_with_shroud_no_panic() {
     // changed. The 0/1/3/4-collapse-to-one, 2-differs structure is preserved
     // (the buttons are position-independent); only the constants moved. Sim
     // untouched; sidebar rendering. Re-derived deterministically.
+    //
+    // **Re-pinned for M7.12** (real sidebar button art): with the real assets
+    // present, the text SELL/REP buttons are replaced by the original icon
+    // shapes (`SELL.SHP`/`REPAIR.SHP`, hires.mix — the gold `$` and the wrench),
+    // drawn at native 34×28 side-by-side in the header (QUIRKS Q14 M7.12 note).
+    // Only the header pixels changed: the 0/1/3/4-collapse-to-one, 2-differs
+    // structure is preserved (the buttons are position-independent), proving no
+    // sim/geometry moved — sidebar rendering only. Re-derived deterministically.
     let golden: [u64; 5] = [
-        0xcae6_645d_b5c4_c643,
-        0xcae6_645d_b5c4_c643,
-        0xa9e4_d26a_257a_fc9b,
-        0xcae6_645d_b5c4_c643,
-        0xcae6_645d_b5c4_c643,
+        0x177d_e40f_9529_a3ed,
+        0x177d_e40f_9529_a3ed,
+        0xd0a1_b258_8541_29a9,
+        0x177d_e40f_9529_a3ed,
+        0x177d_e40f_9529_a3ed,
     ];
     let got: Vec<u64> = frames.iter().map(|p| support::fnv1a(p)).collect();
     assert_eq!(

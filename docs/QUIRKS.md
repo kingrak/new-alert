@@ -163,12 +163,13 @@ at its attacker (`FootClass::Take_Damage → Assign_Target(source)`,
   cell, so a tank group ends packed *adjacently*, not stacked.
 
 **Simplifications vs. the original (documented deviations).**
-1. **No ask-the-blocker-to-scatter radio protocol** (`drive.cpp` `MOVE_MOVING_BLOCK`
-   → `Do_Uncloak`/radio). A vehicle blocked by another vehicle re-routes **around**
-   it (`find_path_avoiding` — our A* ignores units, so a blocker in the straight
-   path is routed around at drive time); if no detour helps this tick it simply
-   **holds** and retries. A true 1-wide corridor with no detour just waits
-   (rare; benign).
+1. ~~**No ask-the-blocker-to-scatter radio protocol.**~~ **Closed in M7.12 (P0,
+   the ore-truck deadlock).** A vehicle whose *only* route runs through a
+   **friendly, stationary** unit now radios that unit to scatter aside, faithfully
+   porting `DriveClass::Start_Of_Move`'s MOVE_TEMP reaction — see the
+   **"Scatter completion"** block below. A vehicle blocked by another *moving*
+   vehicle still re-routes **around** it (`find_path_avoiding`); an enemy or busy
+   blocker is left alone.
 
    **Head-on tie-break (M7.7 P0a).** Two vehicles of *exactly* identical speed
    meeting head-on in a passable-width corridor used to re-route in lock-step
@@ -180,6 +181,55 @@ at its attacker (`FootClass::Take_Damage → Assign_Target(source)`,
    original's implicit asymmetry (one unit made passive by the scatter request).
    A *parked* blocker never triggers a yield, so ordinary re-routing around
    stationary obstacles is unchanged. No RNG is introduced (determinism intact).
+
+   **Scatter completion (M7.12, P0 ore-truck deadlock).** The user reported a
+   harvester (and any mover) permanently stuck when a stationary living friendly
+   unit blocks its sole path — deviation #1's "wait forever" left the blocker
+   un-nudged, unlike the original. `move_units` now ports the real policy: when a
+   **vehicle** mover's next step is blocked and no detour exists
+   (`find_path_avoiding` fails), and the blocking cell holds a **friendly**,
+   **stationary** unit (`path.is_empty()` = the original's `is_moving == false`:
+   no NavCom, not rotating, not driving — `UnitClass::Can_Enter_Cell`'s MOVE_TEMP
+   condition, `unit.cpp:3336`), the mover fires `scatter_friendly_blockers` →
+   `scatter_blocker`, a port of `CellClass::Incoming(0, true, false)` →
+   `DriveClass::Scatter(threat=0, forced=true, nokidding=false)`
+   (`drive.cpp:970/1034` → `drive.cpp:181`). The blocker picks a random adjacent
+   `MOVE_OK` cell — bias = `Dir_Facing(PrimaryFacing) + (Random_Pick(0,2)-1)`
+   (one SYNC-RNG draw; the call sites pass `threat==0`, so the bias is the
+   blocker's own facing, not a threat direction), then the **last** `MOVE_OK`
+   facing in the 8-way rotation wins (the original's non-breaking
+   `Assign_Destination` loop) — and steps aside; the mover holds this tick and
+   retries (our indefinite hold-and-retry stands in for `TryTryAgain`/`PATH_RETRY`).
+   - **Precedence (explicit).** On a block: **yield** tie-break (moving lower-index
+     blocker) → **re-route** (`find_path_avoiding`, detour exists) → **scatter +
+     hold** (no detour *and* a friendly stationary blocker) → **plain hold**
+     (enemy / terrain / no clear cell). Yield and scatter are mutually exclusive by
+     construction — a stationary blocker is never in `moved_this_tick`, and scatter
+     only fires when re-route already failed. Scatter fires **instead of** the old
+     plain hold, never before re-route (mirroring the original, which scatters only
+     when even `Basic_Path` cannot avoid the friendly).
+   - **Not scattered (verified + cited).** *Enemy* blockers are MOVE_DESTROYABLE/
+     MOVE_NO, never MOVE_TEMP (`unit.cpp:3355+`), so they are left alone; *busy*
+     (moving) friendlies are MOVE_MOVING_BLOCK, not MOVE_TEMP (`unit.cpp:3340`),
+     handled by re-route/yield; a harvester **dumping** at a dock never scatters
+     (`IsDumping`, `drive.cpp:191`). **Infantry movers never issue the request**
+     — the reaction lives in `DriveClass::Start_Of_Move`, and infantry are
+     `FootClass`/`InfantryClass`, not `DriveClass` (their per-cell movement never
+     calls `Incoming`), so sub-cell packing/dispersal is unchanged. An infantry
+     *blocker* is still scattered by a vehicle mover (`Incoming` scatters every
+     occupier).
+   - **Determinism / re-pins.** The scatter's sync draw only happens when a
+     blocker is actually asked to move, so **every** existing golden — including
+     the occupancy/corridor/mission suites and the synthetic single-unit oracle —
+     is byte-identical (verified: full `--no-fail-fast` matrix green with **zero**
+     re-pins). The old `one_wide_corridor_head_on_is_a_documented_wait_not_a_swap`
+     pin stays valid: it is a **head-on of two *moving* enemy vehicles** (neither a
+     stationary friendly), which scatter deliberately does not touch — the "idle
+     friendly blocker in a 1-wide corridor" case (which *does* resolve) is the new
+     `scatter_suite`, not that test. New coverage lives in
+     `ra-sim/tests/scatter_suite.rs` (parked-friendly-in-corridor resolves,
+     enemy-blocker-not-scattered, single-unit determinism, and the user's
+     harvester-docks-past-a-parked-friendly-and-banks-credits end-to-end).
 2. **Closest-free-spot centre fallback** uses the fixed `_sequence[0]` order rather
    than the RNG-picked `_alternate` row (`cell.cpp:1948`), avoiding a new sim-RNG
    draw in the movement path (determinism, and it keeps existing goldens' RNG
@@ -643,6 +693,22 @@ golden) hashes identically. The SELL/REPAIR buttons render in the sidebar header
 which legitimately moves the four **sidebar-enabled** `compose_game` frame goldens
 (`ui_shroud_golden` ×2, `ui_menu_golden_frames` paused/gameover ×2) — re-pinned
 with citations; sidebar rendering only, no sim/geometry change.
+
+> **M7.12 art pass (ra-coder).** The text SELL/REP buttons are replaced with the
+> original **icon** buttons when real assets are present: `SELL.SHP` (the gold `$`)
+> and `REPAIR.SHP` (the wrench), extracted from `hires.mix` (34×28, 3 frames:
+> up / pressed / disabled), matching `SidebarClass`'s
+> `Upgrade.Set_Shape("SELL.SHP")` / `Repair.Set_Shape("REPAIR.SHP")`
+> (`sidebar.cpp:319`/`:310`). They render at native size side-by-side in the header
+> (repair left of sell, as `Repair.X < Upgrade.X`), drawing frame 1 (pressed) while
+> the mode is armed and frame 0 otherwise (the original's `IsToggleType` +
+> `ReflectButtonState`). **Text fallback stays** when the shapes are missing
+> (`sell_button_art`/`repair_button_art` = `None`), so the no-asset goldens are
+> byte-identical; only the real-asset (`hires`) `compose_game` frames move,
+> re-pinned rendering-only. The button *rects* switch to native-art geometry only
+> when art is installed, so click hit-testing always matches what is drawn. Lores
+> (`lores.mix`, 17×14) art also exists and is a future low-res option; the hi-res
+> client uses the 34×28 hires shapes.
 
 ---
 

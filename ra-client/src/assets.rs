@@ -1602,6 +1602,10 @@ fn install_cosmetic_art(
             })
             .collect();
         core.set_cameo_art(cameos);
+        // Original SELL / REPAIR sidebar button art (`SELL.SHP` / `REPAIR.SHP`,
+        // hires.mix; `sidebar.cpp:319`/`:310`). Optional — missing shapes leave
+        // the text buttons in place.
+        core.set_mode_button_art(load_shp_opt(h, "SELL.SHP"), load_shp_opt(h, "REPAIR.SHP"));
     }
     core.enable_radar();
 }
