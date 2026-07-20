@@ -202,6 +202,116 @@ fn skirmish_world_guard_target_flag_becomes_true_on_proactive_acquire() {
     );
 }
 
+/// M7.11 healer carve-out — `maybe_acquire_guard_target` and
+/// `alert_nearby_guards` exclude any unit whose weapon deals non-positive
+/// ("healer") damage from proactive guard acquisition. Without this
+/// carve-out, universal guard acquisition (this milestone) would have an
+/// idle, default-Guard medic pick the nearest ENEMY as its guard target and
+/// then fire its heal weapon at it — healing the enemy. This is pinned
+/// directly against `maybe_acquire_guard_target`, isolated from
+/// `maybe_acquire_heal_target`'s own separate ally/infantry filter (which
+/// only gates the *heal-scan* path, not this one): the enemy here is fully
+/// armed, well within both weapons' range, and left passive (Sleep) so the
+/// only mechanism that could ever move the medic's target is the guard-
+/// acquisition path under test.
+#[test]
+fn medic_never_guard_acquires_an_enemy_even_when_idle_beside_one() {
+    let mut w = skirmish_world();
+    let medic = w.spawn_unit(0, 1, CellCoord::new(10, 10), Facing(0), 45, stats());
+    let heal_weapon = WeaponProfile {
+        damage: -50,
+        rof: 80,
+        range: 3 * 256, // comparable reach to `gun()`, so range is never the reason it fails to acquire
+        proj_speed: 255,
+        proj_rot: 0,
+        invisible: true,
+        instant: true,
+        warhead: WarheadProfile {
+            spread: 0,
+            verses: pct5([100, 0, 0, 0, 0]),
+        },
+        warhead_ap: false,
+        arcing: false,
+        ballistic_scatter: 256,
+        homing_scatter: 512,
+        min_damage: 1,
+        max_damage: 1000,
+    };
+    w.set_unit_combat(medic, 0, Some(heal_weapon), true);
+    // Default mission is Guard — the exact scenario the carve-out exists for.
+    let enemy = w.spawn_unit(0, 2, CellCoord::new(11, 10), Facing(0), 400, stats());
+    w.set_unit_combat(enemy, 0, Some(gun()), true);
+    w.set_unit_mission(enemy, Mission::Sleep); // keep the enemy passive too
+
+    for _ in 0..200 {
+        w.tick(&[]);
+    }
+    assert!(
+        w.units.get(medic).unwrap().target.is_none(),
+        "M7.11 healer carve-out: an idle Guard medic must NEVER proactively \
+         guard-acquire a nearby enemy, no matter how long it waits"
+    );
+    assert!(
+        !w.units.get(medic).unwrap().guard_target,
+        "a medic that never acquires must never have guard_target flagged either"
+    );
+    assert_eq!(
+        w.units.get(enemy).unwrap().health,
+        400,
+        "no heal (or anything else) was ever fired at the enemy"
+    );
+}
+
+/// M7.11 audit backfill: the literal user-facing scenario the milestone was
+/// driven by ("AI players still don't do active fight" — a **player** tank
+/// driving past a skirmish AI base's defenders used to take a free pass,
+/// since the M7.5-B guard layer was campaign-only). Neither unit here has an
+/// `AiPlayer` — both are plain skirmish units, so this exercises exactly what
+/// a human player controls, not AI-vs-AI. The defender is idle (default
+/// Guard) at a fixed post; the "player" unit is only ever given a `Move`
+/// order (never `Attack`), simulating driving past without engaging. The
+/// defender must acquire and land a hit as soon as the player unit enters its
+/// weapon range — engaging first, since the player unit never fires at all.
+#[test]
+fn a_moving_player_unit_driving_past_a_skirmish_defender_gets_engaged_first() {
+    let mut w = skirmish_world();
+    let defender = w.spawn_unit(0, 1, CellCoord::new(20, 10), Facing(0), 400, stats());
+    w.set_unit_combat(defender, 0, Some(gun()), true);
+    // Default mission is Guard — a defender sitting at its post, exactly as a
+    // produced/placed skirmish unit would be.
+
+    // The "player" unit starts well outside the defender's 3-cell weapon
+    // range and is walked straight through it via an ordinary Move order —
+    // never an Attack order, so it can never be the one to fire first.
+    let player = w.spawn_unit(0, 2, CellCoord::new(0, 10), Facing(0), 400, stats());
+    w.set_unit_combat(player, 0, Some(gun()), true);
+    w.tick(&[Command::Move {
+        unit: player,
+        dest: CellCoord::new(40, 10),
+        house: 2,
+    }]);
+
+    let mut engaged_tick = None;
+    for t in 0..200 {
+        w.tick(&[]);
+        if w.units.get(player).unwrap().health < 400 {
+            engaged_tick = Some(t);
+            break;
+        }
+    }
+    assert!(
+        engaged_tick.is_some(),
+        "M7.11: a skirmish defender must engage a player unit that merely \
+         drives within weapon range, with no Attack order from either side"
+    );
+    assert_eq!(
+        w.units.get(defender).unwrap().health,
+        400,
+        "the defender must land the first hit — the player unit, which was \
+         only ever Move-ordered, can never have fired back yet"
+    );
+}
+
 // ===========================================================================
 // §2 — Guard leash: the exact drop boundary. `In_Range` uses `dist <=
 // weapon.range`; one lepton beyond must drop on the very next combat pass,

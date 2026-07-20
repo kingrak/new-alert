@@ -263,6 +263,74 @@ fn drive_to_decisive(mut game: AiVsAiGame, max_ticks: u32) -> Option<(u32, Outco
     None
 }
 
+// ===========================================================================
+// Building-count utilities (M7.11 audit backfill — QUIRKS Q20's "building-
+// runaway fix"): the rubber-band building cap `max(self, avg_enemy+10)`
+// (house.cpp:5010) was a positive-feedback loop between two symmetric bases
+// that, pre-fix, spammed hundreds of power plants and walled a base in (units
+// could no longer path out to attack — an eternal stalemate). These utilities
+// sample each house's live building count over the course of an AI-vs-AI run
+// so a regression of that class shows up as a numeric bound violation, not
+// only as "the game never resolves."
+// ===========================================================================
+
+/// Count of `house`'s currently-alive buildings.
+fn building_count(world: &World, house: u8) -> usize {
+    world
+        .buildings
+        .iter()
+        .filter(|(_, b)| b.house == house && b.is_alive())
+        .count()
+}
+
+/// [`drive_to_decisive`], additionally sampling both houses' live building
+/// counts every `sample_every` ticks. Returns the per-house time series (one
+/// entry per sample, oldest first) alongside the terminal `(tick, Outcome)` —
+/// or `None` in that slot if the game never resolved within `max_ticks` (the
+/// partial series is still returned).
+fn drive_to_decisive_sampling(
+    mut game: AiVsAiGame,
+    max_ticks: u32,
+    sample_every: u32,
+) -> (Option<(u32, Outcome)>, Vec<usize>, Vec<usize>) {
+    let mut series_a = Vec::new();
+    let mut series_b = Vec::new();
+    for t in 0..max_ticks {
+        game.world.tick(&[]);
+        if t % sample_every.max(1) == 0 {
+            series_a.push(building_count(&game.world, game.house_a));
+            series_b.push(building_count(&game.world, game.house_b));
+        }
+        let a_alive = game.world.house_alive(game.house_a);
+        let b_alive = game.world.house_alive(game.house_b);
+        match (a_alive, b_alive) {
+            (true, false) => return (Some((t, Outcome::HouseAWins)), series_a, series_b),
+            (false, true) => return (Some((t, Outcome::HouseBWins)), series_a, series_b),
+            (false, false) => return (Some((t, Outcome::BothEliminated)), series_a, series_b),
+            (true, true) => {}
+        }
+    }
+    (None, series_a, series_b)
+}
+
+/// Progress-monotonicity helper (added for future AI-vs-AI regression tests,
+/// not just the building-count-bounded pin below): true if `series`, viewed
+/// through every trailing window of `window` consecutive samples, never
+/// increases — i.e. no window's last sample exceeds its first. Intended use:
+/// pin that a *losing* AI's building count (or any other "amount of stuff
+/// left" metric) is on a one-way path down once its endgame has begun
+/// (fire-sale/all-hunt, QUIRKS Q16), rather than fluctuating back upward,
+/// which would indicate its production was not actually eliminated.
+/// Vacuously true if `series` is shorter than `window`, or `window` is 0.
+fn is_non_increasing_over_window(series: &[usize], window: usize) -> bool {
+    if window == 0 || series.len() < window {
+        return true;
+    }
+    series
+        .windows(window)
+        .all(|w| w.first().copied().unwrap_or(0) >= w.last().copied().unwrap_or(0))
+}
+
 /// Run one scenario end to end at Hard-vs-Hard and assert it resolves.
 fn assert_decisive(scenario: &str, max_ticks: u32) {
     assert_decisive_at(scenario, max_ticks, Difficulty::Hard);
@@ -491,4 +559,102 @@ fn real_difficulty_handicap_table_matches_rules_ini_with_the_documented_inversio
     // The inversion is total: Hard and Easy must not coincide on any field a
     // real rules.ini biases (a regression here would silently un-invert it).
     assert_ne!(hard, easy, "Hard and Easy handicaps must differ");
+}
+
+// ===========================================================================
+// M7.11 audit backfill: building-count-bounded (QUIRKS Q20 spare-power-
+// runaway regression pin) + a pure sanity check for the progress-
+// monotonicity helper it exercises.
+// ===========================================================================
+
+/// Pure sanity check for [`is_non_increasing_over_window`] — no assets
+/// needed, so this always runs and guards the helper itself before any
+/// asset-gated test trusts it.
+#[test]
+fn non_increasing_window_helper_catches_an_uptick_and_ignores_short_series() {
+    assert!(is_non_increasing_over_window(&[10, 9, 9, 7, 5], 3));
+    // The 9 -> 11 uptick falls inside a window of 3: caught.
+    assert!(!is_non_increasing_over_window(&[10, 9, 9, 11, 5], 3));
+    // Same series, but the window is longer than the series: vacuously true.
+    assert!(is_non_increasing_over_window(&[10, 9, 9, 11, 5], 10));
+    assert!(is_non_increasing_over_window(&[], 3));
+    assert!(is_non_increasing_over_window(&[5], 0));
+    // A flat series never "increases".
+    assert!(is_non_increasing_over_window(&[4, 4, 4, 4], 2));
+}
+
+/// M7.11 regression pin: the spare-power-runaway building cap bug (QUIRKS
+/// Q20 — the `max(self, avg_enemy+10)` rubber-band positive-feedback loop
+/// that, pre-fix, spammed hundreds of power plants and walled a base in) must
+/// not come back. A symmetric (same-difficulty) AI-vs-AI game's live building
+/// count, sampled throughout the run, must stay under a sane cap — generous
+/// enough for any legitimate base, nowhere close to the "hundreds" the
+/// pre-fix bug produced. Also exercises [`is_non_increasing_over_window`]
+/// against the loser's tail: once a house is in its terminal collapse, its
+/// building count should only go down.
+#[test]
+fn real_symmetric_ai_vs_ai_building_count_stays_bounded() {
+    if !support::real_assets_available() {
+        eprintln!("SKIP: real assets not found (building-count-bounded regression pin)");
+        return;
+    }
+    // A real base in these scenarios peaks in the teens/twenties of
+    // buildings (see the eprintln! below for observed peaks); 60 is a
+    // generous cap that is nowhere near the "hundreds" the pre-fix rubber-
+    // band bug produced, while still catching any reoccurrence early.
+    const SANE_CAP: usize = 60;
+    let dir = support::assets_dir();
+    let main_bytes = std::fs::read(dir.join("main.mix")).expect("main.mix");
+    let redalert_bytes = std::fs::read(dir.join("redalert.mix")).expect("redalert.mix");
+    let game = load_ai_vs_ai_from_bytes(
+        &main_bytes,
+        &redalert_bytes,
+        "scg05ea.ini",
+        CREDITS,
+        Difficulty::Hard,
+        Difficulty::Hard,
+    )
+    .unwrap_or_else(|e| panic!("failed to load a symmetric Hard-vs-Hard game: {e}"));
+
+    let (resolved, series_a, series_b) =
+        drive_to_decisive_sampling(game, MAX_TICKS, TICKS_PER_SEC * 5);
+    let (tick, outcome) = resolved.unwrap_or_else(|| {
+        panic!("symmetric Hard-vs-Hard scg05ea never resolved within {MAX_TICKS} ticks")
+    });
+    let max_a = series_a.iter().copied().max().unwrap_or(0);
+    let max_b = series_b.iter().copied().max().unwrap_or(0);
+    eprintln!(
+        "symmetric building-count run: resolved tick {tick} outcome={outcome:?}, peak building \
+         counts A={max_a} B={max_b} (cap {SANE_CAP}, {} samples each)",
+        series_a.len()
+    );
+    assert!(
+        max_a <= SANE_CAP,
+        "house A's building count peaked at {max_a}, exceeding the sane cap of {SANE_CAP} — \
+         the M7.11 spare-power-runaway fix (QUIRKS Q20) may have regressed"
+    );
+    assert!(
+        max_b <= SANE_CAP,
+        "house B's building count peaked at {max_b}, exceeding the sane cap of {SANE_CAP} — \
+         the M7.11 spare-power-runaway fix (QUIRKS Q20) may have regressed"
+    );
+
+    // Progress-monotonicity: the loser's building count should trend only
+    // downward over its terminal collapse (the last few samples before
+    // elimination), never tick back upward. Only the *tail* is checked, not
+    // the whole run — early-game economy growth legitimately raises the
+    // count, so `is_non_increasing_over_window` is applied with a pairwise
+    // window (2) over just the trailing samples, not the full series.
+    let loser_series = match outcome {
+        Outcome::HouseAWins => &series_b,
+        Outcome::HouseBWins => &series_a,
+        Outcome::BothEliminated => return, // no single loser to check
+    };
+    let tail_len = loser_series.len().min(5);
+    let tail = &loser_series[loser_series.len() - tail_len..];
+    assert!(
+        is_non_increasing_over_window(tail, 2),
+        "the loser's building count should trend only downward across its terminal-collapse \
+         tail (last {tail_len} samples before elimination), not tick back upward: {tail:?}"
+    );
 }

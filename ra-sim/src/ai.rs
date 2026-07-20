@@ -781,14 +781,18 @@ impl AiPlayer {
         team.members
             .retain(|&h| world.units.get(h).map(|u| u.is_alive()).unwrap_or(false));
         let alive = team.members.len();
-        if alive == 0 {
-            return; // team wiped out; slot cleared (took it out above)
-        }
 
         // Dissolve + retreat when decimated (below half the starting size, floored
         // at 2) — our stand-in for the per-unit fear/retreat thresholds
         // (`FootClass` `IsScaredToDeath`/`Fear`, deferred). Survivors fall back to
-        // the base and the slot frees for a fresh team.
+        // the base and the slot frees for a fresh team. `retreat_floor` is always
+        // >= 2, so a total wipeout (`alive == 0`) falls into this branch too —
+        // deliberately: a wave that gets wiped out entirely is at least as
+        // strong a failure signal as one merely ground below half strength, and
+        // must escalate the next wave the same way (ra-tester audit fix,
+        // M7.11 — a prior `if alive == 0 { return; }` short-circuited BEFORE
+        // this check and skipped the escalation bump on a total wipeout, the
+        // one outcome most likely to need it).
         let retreat_floor = (team.initial_size / 2).max(2);
         if alive < retreat_floor {
             // Escalate: a team ground down below half its size failed to break the

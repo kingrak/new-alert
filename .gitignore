@@ -1,3 +1,5 @@
 /assets/
 /references/
 /target/
+assets_hidden_temp/
+*.mix

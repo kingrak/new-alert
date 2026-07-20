@@ -1154,3 +1154,95 @@ fn showcase_composed_team_lifecycle_and_repair() {
         "the AI should repair the damaged building (economic reflex)"
     );
 }
+
+// ---------------------------------------------------------------------------
+// M7.11 audit backfill (QUIRKS Q20 "building-runaway fix" — the actual
+// decisiveness blocker): building-count-bounded, isolated from combat.
+// ---------------------------------------------------------------------------
+
+/// Count of `house`'s currently-alive buildings, across every type.
+fn total_building_count(w: &World, house: u8) -> usize {
+    w.buildings
+        .iter()
+        .filter(|(_, b)| b.house == house && b.is_alive())
+        .count()
+}
+
+/// M7.11 regression pin, isolated from the (unrelated) P1 attack retune: the
+/// rubber-band building cap `max(self, avg_enemy+10)` (house.cpp:5010) is a
+/// positive-feedback loop between two symmetric bases — each side's cap only
+/// ever grows, and grows *with the other side's building count*, so
+/// `next_structure`'s discretionary "spare power plant" step (step 4) used to
+/// build forever, spamming plants until the base walled itself in (QUIRKS
+/// Q20). The fix gates that step on an actual power deficit (`low_power`).
+///
+/// This is pinned in total isolation from combat: a full-width impassable
+/// wall splits a small map so neither house's units can ever reach the other
+/// — the AI can never win by combat, so it keeps running its economy/
+/// building logic for the whole budget, with no interference from the
+/// attack-tuning fixes that (on real maps) end most games before the ratchet
+/// has time to run away. Building count must stay bounded regardless. The
+/// map is deliberately small (not the standard 128x128): once units can
+/// never path to the (unreachable) enemy, hunting/attacking units repeatedly
+/// re-search the full reachable component every tick, which is the expensive
+/// part of this fixture — a small map keeps that cheap without weakening
+/// what's under test (the building-count ratchet doesn't care about map
+/// size).
+#[test]
+fn symmetric_economy_only_building_count_stays_bounded_when_combat_can_never_resolve() {
+    let (w_cells, h_cells) = (40i32, 30i32);
+    let mut cells = vec![true; (w_cells * h_cells) as usize];
+    for x in 0..w_cells {
+        cells[(15 * w_cells + x) as usize] = false;
+    }
+    let grid = Passability::new(w_cells, h_cells, cells);
+    let eco_home1 = CellCoord::new(5, 5);
+    let eco_home2 = CellCoord::new(34, 24);
+
+    let mut w = World::new(grid, 0x5EC0_5EC0);
+    w.set_catalog(catalog());
+    w.init_houses(3, CREDITS);
+    w.spawn_unit(U_MCV, 1, eco_home1, Facing(0), 400, stats());
+    w.spawn_unit(U_MCV, 2, eco_home2, Facing(0), 400, stats());
+    w.set_ai(vec![
+        AiPlayer::new(1, Difficulty::Hard),
+        AiPlayer::new(2, Difficulty::Hard),
+    ]);
+
+    // This fixture's catalog has exactly 4 building types (FACT/POWR/PROC/
+    // WEAP) with `next_structure` explicitly capping PROC at 2 and gating
+    // POWR on an actual deficit; a legitimate base here never plausibly needs
+    // more than ~15 buildings. 30 is a deliberately generous cap — nowhere
+    // near the "hundreds" the pre-fix rubber-band bug produced.
+    const SANE_CAP: usize = 30;
+    // The ratchet (when broken) is not a slow leak: it grows every time
+    // `next_structure` is polled and power is "sufficient", so an unbounded
+    // regression shows up fast (confirmed against a deliberately-reverted
+    // gate). Once the *fixed* AI's power needs are met it stops building and
+    // the count plateaus well within this budget.
+    const TICKS: u32 = 3_000;
+
+    let mut peak = [0usize; 3]; // indices 1, 2 used
+    for _ in 0..TICKS {
+        w.tick(&[]);
+        for house in [1usize, 2usize] {
+            let count = total_building_count(&w, house as u8);
+            if count > peak[house] {
+                peak[house] = count;
+            }
+        }
+    }
+
+    assert!(
+        peak[1] <= SANE_CAP,
+        "house 1's building count peaked at {}, exceeding the sane cap of {SANE_CAP} — the \
+         M7.11 spare-power-runaway fix (QUIRKS Q20) may have regressed",
+        peak[1]
+    );
+    assert!(
+        peak[2] <= SANE_CAP,
+        "house 2's building count peaked at {}, exceeding the sane cap of {SANE_CAP} — the \
+         M7.11 spare-power-runaway fix (QUIRKS Q20) may have regressed",
+        peak[2]
+    );
+}
