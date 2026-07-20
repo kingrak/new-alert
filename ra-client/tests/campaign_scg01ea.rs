@@ -41,6 +41,7 @@ fn scg01ea_inventory_and_playthrough_to_victory() {
         &std::fs::read(dir.join("main.mix")).unwrap(),
         &std::fs::read(dir.join("redalert.mix")).unwrap(),
         "scg01ea.ini",
+        ra_sim::Difficulty::Normal,
     )
     .expect("load scg01ea");
 
@@ -370,6 +371,7 @@ fn scg01ea_playthrough_is_deterministic() {
             &std::fs::read(dir.join("main.mix")).unwrap(),
             &std::fs::read(dir.join("redalert.mix")).unwrap(),
             "scg01ea.ini",
+            ra_sim::Difficulty::Normal,
         )
         .unwrap();
         let core = &mut m.core;
@@ -477,6 +479,7 @@ fn scg01ea_einstein_dies_to_active_guards_if_the_route_is_not_cleared() {
         &std::fs::read(dir.join("main.mix")).unwrap(),
         &std::fs::read(dir.join("redalert.mix")).unwrap(),
         "scg01ea.ini",
+        ra_sim::Difficulty::Normal,
     )
     .expect("load scg01ea");
     let core = &mut mission.core;

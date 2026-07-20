@@ -354,7 +354,11 @@ impl CampaignFactory for MonkeyCampaign {
             },
         ]
     }
-    fn build(&self, scenario: &str) -> Result<BuiltMission, String> {
+    fn build(
+        &self,
+        scenario: &str,
+        _difficulty: ra_sim::Difficulty,
+    ) -> Result<BuiltMission, String> {
         let win = scenario == "m1";
         let raster = IndexedImage {
             width: 8,

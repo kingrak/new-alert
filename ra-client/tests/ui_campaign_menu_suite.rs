@@ -140,7 +140,11 @@ impl CampaignFactory for OneMissionCampaign {
             name: "The Golden Briefing".into(),
         }]
     }
-    fn build(&self, _scenario: &str) -> Result<BuiltMission, String> {
+    fn build(
+        &self,
+        _scenario: &str,
+        _difficulty: ra_sim::Difficulty,
+    ) -> Result<BuiltMission, String> {
         Ok(built(
             true,
             0x6018_DE01,
@@ -174,7 +178,10 @@ fn briefing_screen_frame_hash() {
     assert_eq!((f.width, f.height), (1024, 768));
     assert_eq!(
         support::fnv1a(&f.pixels),
-        0x6faa_24ef_871f_dd4f,
+        // Re-pinned M7.5-C P0: the briefing screen gained the Easy/Normal/Hard
+        // difficulty selector row (a new visible UI element, like Q14's sidebar
+        // SELL/REPAIR buttons) — a legitimate menu-frame change, not a sim golden.
+        0x641f_8991_3004_adc3,
         "Briefing frame hash changed (composition or layout changed)"
     );
 }
@@ -200,7 +207,11 @@ impl CampaignFactory for RetryCampaign {
             },
         ]
     }
-    fn build(&self, scenario: &str) -> Result<BuiltMission, String> {
+    fn build(
+        &self,
+        scenario: &str,
+        _difficulty: ra_sim::Difficulty,
+    ) -> Result<BuiltMission, String> {
         Ok(built(
             false, // always LOSE
             0xDEAD_0000,
@@ -310,7 +321,11 @@ impl CampaignFactory for ThreeMissionCampaign {
             },
         ]
     }
-    fn build(&self, scenario: &str) -> Result<BuiltMission, String> {
+    fn build(
+        &self,
+        scenario: &str,
+        _difficulty: ra_sim::Difficulty,
+    ) -> Result<BuiltMission, String> {
         let (name, seed) = match scenario {
             "alpha" => ("Alpha Mission", 0xA1),
             "bravo" => ("Bravo Mission", 0xB2),

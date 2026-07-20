@@ -544,12 +544,13 @@ fn register_campaign_building(
 pub fn load_campaign_from_dir(
     dir: &Path,
     scenario_name: &str,
+    difficulty: ra_sim::Difficulty,
 ) -> Result<CampaignMission, Box<dyn Error>> {
     let main_bytes =
         std::fs::read(dir.join("main.mix")).map_err(|e| format!("reading main.mix: {e}"))?;
     let redalert_bytes = std::fs::read(dir.join("redalert.mix"))
         .map_err(|e| format!("reading redalert.mix: {e}"))?;
-    load_campaign_from_bytes(&main_bytes, &redalert_bytes, scenario_name)
+    load_campaign_from_bytes(&main_bytes, &redalert_bytes, scenario_name, difficulty)
 }
 
 /// Load a fully-playable single-player mission from in-memory archives: terrain,
@@ -559,6 +560,7 @@ pub fn load_campaign_from_bytes(
     main_bytes: &[u8],
     redalert_bytes: &[u8],
     scenario_name: &str,
+    difficulty: ra_sim::Difficulty,
 ) -> Result<CampaignMission, Box<dyn Error>> {
     use ra_data::campaign as camp;
 
@@ -644,6 +646,8 @@ pub fn load_campaign_from_bytes(
     let raw_teams = camp::parse_teamtypes(&ini);
     let cell_trigs = camp::parse_cell_triggers(&ini);
     let waypoints = camp::parse_waypoints(&ini);
+    let base_def = camp::parse_base(&ini);
+    let tech_level = camp::parse_tech_level(&ini);
 
     // trigger name -> index (for object/cell attachments).
     let trig_idx: std::collections::BTreeMap<String, u16> = raw_triggers
@@ -726,6 +730,24 @@ pub fn load_campaign_from_bytes(
                 trig_idx.get(&p.trigger).copied(),
             )),
             None => skipped.push(p.building_type.clone()),
+        }
+    }
+
+    // [Base] rebuild nodes: register each building type (like [STRUCTURES]) and
+    // resolve to (proto id, cell), preserving list order (= rebuild priority).
+    let mut base_nodes: Vec<(u32, CellCoord)> = Vec::new();
+    for (name, cell) in &base_def.nodes {
+        match register_campaign_building(
+            &mut catalog,
+            &mut building_sprites,
+            &mut building_overlays,
+            &mut bldg_ids,
+            &rules,
+            &conquer,
+            name,
+        ) {
+            Some(id) => base_nodes.push((id, CellCoord::from_index(*cell))),
+            None => skipped.push(format!("base:{name}")),
         }
     }
 
@@ -871,6 +893,23 @@ pub fn load_campaign_from_bytes(
         pending_speech: Vec::new(),
     };
     world.set_campaign(campaign);
+
+    // --- Enemy activation (M7.5-C): the [Base] rebuild list + per-house latches
+    // that TACTION_AUTOCREATE/BEGIN_PRODUCTION flip at runtime. Always installed for
+    // a campaign (sized to the house table); inert + unhashed until a trigger fires.
+    world.set_enemy_activation(ra_sim::EnemyActivation {
+        alerted: vec![false; camp::CAMPAIGN_HOUSE_COUNT],
+        alert_timer: vec![-1; camp::CAMPAIGN_HOUSE_COUNT],
+        production: vec![false; camp::CAMPAIGN_HOUSE_COUNT],
+        base_house: base_def.house.unwrap_or(player_house),
+        base_nodes,
+        tech_level,
+    });
+
+    // --- Campaign difficulty handicaps (M7.5-C P0): computer houses take the chosen
+    // difficulty (`Scen.CDifficulty`), the player takes the inverse (`Scen.Difficulty`).
+    // Normal is a neutral no-op — the campaign default — so no golden moves.
+    world.set_campaign_difficulty(player_house, difficulty);
 
     // --- Camera start: waypoint 98 (home), else a placed player unit, else centre.
     let start = waypoints
@@ -2609,9 +2648,14 @@ impl crate::menu::CampaignFactory for ArchiveCampaignFactory {
         out
     }
 
-    fn build(&self, scenario: &str) -> Result<crate::menu::BuiltMission, String> {
-        let m = load_campaign_from_bytes(&self.main_bytes, &self.redalert_bytes, scenario)
-            .map_err(|e| e.to_string())?;
+    fn build(
+        &self,
+        scenario: &str,
+        difficulty: ra_sim::Difficulty,
+    ) -> Result<crate::menu::BuiltMission, String> {
+        let m =
+            load_campaign_from_bytes(&self.main_bytes, &self.redalert_bytes, scenario, difficulty)
+                .map_err(|e| e.to_string())?;
         Ok(crate::menu::BuiltMission {
             core: m.core,
             start: m.start,

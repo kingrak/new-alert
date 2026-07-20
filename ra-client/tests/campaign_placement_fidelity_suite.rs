@@ -187,17 +187,21 @@ fn inventory_check(scenario_name: &str) {
     };
     let ini = Ini::parse(&ini_text);
 
-    let mission =
-        match assets::load_campaign_from_bytes(&main_bytes, &redalert_bytes, scenario_name) {
-            Ok(m) => m,
-            Err(e) => {
-                eprintln!(
-                    "SKIP {scenario_name}: failed to load ({e}) — scenario may reference \
+    let mission = match assets::load_campaign_from_bytes(
+        &main_bytes,
+        &redalert_bytes,
+        scenario_name,
+        ra_sim::Difficulty::Normal,
+    ) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!(
+                "SKIP {scenario_name}: failed to load ({e}) — scenario may reference \
                      unimplemented reference content"
-                );
-                return;
-            }
-        };
+            );
+            return;
+        }
+    };
 
     let world = mission.core.world();
     let bnames = building_name_set(world);
@@ -428,14 +432,18 @@ fn alliance_matrix_is_symmetric_and_gates_auto_acquire() {
     // Greece(1)/England(3) are declared mutually already.
     assert!(allied_pairs.contains(&(1, 3)) && allied_pairs.contains(&(3, 1)));
 
-    let mut mission =
-        match assets::load_campaign_from_bytes(&main_bytes, &redalert_bytes, scenario_name) {
-            Ok(m) => m,
-            Err(e) => {
-                eprintln!("SKIP {scenario_name}: failed to load ({e})");
-                return;
-            }
-        };
+    let mut mission = match assets::load_campaign_from_bytes(
+        &main_bytes,
+        &redalert_bytes,
+        scenario_name,
+        ra_sim::Difficulty::Normal,
+    ) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("SKIP {scenario_name}: failed to load ({e})");
+            return;
+        }
+    };
 
     // 1. Full symmetric-match check over every campaign house pair.
     {
@@ -602,14 +610,18 @@ fn terrain_occupancy_check(scenario_name: &str) {
         "{scenario_name} should declare [TERRAIN] entries"
     );
 
-    let mission =
-        match assets::load_campaign_from_bytes(&main_bytes, &redalert_bytes, scenario_name) {
-            Ok(m) => m,
-            Err(e) => {
-                eprintln!("SKIP {scenario_name}: failed to load ({e})");
-                return;
-            }
-        };
+    let mission = match assets::load_campaign_from_bytes(
+        &main_bytes,
+        &redalert_bytes,
+        scenario_name,
+        ra_sim::Difficulty::Normal,
+    ) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("SKIP {scenario_name}: failed to load ({e})");
+            return;
+        }
+    };
     let world = mission.core.world();
 
     // Sample several declared cells (not just one) so the pin is robust.

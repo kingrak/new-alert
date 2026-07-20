@@ -189,6 +189,12 @@ pub struct World {
     /// allied with house `b` (`HouseClass::Is_Ally`, `house.cpp`). `None` in a
     /// skirmish (where "ally" means "same house"). Hashed only when present.
     alliances: Option<Vec<u64>>,
+    /// Campaign enemy-activation state (M7.5-C): the `IsAlerted`/`IsStarted`
+    /// latches, `AlertTime`, and the `[Base]` rebuild list that drive scripted
+    /// computer-house autocreate teams + production. `None` for a skirmish and for
+    /// campaigns that never touch it; hashed only when a house has actually been
+    /// alerted or begun production (`run_enemy_activation`).
+    enemy_activation: Option<crate::campaign::EnemyActivation>,
 }
 
 /// Terminal outcome of a skirmish, from the player's point of view (M6, item 4).
@@ -253,6 +259,7 @@ impl World {
             tick_count: 0,
             campaign: None,
             alliances: None,
+            enemy_activation: None,
         }
     }
 
@@ -261,6 +268,52 @@ impl World {
     /// `update_game_over`).
     pub fn set_campaign(&mut self, campaign: Campaign) {
         self.campaign = Some(campaign);
+    }
+
+    /// Install the campaign enemy-activation state (M7.5-C). The loader resolves
+    /// the `[Base]` list + tech level and sizes the per-house latch vectors; the
+    /// `TACTION_AUTOCREATE`/`TACTION_BEGIN_PRODUCTION` actions flip the latches at
+    /// runtime, and [`run_enemy_activation`] acts on them.
+    pub fn set_enemy_activation(&mut self, ea: crate::campaign::EnemyActivation) {
+        self.enemy_activation = Some(ea);
+    }
+
+    /// Borrow the enemy-activation state, if present (verification hook).
+    pub fn enemy_activation(&self) -> Option<&crate::campaign::EnemyActivation> {
+        self.enemy_activation.as_ref()
+    }
+
+    /// Apply single-player **campaign difficulty handicaps** (M7.5-C P0), matching
+    /// `HouseClass::Assign_Handicap`'s campaign call sites: the reference constructs
+    /// **every** house with the *computer* difficulty `Scen.CDifficulty`
+    /// (house.cpp:742) and then overrides only the `Player=` house with the *player*
+    /// difficulty `Scen.Difficulty` (scenario.cpp:2332). The classic difficulty
+    /// slider maps a selection to a **pair** (init.cpp:681-705): the player is
+    /// *buffed* on Easy and *nerfed* on Hard, the mirror of the computers.
+    ///
+    /// Our [`Catalog::difficulty_handicap`] table already inverts label→rules.ini
+    /// section for AI opponents (a "Hard" AI gets the buffed `[Easy]` biases — see
+    /// QUIRKS Q15), so the computer houses take `difficulty_handicap(chosen)`
+    /// directly (`Scen.CDifficulty`), and the player takes the **inverse label**'s
+    /// handicap (`Scen.Difficulty`): Easy game → player gets the buff, Hard game →
+    /// player gets the nerf, Normal → neutral. On **Normal every house is neutral**
+    /// (the `[Normal]` section is all-`1.0`), a byte-exact no-op that never perturbs
+    /// a golden — the campaign default.
+    pub fn set_campaign_difficulty(&mut self, player_house: u8, difficulty: Difficulty) {
+        let computer = self.catalog.difficulty_handicap(difficulty);
+        let player_diff = match difficulty {
+            Difficulty::Easy => Difficulty::Hard, // player buffed ([Easy] section)
+            Difficulty::Normal => Difficulty::Normal, // symmetric
+            Difficulty::Hard => Difficulty::Easy, // player nerfed ([Difficult] section)
+        };
+        let player = self.catalog.difficulty_handicap(player_diff);
+        for (i, h) in self.houses.iter_mut().enumerate() {
+            h.handicap = if i as u8 == player_house {
+                player
+            } else {
+                computer
+            };
+        }
     }
 
     /// Borrow the campaign scripting state, if this is a mission.
@@ -708,6 +761,14 @@ impl World {
                 h.write_u32((bits >> 32) as u32);
             }
         }
+        // Enemy-activation latches (M7.5-C) fold in ONLY once a house is actually
+        // alerted or has begun production, so every campaign that never fires those
+        // triggers (Allied mission 1, all skirmish/synthetic worlds) is byte-identical.
+        if let Some(ea) = &self.enemy_activation {
+            if ea.is_active() {
+                ea.hash_into(&mut h);
+            }
+        }
         h.finish()
     }
 }
@@ -784,6 +845,13 @@ pub fn apply(world: &mut World, tick: u32, commands: &[Command]) {
     // this tick's deaths are visible to DESTROYED events; before win/lose so a
     // WIN/LOSE action resolves this same tick.
     run_campaign(world);
+
+    // System 7.6: campaign enemy activation (M7.5-C) — alerted computer houses form
+    // autocreate teams on the AlertTime cadence, and production-started houses build
+    // from their factories + rebuild their [Base]. Inert (and RNG-free) until a
+    // TACTION_AUTOCREATE/BEGIN_PRODUCTION action flips a latch, so it never touches a
+    // scripted-only mission (Allied mission 1) or any skirmish.
+    run_enemy_activation(world);
 
     // System 8: house-elimination / win-lose resolution.
     update_game_over(world);
@@ -1206,10 +1274,323 @@ fn run_action(
             camp.mission_timer = Some(a.data.max(0) * ticks_per_tenth);
         }
         STOP_TIMER => camp.mission_timer = None,
-        // BEGIN_PRODUCTION / FIRE_SALE / AUTOCREATE / ALLOWWIN / DESTROY_TEAM /
-        // PLAY_MOVIE / etc. — inert or deferred (documented in QUIRKS).
+        // AUTOCREATE (M7.5-C P1): alert the target house so it forms autocreate teams
+        // on the AlertTime cadence (`TACTION_AUTOCREATE` → `House->IsAlerted = true`,
+        // taction.cpp:645).
+        AUTOCREATE => {
+            if let Some(h) = action_house(a.data, camp.triggers[trig].house) {
+                if let Some(ea) = world.enemy_activation.as_mut() {
+                    grow_house_flag(&mut ea.alerted, h, true);
+                    grow_house_flag_i32(&mut ea.alert_timer, h, 0); // fires immediately
+                }
+            }
+        }
+        // BEGIN_PRODUCTION (M7.5-C P2): flag the target house to produce from its
+        // factories + rebuild its [Base] (`TACTION_BEGIN_PRODUCTION` →
+        // `House->Begin_Production()` → `IsStarted = true`, house.h:781).
+        BEGIN_PRODUCTION => {
+            if let Some(h) = action_house(a.data, camp.triggers[trig].house) {
+                if let Some(ea) = world.enemy_activation.as_mut() {
+                    grow_house_flag(&mut ea.production, h, true);
+                }
+            }
+        }
+        // FIRE_SALE / ALLOWWIN / DESTROY_TEAM / PLAY_MOVIE / etc. — inert or deferred
+        // (documented in QUIRKS).
         _ => {}
     }
+}
+
+/// Resolve the target house of a house-scoped trigger action from its raw `Data`
+/// value. RA stores the house in the **low byte** of the action's `Data.Value`
+/// union (`TActionClass`, taction.cpp:226 writes `Data.Value`; the handlers read
+/// `Data.House`, taction.cpp:625/645), so an editor-encoded value like scg03ea's
+/// `-247` resolves as `-247 & 0xFF = 9` (BadGuy) and a bare positive index (`9`)
+/// resolves to itself; `0xFF` is `HOUSE_NONE`. A none/out-of-range value falls back
+/// to the **trigger's own house** (the scenario intent — the enemy that owns the
+/// trigger activates itself).
+fn action_house(data: i32, trigger_house: i32) -> Option<u8> {
+    let byte = (data & 0xFF) as u8;
+    if byte != 0xFF && (byte as usize) < crate::campaign::CAMPAIGN_HOUSE_SLOTS {
+        Some(byte)
+    } else if trigger_house >= 0 && (trigger_house as usize) < crate::campaign::CAMPAIGN_HOUSE_SLOTS
+    {
+        Some(trigger_house as u8)
+    } else {
+        None
+    }
+}
+
+/// Grow a per-house `bool` latch vector to include `house` and set it.
+fn grow_house_flag(v: &mut Vec<bool>, house: u8, val: bool) {
+    let i = house as usize;
+    if v.len() <= i {
+        v.resize(i + 1, false);
+    }
+    v[i] = val;
+}
+
+/// Grow a per-house `i32` vector to include `house` and set it.
+fn grow_house_flag_i32(v: &mut Vec<i32>, house: u8, val: i32) {
+    let i = house as usize;
+    if v.len() <= i {
+        v.resize(i + 1, -1);
+    }
+    v[i] = val;
+}
+
+/// `Rule.AutocreateTime` (rules.cpp:173, `AutocreateTime(5)`): the multiplier on the
+/// randomized autocreate interval. `AlertTime = AutocreateTime × Random_Pick(
+/// TICKS_PER_MINUTE/2, TICKS_PER_MINUTE*2)` (house.cpp:1056).
+const AUTOCREATE_TIME: i32 = 5;
+
+/// System 7.6: campaign enemy activation (M7.5-C). Runs the two scripted-enemy
+/// behaviours that `TACTION_AUTOCREATE` / `TACTION_BEGIN_PRODUCTION` unlock — a
+/// faithful-but-scoped port of `HouseClass::AI`'s autocreate loop (house.cpp:1042)
+/// and factory/base AI (house.cpp:5700, building.cpp:5600). It is a **no-op until a
+/// house is alerted or has begun production**, so a scripted-only mission draws no
+/// RNG and hashes identically.
+///
+/// **Sync RNG.** Where the original draws `Scen.RandomNumber` we draw the sim RNG
+/// (a `Copy` snapshot, written back — the [`run_ai`] pattern), in a fixed order per
+/// house in house-index order: the wave count (`Random_Pick(2,…)`, house.cpp:1047),
+/// each team pick (`Random_Pick`, teamtype.cpp:490), the AlertTime reset
+/// (house.cpp:1056), then the production weighted pick (house.cpp:6186).
+fn run_enemy_activation(world: &mut World) {
+    let active = world
+        .enemy_activation
+        .as_ref()
+        .map(|ea| ea.is_active())
+        .unwrap_or(false);
+    if !active || world.campaign.is_none() {
+        return;
+    }
+    let mut camp = world.campaign.take().unwrap();
+    let mut ea = world.enemy_activation.take().unwrap();
+    let mut rng = world.rng;
+    let tpm = world.catalog.econ.ticks_per_minute.max(1);
+
+    // --- Autocreate teams (P1): each alerted, live house on the AlertTime cadence.
+    for house in 0..ea.alerted.len() {
+        if !ea.alerted[house] || !world.house_alive(house as u8) {
+            continue;
+        }
+        let t = ea.alert_timer.get(house).copied().unwrap_or(0);
+        if t > 0 {
+            ea.alert_timer[house] = t - 1;
+            continue;
+        }
+        autocreate_wave(world, &mut camp, house as u8, ea.tech_level, &mut rng);
+        // Re-arm: AlertTime = AutocreateTime × Random_Pick(TPM/2, TPM*2) (house.cpp:1056).
+        let reset = AUTOCREATE_TIME * rng.range(tpm / 2, tpm * 2);
+        grow_house_flag_i32(&mut ea.alert_timer, house as u8, reset);
+    }
+
+    // --- Scripted production + base rebuild (P2): each production-started house.
+    for house in 0..ea.production.len() {
+        if !ea.production[house] || !world.house_alive(house as u8) {
+            continue;
+        }
+        campaign_produce_units(world, house as u8, &mut rng);
+        if house as u8 == ea.base_house {
+            campaign_rebuild_base(world, &ea, house as u8);
+        }
+    }
+
+    world.rng = rng;
+    world.campaign = Some(camp);
+    world.enemy_activation = Some(ea);
+}
+
+/// Form up to `Random_Pick(2, (TechLevel-1)/3+1)` autocreate teams for `house`
+/// (house.cpp:1047). Each team is a uniform random pick among the house's
+/// autocreate-flagged team types (`Suggested_New_Team(true)`, teamtype.cpp:414),
+/// created by recruiting existing idle units of the house (`Create_One_Of` →
+/// `TeamClass` recruit, team.cpp:1179) via the shared CREATE_TEAM path.
+fn autocreate_wave(
+    world: &mut World,
+    camp: &mut Campaign,
+    house: u8,
+    tech_level: i32,
+    rng: &mut RandomLcg,
+) {
+    // Random_Pick(2, (TechLevel-1)/3 + 1) — clamps to ≥2 (the reference's low-tech
+    // "centre on 2"; `range` swaps min/max, so a hi<2 still yields 2 on the nose).
+    let hi = ((tech_level - 1) / 3 + 1).max(2);
+    let maxteams = rng.range(2, hi);
+    for _ in 0..maxteams {
+        let choices: Vec<usize> = camp
+            .teamtypes
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| {
+                t.house == house as i32 && (t.flags & crate::campaign::team_flags::AUTOCREATE) != 0
+            })
+            .map(|(i, _)| i)
+            .collect();
+        if choices.is_empty() {
+            break;
+        }
+        let pick = choices[rng.range(0, choices.len() as i32 - 1) as usize];
+        // Recruit existing idle house units into the team and run its mission list.
+        spawn_team(world, camp, pick as i32, false);
+    }
+}
+
+/// Produce vehicles + infantry for a production-started campaign house from its
+/// **live factories**, using the AI weighted table (house.cpp:6172: armed vehicle
+/// weight 20, unarmed 1; offensive infantry only). Money is drawn from the house's
+/// scenario `Credits=` pool by the existing production machinery — no free money
+/// (`FactoryClass::AI`, factory.cpp:203). One item per lane per pass.
+fn campaign_produce_units(world: &mut World, house: u8, rng: &mut RandomLcg) {
+    let has_factory = world
+        .buildings
+        .iter()
+        .any(|(_, b)| b.house == house && b.is_war_factory && b.is_alive());
+    let has_barracks = world
+        .buildings
+        .iter()
+        .any(|(_, b)| b.house == house && b.is_barracks && b.is_alive());
+
+    // Resolve both picks up front (all `catalog`/`house` borrows released) so the
+    // mutating `apply_start_production` calls below hold no immutable borrow.
+    let vehicle_pick: Option<u32> = {
+        let cat = &world.catalog;
+        let hs = world.houses.get(house as usize);
+        if has_factory
+            && hs.map(|h| h.unit_prod.is_none()).unwrap_or(false)
+            && world.house_credits(house) > 0
+        {
+            let hs = hs.unwrap();
+            let eligible: Vec<(u32, i32)> = cat
+                .units
+                .iter()
+                .enumerate()
+                .filter(|(_id, p)| {
+                    !p.is_harvester
+                        && !p.is_infantry
+                        && p.deploys_to.is_none()
+                        && p.prereq.iter().all(|&pre| hs.owns_building(pre))
+                })
+                .map(|(id, p)| (id as u32, if p.weapon.is_some() { 20 } else { 1 }))
+                .collect();
+            let total: i32 = eligible.iter().map(|(_, w)| *w).sum();
+            if total > 0 {
+                // Weighted walk over the counter array (house.cpp:6186).
+                let mut choice = rng.range(0, total - 1);
+                let mut picked = None;
+                for (id, w) in &eligible {
+                    if choice < *w {
+                        picked = Some(*id);
+                        break;
+                    }
+                    choice -= *w;
+                }
+                picked
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    };
+    if let Some(id) = vehicle_pick {
+        apply_start_production(world, house, BuildItem::Unit(id));
+    }
+
+    let infantry_pick: Option<u32> = {
+        let cat = &world.catalog;
+        let hs = world.houses.get(house as usize);
+        if has_barracks
+            && hs.map(|h| h.infantry_prod.is_none()).unwrap_or(false)
+            && world.house_credits(house) > 0
+        {
+            let hs = hs.unwrap();
+            let eligible: Vec<u32> = cat
+                .units
+                .iter()
+                .enumerate()
+                .filter(|(_, p)| {
+                    p.is_infantry
+                        && p.weapon.map(|w| w.damage > 0).unwrap_or(false)
+                        && p.prereq.iter().all(|&pre| hs.owns_building(pre))
+                })
+                .map(|(id, _)| id as u32)
+                .collect();
+            if !eligible.is_empty() {
+                Some(eligible[rng.range(0, eligible.len() as i32 - 1) as usize])
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    };
+    if let Some(id) = infantry_pick {
+        apply_start_production(world, house, BuildItem::Unit(id));
+    }
+}
+
+/// Rebuild the first destroyed `[Base]` node (list order = priority,
+/// `Next_Buildable`, base.cpp:377) when the base house owns a construction yard.
+/// Starts the structure through the normal production lane and places the completed
+/// building back on its scripted cell (`building.cpp:2196` rebuilds at `node->Cell`).
+fn campaign_rebuild_base(world: &mut World, ea: &crate::campaign::EnemyActivation, house: u8) {
+    let Some(hs) = world.houses.get(house as usize) else {
+        return;
+    };
+    // A completed base building awaiting placement: drop it on its own node cell
+    // (the reference rebuilds at the exact `node->Cell`, bypassing proximity —
+    // building.cpp:2196).
+    if let Some(ready) = hs.ready_building {
+        if let Some((_, cell)) = ea
+            .base_nodes
+            .iter()
+            .find(|(id, cell)| *id == ready && !base_node_built(world, house, *id, *cell))
+            .copied()
+        {
+            place_building_inner(world, house, ready, cell, false);
+        }
+        return;
+    }
+    // A structure already building: wait for it.
+    if hs.building_prod.is_some() {
+        return;
+    }
+    // The construction yard is required to build structures (BuildingFactories,
+    // house.cpp:6828) — no yard, no rebuild (apply_start_production also guards this).
+    let has_yard = world
+        .buildings
+        .iter()
+        .any(|(_, b)| b.house == house && b.is_construction_yard && b.is_alive());
+    if !has_yard {
+        return;
+    }
+    // First unbuilt node in list order (Next_Buildable), if the house can build it.
+    for (id, cell) in &ea.base_nodes {
+        if base_node_built(world, house, *id, *cell) {
+            continue;
+        }
+        let ok = world
+            .catalog
+            .building(*id)
+            .map(|p| p.prereq.iter().all(|&pre| hs.owns_building(pre)))
+            .unwrap_or(false);
+        if ok {
+            apply_start_production(world, house, BuildItem::Building(*id));
+            return;
+        }
+    }
+}
+
+/// Whether a `[Base]` node currently stands: a live building of `house` with the
+/// node's proto id on the node's cell (`BaseClass::Is_Built` / `Get_Building`,
+/// base.cpp:229).
+fn base_node_built(world: &World, house: u8, id: u32, cell: CellCoord) -> bool {
+    world
+        .buildings
+        .iter()
+        .any(|(_, b)| b.house == house && b.is_alive() && b.type_id == id && b.cell == cell)
 }
 
 fn set_global(camp: &mut Campaign, idx: i32, val: bool) {
@@ -1325,6 +1706,10 @@ fn team_objective(tt: &crate::campaign::TeamType, camp: &Campaign) -> (Option<Ce
             MOVECELL => return (Some(CellCoord::from_index(m.arg.max(0) as u32)), false),
             ATTACK => return (None, true),
             GUARD => return (None, false),
+            // TMISSION_DO (teamtype.h:57): adopt the MissionType named by `arg`. The
+            // autocreate-team script is `DO:MISSION_HUNT` (arg 14) — the team hunts
+            // the player; other DO args (guard/area-guard) are stationary defence.
+            DO => return (None, m.arg == MISSION_HUNT_ARG),
             _ => {}
         }
     }
@@ -2150,6 +2535,20 @@ fn apply_start_production(world: &mut World, house: u8, item: BuildItem) {
 
 /// Place a completed building, with footprint + proximity validation.
 fn apply_place_building(world: &mut World, house: u8, building: u32, cell: CellCoord) {
+    place_building_inner(world, house, building, cell, true);
+}
+
+/// Place a house's ready building at `cell`. `require_proximity` enforces the
+/// build-adjacency rule for normal (player/AI) placement; the campaign `[Base]`
+/// rebuild passes `false` because the reference rebuilds at the exact scripted
+/// `node->Cell` (building.cpp:2196), bypassing `Find_Build_Location`.
+fn place_building_inner(
+    world: &mut World,
+    house: u8,
+    building: u32,
+    cell: CellCoord,
+    require_proximity: bool,
+) {
     // Must have this exact structure ready.
     let ready = world
         .houses
@@ -2161,7 +2560,7 @@ fn apply_place_building(world: &mut World, house: u8, building: u32, cell: CellC
     if !footprint_placeable(world, building, cell) {
         return;
     }
-    if !passes_proximity(world, house, building, cell) {
+    if require_proximity && !passes_proximity(world, house, building, cell) {
         return;
     }
     // Consume the ready slot and place.

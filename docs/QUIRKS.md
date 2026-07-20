@@ -960,3 +960,133 @@ no transport activity is byte-identical.
   (Q15/Q16) and team machinery exist to build on; the campaign flow currently starts enemies
   scripted-only. `BEGIN_PRODUCTION`/`AUTOCREATE` `TActionType` codes remain inert (as before).
 - **P3 (mission-timer HUD, terrain SHP render) — deferred** (unchanged from Q17.4).
+
+---
+
+## Q19 — Campaign enemy activation: difficulty, autocreate teams, scripted production (M7.5-C)
+
+**Milestone:** M7.5-C (the P2 cut from M7.5-B, now landed). Closes the
+`TACTION_AUTOCREATE`/`TACTION_BEGIN_PRODUCTION` "inert" note in Q18's cuts.
+
+### P0 — campaign difficulty (briefing Easy/Normal/Hard)
+
+The briefing screen gained an Easy/Normal/Hard selector (default **Normal**),
+threaded through the menu state machine into `CampaignFactory::build(scenario,
+difficulty)` — the same "factory config" path skirmish uses — and applied by
+[`World::set_campaign_difficulty`].
+
+**What the source does (and we mirror).** `HouseClass::Assign_Handicap`
+(house.cpp:278) is called at two campaign sites: the constructor handicaps
+**every** house with the *computer* difficulty `Scen.CDifficulty` (house.cpp:742),
+then `Read_Scenario_INI` overrides only the `Player=` house with the *player*
+difficulty `Scen.Difficulty` (scenario.cpp:2332). The classic 3-position slider
+maps a selection to a **(player, computer) pair** (init.cpp:681-705): the player is
+*buffed* at the Easy end (`Scen.Difficulty = DIFF_EASY`) and *nerfed* at the Hard
+end (`DIFF_HARD`), the mirror of the computers. In single-player the biases come
+straight from `Rule.Diff[handicap]` (the `else` branch, no ActLike multiplier).
+
+**Our mapping.** Because our `Catalog::difficulty_handicap` table already inverts
+label→rules.ini section for AI opponents (Q15: a "Hard" AI gets the buffed `[Easy]`
+biases), the computer houses take `difficulty_handicap(chosen)` directly
+(`Scen.CDifficulty`), and the **player takes the inverse label**'s handicap
+(`Scen.Difficulty`): **Easy game → player buffed** (`[Easy]`), **Hard game → player
+nerfed** (`[Difficult]`), Normal → neutral. This is exactly the source's
+player-side bias (yes, the original buffs the player on Easy — we implement it).
+
+**Golden discipline.** On **Normal every house is neutral** (the `[Normal]` section
+is all-`1.0`), a byte-exact no-op — so the campaign default perturbs nothing, and
+the existing `handicap` hash-gating (folds only when non-neutral) means only a
+non-Normal campaign appends handicap bytes. The briefing *frame* golden was
+re-pinned once (the visible difficulty-button row, like Q14's sidebar buttons) — a
+menu-frame change, not a sim golden.
+
+### P1 — autocreate teams (`TACTION_AUTOCREATE`)
+
+`TACTION_AUTOCREATE` (code 13) sets the target house's `IsAlerted` flag
+(taction.cpp:645). An alerted house forms autocreate teams on the `AlertTime`
+cadence (house.cpp:1042): each wave creates `Random_Pick(2, (TechLevel-1)/3+1)`
+teams (house.cpp:1047), each a uniform random pick among the house's
+**autocreate-flagged** team types (`Suggested_New_Team(true)`, teamtype.cpp:414;
+the flag is bit `0x4`, `IsAutocreate`, teamtype.h:219), created by recruiting
+existing idle house units (`Create_One_Of` → `TeamClass` recruit, team.cpp:1179).
+After each wave `AlertTime = Rule.AutocreateTime(5) × Random_Pick(TPM/2, TPM×2)`
+(house.cpp:1056). We reuse the existing CREATE_TEAM recruitment path and run the
+team's mission list; the common autocreate script is `TMISSION_DO:MISSION_HUNT`
+(code 11 arg 14, teamtype.h:57) — the recruited units hunt the player.
+
+**Two-condition gate (both required).** A team forms only when the **house** is
+alerted *and* the **team type** carries the autocreate flag — matching the
+`(alerted && !IsAutocreate) → excluded` filter (teamtype.cpp:430). Verified both
+ways in `campaign_activation_suite`.
+
+### P2 — scripted production + `[Base]` rebuild (`TACTION_BEGIN_PRODUCTION`)
+
+`TACTION_BEGIN_PRODUCTION` (code 3) sets `IsStarted` (taction.cpp:621 →
+`Begin_Production()` → house.h:781). A started house (a) **produces** from its live
+factories using the AI weighted table (armed vehicle weight 20 / unarmed 1,
+house.cpp:6172; offensive infantry from the barracks), draining its scenario
+`Credits=` pool through the existing production machinery — **no free money**
+(factory.cpp:203); and (b) if it owns the `[Base]` list, **rebuilds** the first
+destroyed node in **list order** (`Next_Buildable`, base.cpp:377) when it has a
+construction yard + credits, placing it back on the scripted `node->Cell`
+(building.cpp:2196 — **bypassing the proximity rule**, a documented deviation from
+normal player/AI placement).
+
+**`[Base]` parsing.** `Player=<house>`, `Count=N`, then `000=NAME,cell` … in
+priority order (`BaseClass::Read_INI`, base.cpp:432). The client resolves node
+names to building-proto ids at load; list order is the rebuild priority.
+
+**Trigger-action house resolution.** RA stores the action's target house in the
+**low byte** of the `Data.Value` union (taction.cpp:226 writes `Data.Value`, the
+handlers read `Data.House`). Scenario editors write sentinel-padded negatives:
+scg03ea's `acrt` carries `-247` (`& 0xFF = 9` = BadGuy) and scg04ea's `set1` a bare
+`9`; `win` carries `-255` (`& 0xFF = 1` = the player). [`action_house`] resolves
+`data & 0xFF` (with `0xFF` = `HOUSE_NONE`), falling back to the **trigger's own
+house**. (WIN/LOSE keep ignoring the house per Q17.7. ALL_HUNT's existing
+`data.max(0)` resolution was left untouched to avoid perturbing its pins — a known
+minor latent mismatch on sentinel-encoded houses, only reachable by an ALL_HUNT
+action no early Allied mission fires against a sentinel house.)
+
+### Real missions that exercise this
+
+Scan of `scg01-06ea` (all extracted from the real `general.mix`): the **earliest**
+Allied mission using either feature is **scg03ea** ("Dead End") — its `acrt`
+trigger (a `PLAYER_ENTERED` cell trigger at cells 8107-8109, house 9) fires **both**
+AUTOCREATE (→ BadGuy autocreate teams `bad1`/`bad2`, flags 12) and BEGIN_PRODUCTION.
+The first mission with a real prebuilt `[Base]` is **scg04ea** (15 BadGuy buildings:
+POWR/BARR/PROC/WEAP/FTUR/SILO/AFLD…). scg01ea/02ea/05ea/06ea have `[Base] Count=0`;
+scg01ea/02ea use neither trigger (so they are unaffected — mission 1 stays green).
+
+### Determinism / hash gating
+
+The whole system lives in a small `EnemyActivation` side-struct on `World`
+(alerted/production latches, per-house `AlertTime`, the resolved `[Base]` list +
+tech level), installed for every campaign but folded into the hash **only once a
+house is actually alerted or has begun production** (`is_active()`), and the system
+is a **no-op (RNG-free) until then**. So a scripted-only mission (Allied mission 1)
+and every skirmish/synthetic world is byte-identical, and same-script-twice
+determinism holds through the new sim-RNG draws (wave count, team pick, AlertTime
+reset, production pick — all at cited original call sites). Verified in
+`campaign_activation_suite` (asset-free) + `campaign_activation_scg03ea`
+(real-asset, real trigger).
+
+### What the player sees on Hard now
+
+On **Hard**, the enemy houses are buffed (`[Easy]` biases — 1.2× firepower/armor/
+speed, 0.8× ROF/cost/build-time) and the player is nerfed (`[Difficult]` — 0.8×
+firepower, etc.); enemy attacks land harder and faster. In missions that fire
+AUTOCREATE/BEGIN_PRODUCTION (from scg03ea on), the enemy also **actively forms
+attack teams and rebuilds/produces** instead of sitting scripted-only — a
+noticeably more aggressive campaign opponent. On **Normal** (the default) behaviour
+is unchanged from M7.5-B.
+
+### Cuts / deferrals
+
+- **P3 (mission-timer HUD, terrain SHP render)** — still deferred (Q17.4).
+- **Team `MaxAllowed`/`Number` live-count tracking** — autocreate is bounded by the
+  long `AlertTime` cadence + idle-unit availability rather than a per-type live
+  count; a documented simplification of teamtype.cpp:428's `Number < MaxAllowed`.
+- **`IQ >= Rule.IQProduction` auto-alert** (house.cpp:987) — we only activate via
+  the explicit trigger actions, not the AI's self-alert, so campaign enemies stay
+  scripted until the mission says otherwise (matching the scenario author's intent
+  and keeping non-triggering missions inert).

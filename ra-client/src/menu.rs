@@ -147,8 +147,10 @@ pub struct BuiltMission {
 pub trait CampaignFactory {
     /// The ordered Allied mission list (those that resolve in the archives).
     fn missions(&self) -> Vec<CampaignEntry>;
-    /// Build one mission by scenario key, or an error string.
-    fn build(&self, scenario: &str) -> Result<BuiltMission, String>;
+    /// Build one mission by scenario key at the chosen difficulty, or an error
+    /// string. Difficulty applies the campaign handicaps (computer houses get the
+    /// chosen difficulty, the player the inverse — see `World::set_campaign_difficulty`).
+    fn build(&self, scenario: &str, difficulty: Difficulty) -> Result<BuiltMission, String>;
 }
 
 /// The current top-level UI state.
@@ -221,6 +223,8 @@ enum Action {
     StartMission,
     /// Retry the current mission after a defeat.
     RetryMission,
+    /// Choose the campaign difficulty on the briefing screen (index into [`DIFFICULTIES`]).
+    SetCampaignDifficulty(usize),
     Disabled,
 }
 
@@ -253,6 +257,9 @@ pub struct App {
     campaign_missions: Vec<CampaignEntry>,
     /// Index of the mission currently briefed / playing.
     campaign_current: usize,
+    /// Selected campaign difficulty (index into [`DIFFICULTIES`]); persists across
+    /// missions. Default Normal (1) — a neutral no-op handicap.
+    campaign_difficulty: usize,
     /// Briefing text for the current mission.
     briefing_text: String,
     /// Whether the running game is a campaign mission (vs. skirmish).
@@ -288,6 +295,7 @@ impl App {
             campaign_factory: None,
             campaign_missions: Vec::new(),
             campaign_current: 0,
+            campaign_difficulty: 1, // Normal
             briefing_text: String::new(),
             in_campaign: false,
             pending_core: None,
@@ -319,6 +327,30 @@ impl App {
     /// The current briefing text (for tests).
     pub fn briefing_text(&self) -> &str {
         &self.briefing_text
+    }
+
+    /// The selected campaign difficulty (for tests / the shell).
+    pub fn campaign_difficulty(&self) -> Difficulty {
+        DIFFICULTIES[self.campaign_difficulty.min(DIFFICULTIES.len() - 1)].1
+    }
+
+    /// Choose the campaign difficulty (briefing screen). Rebuilds the pending
+    /// mission core through the factory at the new difficulty — the same
+    /// "factory config" path the skirmish setup uses — so the difficulty is a
+    /// single source of truth (the built world already carries its handicaps).
+    fn set_campaign_difficulty(&mut self, idx: usize) {
+        self.campaign_difficulty = idx.min(DIFFICULTIES.len() - 1);
+        if self.state != AppState::Briefing {
+            return;
+        }
+        if let Some(f) = &self.campaign_factory {
+            if let Some(entry) = self.campaign_missions.get(self.campaign_current) {
+                if let Ok(built) = f.build(&entry.scenario, self.campaign_difficulty()) {
+                    self.briefing_text = built.briefing;
+                    self.pending_core = Some((built.core, built.start));
+                }
+            }
+        }
     }
 
     /// The current UI state (for the shell + tests).
@@ -560,6 +592,7 @@ impl App {
             Action::SelectMission(i) => self.goto_briefing(i),
             Action::StartMission => self.start_mission(self.campaign_current),
             Action::RetryMission => self.start_mission(self.campaign_current),
+            Action::SetCampaignDifficulty(i) => self.set_campaign_difficulty(i),
             Action::BackToMenu => {
                 self.state = AppState::MainMenu;
                 self.focus = 0;
@@ -587,7 +620,7 @@ impl App {
         // Build eagerly so the real briefing text is available on the screen.
         if let Some(f) = &self.campaign_factory {
             if let Some(entry) = self.campaign_missions.get(idx) {
-                if let Ok(built) = f.build(&entry.scenario) {
+                if let Ok(built) = f.build(&entry.scenario, self.campaign_difficulty()) {
                     self.briefing_text = built.briefing;
                     // Stash the built core for immediate play (avoids a second load).
                     self.pending_core = Some((built.core, built.start));
@@ -612,7 +645,7 @@ impl App {
                 let Some(entry) = self.campaign_missions.get(idx) else {
                     return;
                 };
-                match f.build(&entry.scenario) {
+                match f.build(&entry.scenario, self.campaign_difficulty()) {
                     Ok(b) => {
                         self.briefing_text = b.briefing;
                         (b.core, b.start)
@@ -1008,23 +1041,44 @@ impl App {
 
     fn items_briefing(&self) -> Vec<Item> {
         let cx = self.viewport_w as i32 / 2;
+        let mut items = Vec::new();
+        // START / BACK come **first in list order** so the keyboard focus default
+        // (focus 0 = START MISSION) is unchanged by the added difficulty row; the
+        // difficulty buttons are laid out visually *above* them (rect y), decoupling
+        // draw position from focus order.
         let y = self.viewport_h as i32 - 80;
-        vec![
-            Item {
-                rect: (cx - 260, y, cx - 20, y + 34),
-                label: "START MISSION".to_string(),
-                action: Action::StartMission,
+        items.push(Item {
+            rect: (cx - 260, y, cx - 20, y + 34),
+            label: "START MISSION".to_string(),
+            action: Action::StartMission,
+            enabled: true,
+            selected: false,
+        });
+        items.push(Item {
+            rect: (cx + 20, y, cx + 200, y + 34),
+            label: "BACK".to_string(),
+            action: Action::GotoCampaign, // return to the mission list
+            enabled: true,
+            selected: false,
+        });
+        // Difficulty selector: one button per level (Easy/Normal/Hard), the current
+        // one highlighted. Drawn above the Start/Back row.
+        let dy = self.viewport_h as i32 - 130;
+        let bw = 150;
+        let gap = 8;
+        let total = DIFFICULTIES.len() as i32 * (bw + gap) - gap;
+        let dx0 = cx - total / 2;
+        for (i, (label, _)) in DIFFICULTIES.iter().enumerate() {
+            let x0 = dx0 + i as i32 * (bw + gap);
+            items.push(Item {
+                rect: (x0, dy, x0 + bw, dy + 30),
+                label: (*label).to_string(),
+                action: Action::SetCampaignDifficulty(i),
                 enabled: true,
-                selected: false,
-            },
-            Item {
-                rect: (cx + 20, y, cx + 200, y + 34),
-                label: "BACK".to_string(),
-                action: Action::GotoCampaign, // return to the mission list
-                enabled: true,
-                selected: false,
-            },
-        ]
+                selected: i == self.campaign_difficulty,
+            });
+        }
+        items
     }
 
     fn items_setup(&self) -> Vec<Item> {

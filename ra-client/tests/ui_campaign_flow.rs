@@ -106,7 +106,11 @@ impl CampaignFactory for SynthCampaign {
             },
         ]
     }
-    fn build(&self, scenario: &str) -> Result<BuiltMission, String> {
+    fn build(
+        &self,
+        scenario: &str,
+        _difficulty: ra_sim::Difficulty,
+    ) -> Result<BuiltMission, String> {
         let raster = IndexedImage {
             width: 8,
             height: 8,

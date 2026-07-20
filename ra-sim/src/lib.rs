@@ -47,7 +47,8 @@ pub use arena::{Arena, Handle};
 pub use building::Building;
 pub use bullet::Bullet;
 pub use campaign::{
-    Campaign, SpawnProto, TActionDef, TEventDef, TeamClass, TeamMission, TeamType, TriggerType,
+    Campaign, EnemyActivation, SpawnProto, TActionDef, TEventDef, TeamClass, TeamMission, TeamType,
+    TriggerType,
 };
 pub use catalog::{BuildingProto, Catalog, EconRules, UnitProto};
 pub use combat::{modify_damage, Target, WarheadProfile, WeaponProfile, ARMOR_COUNT};

@@ -164,6 +164,49 @@ pub struct HouseDef {
     pub edge: String,
 }
 
+/// The parsed `[Base]` section (`BaseClass::Read_INI`, base.cpp:432): the owning
+/// house plus the ordered rebuild node list. List order **is** the rebuild
+/// priority (`Next_Buildable`, base.cpp:377).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct BaseDef {
+    /// The base owner (`[Base] Player=`), or `None` if the section is absent.
+    pub house: Option<u8>,
+    /// Ordered `(building type name, footprint top-left cell)` nodes.
+    pub nodes: Vec<(String, u32)>,
+}
+
+/// Parse the `[Base]` section: `Player=<house>`, `Count=<n>`, then `000=NAME,cell`,
+/// `001=NAME,cell`, … in priority order (`BaseClass::Read_INI`, base.cpp:432-476).
+/// An absent section (or `Count=0`) yields an empty node list.
+pub fn parse_base(ini: &Ini) -> BaseDef {
+    if !ini.has_section("Base") {
+        return BaseDef::default();
+    }
+    let house = ini.get("Base", "Player").and_then(campaign_house_index);
+    let count = ini.get_int("Base", "Count").unwrap_or(0).max(0) as usize;
+    let mut nodes = Vec::with_capacity(count);
+    for i in 0..count {
+        let key = format!("{i:03}");
+        let Some(val) = ini.get("Base", &key) else {
+            continue;
+        };
+        let f: Vec<&str> = val.split(',').map(|s| s.trim()).collect();
+        if f.len() < 2 {
+            continue;
+        }
+        let Ok(cell) = f[1].parse::<u32>() else {
+            continue;
+        };
+        nodes.push((f[0].to_string(), cell));
+    }
+    BaseDef { house, nodes }
+}
+
+/// Parse `[Basic] TechLevel` (the autocreate wave-count input; default 1).
+pub fn parse_tech_level(ini: &Ini) -> i32 {
+    ini.get_int("Basic", "TechLevel").unwrap_or(1) as i32
+}
+
 /// Parse the `[INFANTRY]` section.
 pub fn parse_infantry(ini: &Ini) -> Vec<InfantryPlacement> {
     let Some(entries) = ini.section_entries("INFANTRY") else {
@@ -482,6 +525,27 @@ mod tests {
         assert_eq!(inf[0].cell, 7615);
         assert_eq!(inf[0].sub_cell, 2);
         assert_eq!(inf[0].trigger, "dwig");
+    }
+
+    #[test]
+    fn parses_base_section_in_priority_order() {
+        // scg04ea layout: BadGuy base, first two nodes POWR then BARR.
+        let ini = Ini::parse(
+            "[Base]\nPlayer=BadGuy\nCount=3\n000=POWR,2735\n001=BARR,3381\n002=PROC,2742\n",
+        );
+        let base = parse_base(&ini);
+        assert_eq!(base.house, Some(9)); // BadGuy
+        assert_eq!(base.nodes.len(), 3);
+        assert_eq!(base.nodes[0], ("POWR".to_string(), 2735));
+        assert_eq!(base.nodes[1], ("BARR".to_string(), 3381));
+    }
+
+    #[test]
+    fn empty_base_section_is_empty() {
+        let ini = Ini::parse("[Base]\nPlayer=USSR\nCount=0\n");
+        let base = parse_base(&ini);
+        assert_eq!(base.house, Some(2));
+        assert!(base.nodes.is_empty());
     }
 
     #[test]

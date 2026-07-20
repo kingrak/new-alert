@@ -20,6 +20,11 @@ use crate::coords::CellCoord;
 use crate::hash::Fnv1a;
 use crate::unit::MoveStats;
 
+/// Number of `HousesType` slots a campaign world allocates (`Spain`..`Multi8`,
+/// `hdata.cpp`). Mirrors the loader's `CAMPAIGN_HOUSE_COUNT`; kept here so the sim
+/// can bounds-check trigger-action house indices without depending on `ra-data`.
+pub const CAMPAIGN_HOUSE_SLOTS: usize = 20;
+
 /// `TEventType` codes (`tevent.h:44`). Only the subset the early Allied missions
 /// use is *evaluated* (see `run_campaign`); the rest parse and hash but are inert.
 pub mod tevent {
@@ -64,6 +69,8 @@ pub mod taction {
     pub const FORCE_TRIGGER: u8 = 22;
     pub const START_TIMER: u8 = 23;
     pub const STOP_TIMER: u8 = 24;
+    /// Alert the target house so it forms autocreate teams (`taction.h:58`).
+    pub const AUTOCREATE: u8 = 13;
     pub const SET_TIMER: u8 = 27;
     pub const SET_GLOBAL: u8 = 28;
     pub const CLEAR_GLOBAL: u8 = 29;
@@ -80,9 +87,24 @@ pub mod tmission {
     pub const LOOP: i32 = 6;
     /// Unload the transport at the team's current location (`TMISSION_UNLOAD`).
     pub const UNLOAD: i32 = 8;
+    /// `TMISSION_DO` (`teamtype.h:57`): the team members adopt the `MissionType`
+    /// named by the mission's `arg` and it "sticks" (guard / sticky / area-guard /
+    /// hunt). The common autocreate-team script is `DO:MISSION_HUNT` (arg 14).
+    pub const DO: i32 = 11;
     /// Load the team's foot members onto its transport member (`TMISSION_LOAD`).
     pub const LOAD: i32 = 14;
     pub const PATROL: i32 = 16;
+
+    /// `MissionType::MISSION_HUNT` (`mission.h`, index 14) — the `arg` of the
+    /// `DO:14` autocreate-team script that makes the team hunt the player.
+    pub const MISSION_HUNT_ARG: i32 = 14;
+}
+
+/// `TeamTypeClass` packed-flag bits, as (de)serialised in `teamtype.cpp:1787`.
+pub mod team_flags {
+    /// The computer may create this team automatically on the alerted/autocreate
+    /// cadence (`TeamTypeClass::IsAutocreate`, `teamtype.h:219`). Bit `0x4`.
+    pub const AUTOCREATE: u32 = 0x0004;
 }
 
 /// `MultiStyleType` (`trigtype.h:47`): how event1/event2 combine and how the two
@@ -287,6 +309,68 @@ pub struct Campaign {
     pub pending_texts: Vec<i32>,
     /// EVA speech ids queued for the client. Cosmetic.
     pub pending_speech: Vec<i32>,
+}
+
+/// Campaign **enemy-activation** state (M7.5-C): the runtime latches and static
+/// data that let a *computer* house form autocreate teams and produce/rebuild —
+/// the scripted-enemy behaviour gated behind `TACTION_AUTOCREATE` /
+/// `TACTION_BEGIN_PRODUCTION`. Kept in a small side-struct (rather than folded
+/// into [`Campaign`]) so it can be added, hashed only when it is actually doing
+/// something, and left `None` for a skirmish — with no churn to the ~19 existing
+/// `Campaign { … }` literals.
+///
+/// Ported from `HouseClass::IsAlerted`/`IsStarted` + `AlertTime` (house.cpp:1042,
+/// house.h:781) and `BaseClass` (base.cpp:432 `[Base]`, base.cpp:377
+/// `Next_Buildable`).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct EnemyActivation {
+    /// Per-house `IsAlerted` latch (`TACTION_AUTOCREATE` sets it, taction.cpp:645).
+    /// When set, the house forms autocreate-flagged teams on the `AlertTime`
+    /// cadence (house.cpp:1042). Grown to house count by the loader.
+    pub alerted: Vec<bool>,
+    /// Per-house autocreate countdown (`AlertTime`, house.cpp:1056). `0` fires a
+    /// wave this tick then re-arms; only meaningful while the house is alerted.
+    pub alert_timer: Vec<i32>,
+    /// Per-house `IsStarted` latch (`TACTION_BEGIN_PRODUCTION` sets it,
+    /// house.h:781). When set, the house produces from its live factories and (if
+    /// it owns the `[Base]` list) rebuilds destroyed base buildings.
+    pub production: Vec<bool>,
+    /// The `[Base]` owner (`BaseClass::House`, base.cpp:443) — the one computer
+    /// house whose destroyed base buildings are rebuilt.
+    pub base_house: u8,
+    /// The `[Base]` rebuild list (`BaseClass::Nodes`, base.cpp:432): ordered
+    /// `(building-proto id, footprint top-left cell)`; **list order is the rebuild
+    /// priority** (`Next_Buildable`, base.cpp:377). Static — not hashed.
+    pub base_nodes: Vec<(u32, CellCoord)>,
+    /// Scenario `[Basic] TechLevel`, for the autocreate wave-count formula
+    /// (`Random_Pick(2, (TechLevel-1)/3+1)`, house.cpp:1047). Static.
+    pub tech_level: i32,
+}
+
+impl EnemyActivation {
+    /// Whether any house is currently alerted or has begun production — the gate
+    /// for both running the system and folding it into the hash (so a campaign
+    /// that never fires either trigger, e.g. Allied mission 1, is byte-identical).
+    pub fn is_active(&self) -> bool {
+        self.alerted.iter().any(|&a| a) || self.production.iter().any(|&p| p)
+    }
+
+    pub(crate) fn hash_into(&self, h: &mut Fnv1a) {
+        h.write_u8(0xEA);
+        for &a in &self.alerted {
+            h.write_u8(a as u8);
+        }
+        // Fold the AlertTime only for alerted houses (an inactive house's timer is
+        // inert), so the appended bytes track exactly what drives future RNG draws.
+        for (i, &t) in self.alert_timer.iter().enumerate() {
+            if self.alerted.get(i).copied().unwrap_or(false) {
+                h.write_i32(t);
+            }
+        }
+        for &p in &self.production {
+            h.write_u8(p as u8);
+        }
+    }
 }
 
 impl Campaign {
