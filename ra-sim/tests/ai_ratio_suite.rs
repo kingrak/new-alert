@@ -20,7 +20,7 @@
 
 use ra_sim::coords::{CellCoord, Facing};
 use ra_sim::{
-    AiPlayer, BuildingProto, Catalog, Difficulty, MoveStats, Passability, UnitProto,
+    AiPlayer, BuildingProto, Catalog, Command, Difficulty, MoveStats, Passability, UnitProto,
     WarheadProfile, WeaponProfile, World,
 };
 
@@ -188,8 +188,16 @@ fn catalog() -> Catalog {
 /// A single-AI world: house 1 is the computer (its MCV placed), house 0 is a
 /// passive human (no AI, no MCV) so nothing fights the economy under test.
 fn solo_ai_world(seed: u32) -> World {
+    solo_ai_world_with(seed, |_| {})
+}
+
+/// As [`solo_ai_world`] but lets the caller mutate the catalog (e.g. cap
+/// `refinery_limit` or tweak the `[IQ]` thresholds) before the world is built.
+fn solo_ai_world_with<F: FnOnce(&mut Catalog)>(seed: u32, mutate: F) -> World {
     let mut w = World::new(Passability::all_passable(), seed);
-    w.set_catalog(catalog());
+    let mut cat = catalog();
+    mutate(&mut cat);
+    w.set_catalog(cat);
     w.init_houses(2, CREDITS);
     w.spawn_unit(U_MCV, 1, CellCoord::new(40, 40), Facing(0), 400, stats());
     w.set_ai(vec![AiPlayer::new(1, Difficulty::Normal)]);
@@ -392,5 +400,169 @@ fn ai_base_composition_respects_the_rules_ratios_and_limits() {
     assert!(
         cur <= 30,
         "base of {cur} buildings looks like a runaway (ratios should self-limit)"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 3. Auto-harvester replacement, ISOLATED (revert-sensitive).
+//
+// ra-tester audit note (M7.14): the recovery test above passes even with the
+// war-factory replacement lane disabled, because the ratio system builds a 2nd
+// refinery whose *free* placement harvester (house.cpp:2640, IQ-ungated) refills
+// the count — so that test does not actually pin the replacement feature. These
+// tests cap `RefineryLimit = 1` so no 2nd refinery can be built: the ONLY path
+// back to a harvester is the AI_Unit war-factory lane (house.cpp:6075), making
+// them fail if that lane is removed.
+// ---------------------------------------------------------------------------
+
+/// Verified revert-sensitive: with `iq_ok` forced false in `produce_units`, this
+/// FAILS (harvester never returns); it passes only because the war-factory
+/// replacement lane fires. Refinery count must stay at 1 throughout (proving the
+/// recovery was NOT a new refinery's free harvester).
+#[test]
+fn killed_harvester_recovery_is_via_the_war_factory_lane_not_a_new_refinery() {
+    let mut w = solo_ai_world_with(0x11A2_0011, |c| c.econ.ai.refinery_limit = 1);
+    let ready = run_until(&mut w, 6000, |w| {
+        owns(w, 1, B_PROC) && owns(w, 1, B_WEAP) && count_units(w, 1, |u| u.is_harvester) >= 1
+    });
+    assert!(
+        ready.is_some(),
+        "AI never reached refinery + war factory + harvester"
+    );
+
+    let ref_at_kill = w
+        .house(1)
+        .unwrap()
+        .building_counts
+        .get(B_PROC as usize)
+        .copied()
+        .unwrap_or(0);
+    assert_eq!(
+        ref_at_kill, 1,
+        "RefineryLimit=1 should hold the AI to one refinery"
+    );
+
+    let harv = w
+        .units
+        .iter()
+        .find(|(_, u)| u.house == 1 && u.is_harvester)
+        .map(|(h, _)| h)
+        .expect("harvester handle");
+    w.units.remove(harv);
+
+    let recovered = run_until(&mut w, 6000, |w| count_units(w, 1, |u| u.is_harvester) >= 1);
+    assert!(
+        recovered.is_some(),
+        "AI did not replace its harvester through the war-factory lane (no 2nd refinery \
+         was available as a fallback) — the auto-harvester reflex failed to fire"
+    );
+    // The refinery count never changed: the recovery is the replacement lane, not
+    // a new refinery's free harvester.
+    let ref_after = w
+        .house(1)
+        .unwrap()
+        .building_counts
+        .get(B_PROC as usize)
+        .copied()
+        .unwrap_or(0);
+    assert_eq!(
+        ref_after, ref_at_kill,
+        "refinery count changed during recovery — the free-placement harvester, not the \
+         replacement lane, provided the harvester (test would not be isolating the feature)"
+    );
+}
+
+/// The IQ gate boundary (`IQ >= Rule.IQHarvester`, house.cpp:6075). Exactly at
+/// the threshold the lane fires; one below it does not. Runs the same scenario at
+/// `iq == IQHarvester` (must recover) and `iq == IQHarvester - 1` (must not),
+/// with `RefineryLimit = 1` so the war-factory lane is the only recovery path.
+#[test]
+fn harvester_replacement_fires_exactly_at_the_iq_harvester_threshold() {
+    let run = |iq: i32| -> bool {
+        let mut w = solo_ai_world_with(0x11A2_0012 ^ iq as u32, |c| c.econ.ai.refinery_limit = 1);
+        let threshold = w.catalog.econ.iq.harvester;
+        assert!(threshold >= 1, "IQHarvester default should be >= 1");
+        let ready = run_until(&mut w, 6000, |w| {
+            owns(w, 1, B_PROC) && owns(w, 1, B_WEAP) && count_units(w, 1, |u| u.is_harvester) >= 1
+        });
+        assert!(
+            ready.is_some(),
+            "AI never reached refinery + war factory + harvester"
+        );
+        // Pin the house's IQ to the exact test value, then kill the harvester.
+        w.houses[1].iq = iq;
+        let harv = w
+            .units
+            .iter()
+            .find(|(_, u)| u.house == 1 && u.is_harvester)
+            .map(|(h, _)| h)
+            .unwrap();
+        w.units.remove(harv);
+        run_until(&mut w, 6000, |w| count_units(w, 1, |u| u.is_harvester) >= 1).is_some()
+    };
+
+    let threshold = catalog().econ.iq.harvester;
+    assert!(
+        run(threshold),
+        "at IQ == IQHarvester ({threshold}) the replacement lane must fire"
+    );
+    assert!(
+        !run(threshold - 1),
+        "at IQ == IQHarvester-1 ({}) the replacement lane must be gated off",
+        threshold - 1
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 4. Scatter IQ gate (crux): the movement-deadlock scatter site is the forced
+//    `nokidding == true` variant (drive.cpp:1090/1214), so a ZERO-IQ house's
+//    unit is still scattered out of a committed mover's landing cell. This pins
+//    that the forced dock-nudge is IQ-independent (the Q5 human-harvester case).
+// ---------------------------------------------------------------------------
+
+/// A parked, path-empty friendly blocker owned by an explicitly IQ-0 house is
+/// still forced out of a mover's sole landing cell. (The broader M7.13 scatter
+/// suites cover the geometry; this one nails the IQ-independence explicitly by
+/// setting `house.iq = 0` and asserting the blocker still moves.)
+#[test]
+fn a_zero_iq_blocker_is_still_force_scattered_from_a_committed_movers_cell() {
+    // 1-wide horizontal corridor: row 2 of a 16×5 grid passable, all else walled.
+    let (len, h) = (16i32, 5i32);
+    let row = h / 2;
+    let mut cells = vec![false; (len * h) as usize];
+    for x in 0..len {
+        cells[(row * len + x) as usize] = true;
+    }
+    let mut w = World::new(Passability::new(len, h, cells), 0x5CA7_7E20);
+    w.set_catalog(catalog());
+    w.init_houses(2, 0);
+    // Both units belong to house 1; force house 1 to IQ 0 (a "human").
+    w.houses[1].iq = 0;
+    // Blocker parked mid-corridor (no order -> stationary), mover heading east.
+    let blocker = w.spawn_unit(U_MCV, 1, CellCoord::new(8, row), Facing(0), 400, stats());
+    let mover = w.spawn_unit(U_MCV, 1, CellCoord::new(1, row), Facing(64), 400, stats());
+    w.tick(&[Command::Move {
+        unit: mover,
+        dest: CellCoord::new(14, row),
+        house: 1,
+    }]);
+
+    let start = w.units.get(blocker).map(|u| u.cell()).unwrap();
+    let mut blocker_moved = false;
+    for _ in 0..400 {
+        w.tick(&[]);
+        if w.units
+            .get(blocker)
+            .map(|u| u.cell() != start)
+            .unwrap_or(false)
+        {
+            blocker_moved = true;
+            break;
+        }
+    }
+    assert!(
+        blocker_moved,
+        "an IQ-0 house's parked blocker was NOT force-scattered — the deadlock scatter \
+         site must be the nokidding=true forced variant (IQ-independent), cell.cpp:2025"
     );
 }
