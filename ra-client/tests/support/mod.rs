@@ -622,6 +622,13 @@ pub fn synthetic_world_for_selection_regression(seed: u32) -> (World, Handle) {
         },
     );
     world.set_unit_combat(defender, 0, Some(instant_lethal_weapon()), false);
+    // M7.11: guard acquisition is now universal, and this defender carries a
+    // map-wide (range 100_000) instant-lethal weapon — left on the default Guard
+    // mission it would, after killing the victim, auto-acquire and one-shot the
+    // free harvester spawned 20 cells away, breaking the slot-reuse regression it
+    // exists to set up. Sleep makes it fire only its pre-set target below and then
+    // stay inert (a Sleep unit still fires an explicitly-set TarCom).
+    world.set_unit_mission(defender, ra_sim::Mission::Sleep);
     if let Some(u) = world.units.get_mut(defender) {
         u.target = Some(Target::Unit(victim));
         // Already facing the victim, so the very first tick fires (no

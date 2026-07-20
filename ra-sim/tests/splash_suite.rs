@@ -496,6 +496,20 @@ fn splash_building_catalog() -> ra_sim::Catalog {
 #[test]
 fn splash_wakes_a_non_addressed_bystander_to_retaliate_against_the_shooter() {
     let mut w = world();
+    // M7.11 isolation: since guard acquisition is now universal, an armed
+    // bystander with an *enemy in weapon range* would proactively acquire it
+    // BEFORE any splash — masking the splash-retaliation path this test pins. To
+    // isolate that path we (a) ally the bystander (house 3) with the primary
+    // (house 2), so the near primary is never a guard target, and (b) give the
+    // bystander a short (1-cell) weapon so the distant shooter (house 1, ~296
+    // leptons away) is out of its guard-acquire range. The ONLY way the bystander
+    // can end up targeting the shooter is then the splash-retaliation under test.
+    w.set_alliances(vec![
+        0,
+        0,
+        1u64 << 3, // house 2 allied with house 3
+        1u64 << 2, // house 3 allied with house 2
+    ]);
     let atk = spawn_attacker(
         &mut w,
         1,
@@ -509,8 +523,12 @@ fn splash_wakes_a_non_addressed_bystander_to_retaliate_against_the_shooter() {
 
     // Idle, armed bystander at 40 leptons (a non-lethal splash hit, per the
     // armor-matrix derivation above: 4 damage against armor none), never the
-    // addressed target.
-    let bystander = spawn_armed_bystander_at(&mut w, 3, east(40), ap_90mm_instant(), 400);
+    // addressed target. Short-range weapon (see the isolation note above).
+    let short_range = WeaponProfile {
+        range: 256,
+        ..ap_90mm_instant()
+    };
+    let bystander = spawn_armed_bystander_at(&mut w, 3, east(40), short_range, 400);
     assert!(
         w.units.get(bystander).unwrap().target.is_none(),
         "sanity: bystander starts idle"

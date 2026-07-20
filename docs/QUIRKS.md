@@ -885,21 +885,25 @@ useful campaign behaviour). Documented rather than half-modelled.
 `Enter_Idle_Mode` (`unit.cpp:1343`, `order = MISSION_GUARD`). Harvesters keep the harvest
 FSM regardless of INI order.
 
-**Scope of proactive acquisition — campaign only (deliberate, documented).** The
-*proactive* guard scan (`maybe_acquire_guard_target`) and the base-under-attack alert fire
-**only in campaign worlds** (`World::campaign.is_some()`). A pure **skirmish** world keeps
-the M7 *retaliate-only* behaviour (a unit fights back when hit, but does not fire first).
-Reason: the playtest complaint is campaign-specific ("enemy units don't fight actively"),
-and enabling proactive guard in skirmish strengthens defence enough that the *tuned*
-AI-vs-AI balance no longer reaches a decisive outcome within the decisiveness suite's
-45-sim-minute budget (`scg05ea` regressed from ~11 min to a >45-min stall). Campaign-scoping
-delivers the fix exactly where it is wanted **and** leaves every skirmish/synthetic world
-byte- and behaviour-identical (zero golden churn — the strict "skirmish goldens must not
-move" constraint is met outright, not by re-pinning). This is a divergence from the
-original (which guards produced units in skirmish too); it is the coordinator-sanctioned
-"if default-Guard changes skirmish behaviour, coordinate" branch, resolved by *scoping*
-rather than re-pinning. **Revisit** when a dedicated skirmish-AI milestone can retune the
-attack cadence/force size to stay decisive with active defenders.
+**Scope of proactive acquisition — ~~campaign only~~ UNIVERSAL since M7.11 (see Q20).**
+~~The *proactive* guard scan (`maybe_acquire_guard_target`) and the base-under-attack alert
+fire **only in campaign worlds** (`World::campaign.is_some()`)... [campaign-scoping
+rationale]~~ **SUPERSEDED by M7.11 (Q20).** The campaign-only gate was removed: proactive
+guard acquisition and the base-alert now run in **all** worlds — skirmish and campaign
+alike — matching the original (`Enter_Idle_Mode` → `MISSION_GUARD` is universal,
+`unit.cpp:1343`), which is what the follow-up playtest ("the AI players still don't do
+active fight" — units on *both* sides stand passive in skirmish) demanded. The original
+scoping rationale (skirmish AI-vs-AI stalls with active defenders) was real, and it is
+resolved not by suppressing acquisition but by **retuning the skirmish AI to stay decisive**
+(escalating waves, weakest-point/production targeting, sustained-failure all-out, and a
+building-runaway fix — all in Q20). One correctness carve-out added with the universal
+change: a **healer** (negative-damage weapon, e.g. the medic) is excluded from guard
+acquisition and the base-alert (`w.damage >= 0`), so it never guard-acquires an enemy and
+heals it. The old skirmish-scoping pins in `mission_guard_depth_suite.rs` §1
+(`skirmish_world_idle_armed_unit_never_auto_acquires...`, `..._guard_target_flag_never...`)
+encoded the OLD behaviour and were **flipped** to pin the NEW universal behaviour (renamed
+`..._auto_acquires...` / `..._becomes_true_on_proactive_acquire`), with M7.11 justification
+comments.
 
 **Player orders vs. guard.** A player `Move`/`Attack` sets the target directly and clears
 [`Unit::guard_target`], so it always *chases* (never leashed); when the order finishes the
@@ -917,10 +921,14 @@ back as a whole. This stands in for the original's house/team alert propagation
 **Hash / golden discipline.** `mission` is folded into the unit hash **only when
 non-default** (≠ Guard); `guard_post`/`guard_target`/`cargo`/`board_target`/`unload_at`
 only when set/non-empty/true. So a default-guard vehicle-only world with no transport
-activity appends **no** new bytes and its byte layout is unchanged. Combined with the
-campaign-scoping above, **every pre-M7.5-B skirmish/synthetic golden is byte-identical** —
-verified by the full suite staying green with no re-pins. `type_id`/`sight`/`locomotor`/
-`capacity` remain unhashed type constants (their effect flows through hashed state).
+activity appends **no** new bytes and its byte layout is unchanged. ~~Combined with the
+campaign-scoping above, every pre-M7.5-B skirmish/synthetic golden is byte-identical.~~
+**M7.11 update:** with the campaign gate removed, skirmish worlds now *behave* differently
+(units auto-acquire), but the hash *layout* is unchanged — a skirmish golden only moves if
+its scene actually has an enemy in a guard's envelope (most goldens don't, so in practice
+no frame golden moved; the depth-suite §1 pins that *did* pin the old behaviour were
+flipped — see Q20). `type_id`/`sight`/`locomotor`/`capacity` remain unhashed type constants
+(their effect flows through hashed state).
 
 ### P1 — transports / passengers (closes Q8's APC deferral)
 
@@ -1090,3 +1098,115 @@ is unchanged from M7.5-B.
   the explicit trigger actions, not the AI's self-alert, so campaign enemies stay
   scripted until the mission says otherwise (matching the scenario author's intent
   and keeping non-triggering missions inert).
+
+---
+
+## Q20 — Active-fight parity in skirmish + decisive AI retune (M7.11)
+
+**Milestone:** M7.11 (playtest-driven: "the AI players still don't do active fight" —
+in skirmish, units on *both* sides stood passive until hit; only campaign got the
+M7.5-B guard layer, because of the Q18 campaign-only scoping gate).
+
+### P0 — remove the campaign-only gate (guard acquisition is universal)
+
+The Q18 gate (`if world.campaign.is_none() { return; }` in `maybe_acquire_guard_target`,
+and `if world.campaign.is_some()` around `alert_nearby_guards`) is **gone**. Proactive
+Guard/Area-Guard acquisition and the base-under-attack alert now run in **every** world —
+skirmish player units, skirmish AI units, campaign — matching the original, where
+`Enter_Idle_Mode` puts every produced/placed unit into `MISSION_GUARD` universally
+(`unit.cpp:1343`) and a guarding unit auto-acquires via `Target_Something_Nearby`
+(`foot.cpp:594`, `techno.cpp:5912`) regardless of single-player-vs-skirmish. Produced/placed
+units already default to `Mission::Guard` (the gate was the only thing scoped). See Q18,
+whose scoping rationale is now **superseded**.
+
+**Healer carve-out.** A **healer** — a unit whose weapon does negative damage (the medic's
+`Heal`, capability derived per Q10/Q11d) — is excluded from both `maybe_acquire_guard_target`
+and `alert_nearby_guards` (`weapon.damage >= 0`). Without this, universal guard would make a
+medic auto-target the nearest *enemy* and fire its heal at it, **healing the enemy**. Medics
+still act only through `maybe_acquire_heal_target` (friendly wounded infantry).
+
+**What the player sees now.** In skirmish, a Guard unit (produced or placed) fires first on
+any enemy that walks into its weapon range — a player tank driving past an AI base is
+engaged by the defenders *before* it lands a shot (verified: a skirmish Guard acquires on
+combat pass 1 and hits within a few ticks, never having been hit itself). Explicit
+Move/Attack orders still override guard (clear `guard_target`, chase not leash — the M7
+invariant, Q18); returning-to-post guards remain re-orderable at any time.
+
+### P1 — skirmish AI retune (stay decisive with active defenders)
+
+Enabling universal guard reproduced exactly the Q18-predicted stall: reactive/active
+defenders grind down the small dribbled attack waves, so games stopped resolving
+(`scg05ea` Normal went to a >45-min stall; Hard/Easy/`scm01ea` ballooned). Fixed by making
+attacks competent, in fidelity order (`ra-sim/src/ai.rs`):
+
+- **(a) Escalating waves.** A new `AiPlayer::failed_attacks` counter bumps each time a team
+  dissolves by decimation; the next wave's target vehicle/infantry counts scale with it
+  (`want_v += escalation*2`, `want_i += escalation`), capped at `MAX_ESCALATION`. Dribbled
+  waves that always retreat at 50% losses would stalemate forever; escalation ratchets each
+  loss into a larger commitment. No single reference mechanism maps 1:1 (the shipped
+  `Check_Attack`/`Attack` urgency counters, house.cpp:5226, are the spirit); documented as
+  tuning.
+- **(b) Attack the weakest point.** `sector_threat(house, cell)` sums enemy armed-building
+  strength within `SECTOR_THREAT_RADIUS` (6) cells of a candidate — a simplified port of
+  `HouseClass::Adjust_Threat`'s region-threat accumulation (house.cpp:2475). Target
+  selection routes the team at the enemy production building in the **lowest-threat sector**.
+- **(c) Focus and finish.** `enemy_target` now prefers **production** buildings (war
+  factory / construction yard / barracks) — the original's `QUARRY_FACTORIES` quarry
+  (`defines.h:2477`) — over the nearest arbitrary building, so a breakthrough cripples the
+  enemy's ability to reinforce. Falls back to nearest building, then nearest unit.
+- **(d) Sustained-failure all-out.** Once `failed_attacks >= ALL_OUT_ESCALATION` (4), the AI
+  abandons the cautious stage-and-retreat cadence and commits every armed non-harvester unit
+  to a relentless assault on enemy production, re-pointing only idle/auto-guarding units each
+  tick (a port of `Do_All_To_Hunt`, house.cpp:7651, triggered by offensive failure rather
+  than only production loss). This is what guarantees a decision. The existing fire-sale +
+  all-hunt lost-cause endgame (Q16) still applies to the loser.
+
+**Building-runaway fix (the actual decisiveness blocker).** The rubber-band building cap
+`max(self, avg_enemy+10)` (house.cpp:5010) is a positive-feedback loop: two symmetric bases
+raise each other's cap without bound, so the discretionary spare-power tail spammed
+*hundreds* of plants and **walled the base in** — units could no longer path out to attack,
+an eternal stalemate (surfaced once active defenders made attacks fail before damaging the
+enemy base). The spare power plant in `next_structure` step 4 is now gated on an actual power
+**deficit** (`low_power`) — step 1 already covers real deficits — bounding base growth to
+what the economy/defense/tech steps justify. This was the dominant fix; without it no amount
+of attack tuning resolved the synthetic symmetric fixture.
+
+**No test-budget change needed.** With the retune, real-map AI-vs-AI resolves decisively at
+**every** difficulty on **both** scenarios within the existing 45-sim-minute budget (the
+P1d "raise budget + progress assertion" fallback was not needed). Game-length before→after
+the retune (real assets, universal guard on both sides):
+
+| scenario / config        | before (P0-only) | after (P1 retune) |
+|--------------------------|------------------|-------------------|
+| scg05ea Hard-vs-Hard     | 10 594 t         | 16 663 t (18.5 m) |
+| scg05ea Normal-vs-Normal | STALL (>45 m)    | 14 566 t (16.2 m) |
+| scg05ea Easy-vs-Easy     | STALL (>45 m)    | 20 071 t (22.3 m) |
+| scm01ea Hard-vs-Hard     | 31 577 t         | 14 904 t (16.6 m) |
+
+(Pre-M7.11 campaign-scoped baselines, for reference: scg05ea Hard 7 832 t, Normal 10 102 t,
+Easy 26 786 t; scm01ea Hard 18 544 t.) Hard still reliably beats Easy in both orientations
+(start-independent). Same-seed determinism holds (new AI state — `failed_attacks` — folds
+into the hash only when non-zero, and the whole AI hash only fires for worlds that have an AI,
+so no non-AI golden moved).
+
+### Golden / re-pin inventory
+
+- **Flipped (legitimate — old behaviour was the campaign-scoping gate):**
+  `mission_guard_depth_suite.rs` §1 —
+  `skirmish_world_idle_armed_unit_never_auto_acquires...` →
+  `..._auto_acquires_a_nearby_enemy` (now asserts skirmish acquisition);
+  `skirmish_world_guard_target_flag_never_becomes_true` →
+  `..._becomes_true_on_proactive_acquire`. Both carry M7.11 justification comments.
+- **Fixture isolation (behaviour under test unchanged, only shielded from the new universal
+  guard):** `world.rs::attack_needs_ownership_and_a_weapon` (enemy moved out of guard range);
+  `splash_suite::splash_wakes_a_non_addressed_bystander...` (bystander allied to the primary +
+  short weapon, so only splash-retaliation can set its target); `subcell_suite::infantry_death
+  _frees_its_spot_for_reuse` and `ui_scripted_drive::synthetic_selection_does_not_survive_slot
+  _reuse_after_kill` + its `support::synthetic_world_for_selection_regression` fixture (the
+  scripted armed killer set to `Sleep` so it stops after its one kill instead of auto-hunting
+  the next friendly). `support_suite`'s medic pins pass unchanged once the healer carve-out
+  landed.
+- **Did NOT move (verified):** every frame golden (`ui_shroud_golden`, `ui_golden_frames`,
+  `ui_menu_golden_frames`), the synthetic single-unit movement oracle (`determinism.rs`), and
+  **all campaign goldens** (`campaign_scg01ea`, `campaign_activation_*`, `campaign_difficulty
+  _depth_suite`) — campaign already ran guard acquisition, so its behaviour is unchanged.

@@ -12,7 +12,7 @@
 
 use ra_sim::coords::{CellCoord, Facing, SPOT_OFFSET, SUBCELL_COUNT};
 use ra_sim::{
-    Command, Handle, MoveStats, Passability, Target, WarheadProfile, WeaponProfile, World,
+    Command, Handle, Mission, MoveStats, Passability, Target, WarheadProfile, WeaponProfile, World,
 };
 
 fn stats(speed: i32, rot: u8) -> MoveStats {
@@ -382,6 +382,13 @@ fn infantry_death_frees_its_spot_for_reuse() {
         stats(20, 8),
     );
     world.set_unit_combat(atk, 0, Some(sa_weapon()), true);
+    // M7.11 isolation: guard acquisition is now universal, so after its scripted
+    // kill this armed attacker would return to Guard and keep auto-firing at the
+    // adjacent house-1 infantry (and the incoming 6th), corrupting the spot-reuse
+    // count under test. Sleep keeps it inert *except* for the explicit Attack
+    // order below (a Sleep unit still fires when directly ordered), so it kills
+    // exactly the victim and nothing else.
+    world.set_unit_mission(atk, Mission::Sleep);
     world.tick(&[Command::Attack {
         unit: atk,
         target: Target::Unit(victim),

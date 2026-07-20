@@ -200,7 +200,27 @@ pub struct AiPlayer {
     max_buildings: u32,
     /// The one active composed attack team, if any (M7.10 d).
     team: Option<Team>,
+    /// Consecutive attack teams dissolved by decimation (M7.11 P1a — escalating
+    /// waves). Each decimated team bumps this; it scales the next wave's size so
+    /// repeated failed attacks eventually commit an overwhelming force, keeping
+    /// AI-vs-AI decisive even against active defenders (the M7.11 skirmish parity
+    /// change). Capped at [`MAX_ESCALATION`]. Stands in for the original's rising
+    /// attack urgency (`Check_Attack`/`Attack` counters, house.cpp:5226) — no
+    /// single mechanism maps 1:1, so this is documented as tuning.
+    failed_attacks: u32,
 }
+
+/// Cap on the consecutive-failure escalation counter (M7.11 P1a). Once reached,
+/// a wave already commits effectively the whole reachable army, so further
+/// growth is pointless — the cap keeps the value bounded (and its hash stable).
+const MAX_ESCALATION: u32 = 8;
+
+/// Consecutive decimated waves after which the AI abandons staged waves and goes
+/// **all-out** (M7.11 P1d). Below this, escalating staged waves (P1a) apply
+/// graduated pressure; at/above it, the whole army assaults enemy production
+/// continuously. Chosen so a few genuine failures still play out as normal waves
+/// (fidelity) before committing everything (decisiveness).
+const ALL_OUT_ESCALATION: u32 = 4;
 
 /// Economy/build decisions are re-evaluated on this cadence (~1 s), matching the
 /// original's `AI_Building` returning `TICKS_PER_SECOND` (`house.cpp` return).
@@ -221,6 +241,7 @@ impl AiPlayer {
             max_units: 0,
             max_buildings: 0,
             team: None,
+            failed_attacks: 0,
         }
     }
 
@@ -249,6 +270,10 @@ impl AiPlayer {
         if let Some(t) = &self.team {
             h.write_u8(0x7E);
             t.hash_into(h);
+        }
+        if self.failed_attacks != 0 {
+            h.write_u8(0xFA);
+            h.write_u32(self.failed_attacks);
         }
     }
 
@@ -564,6 +589,17 @@ impl AiPlayer {
         // discretionary spare-power fallback builds forever, spamming plants until
         // the base walls itself in (units can't path out to attack). `0` cap
         // (pre-Expert_AI) means uncapped.
+        //
+        // **M7.11 runaway fix.** The rubber-band cap `max(self, avg_enemy+10)`
+        // (house.cpp:5010) is a positive feedback loop: two symmetric bases raise
+        // each other's cap without bound, so `under_bcap` stays true forever and the
+        // spare-power tail spammed *hundreds* of plants, walling the base in so no
+        // unit could ever path out to attack (an eternal stalemate — surfaced by the
+        // synthetic AI-vs-AI fixture once active defenders made attacks fail before
+        // damaging the enemy base). We now gate the spare power plant on an actual
+        // power **deficit** (`low_power`) — step 1 already covers real deficits, so
+        // this discretionary tail no longer runs when power is already sufficient,
+        // bounding base growth to what the economy/defense/tech steps above justify.
         let under_bcap = self.max_buildings == 0
             || self.building_size(world, self.house) < self.max_buildings as i32;
         if under_bcap {
@@ -572,9 +608,11 @@ impl AiPlayer {
                     return Some(r);
                 }
             }
-            if let Some(p) = power_id {
-                if self.buildable(world, hs, p) {
-                    return Some(p);
+            if low_power {
+                if let Some(p) = power_id {
+                    if self.buildable(world, hs, p) {
+                        return Some(p);
+                    }
                 }
             }
         }
@@ -703,6 +741,21 @@ impl AiPlayer {
     /// decimated (the fear/retreat threshold), with an occasional
     /// harvester-harassment team.
     fn manage_team(&mut self, world: &World, rng: &mut RandomLcg, out: &mut Vec<Command>) {
+        // Sustained-failure endgame (M7.11 P1d — `Do_All_To_Hunt`, house.cpp:7651).
+        // After `ALL_OUT_ESCALATION` consecutive decimated waves, abandon the
+        // cautious stage-and-retreat cadence and commit the whole army to a
+        // relentless assault on enemy production, re-pointing any idle or merely
+        // auto-guarding armed unit each tick (units already attack-ordered keep
+        // their target — `guard_target` cleared, so they aren't re-issued). This is
+        // what guarantees a decision against active defenders: dribbled waves that
+        // always retreat at 50% losses can stalemate forever (the observed
+        // scg05ea/Easy stall), whereas an all-out assault presses until one side's
+        // production falls and the loser's own fire-sale/all-hunt finishes it.
+        if self.failed_attacks >= ALL_OUT_ESCALATION {
+            self.team = None;
+            self.all_out_assault(world, out);
+            return;
+        }
         if self.team.is_some() {
             self.advance_team(world, out);
             return;
@@ -738,6 +791,13 @@ impl AiPlayer {
         // the base and the slot frees for a fresh team.
         let retreat_floor = (team.initial_size / 2).max(2);
         if alive < retreat_floor {
+            // Escalate: a team ground down below half its size failed to break the
+            // enemy's defense — bump the failure counter so the *next* wave is
+            // bigger (M7.11 P1a). Capped so it stays bounded/hashable. This is the
+            // mechanism that keeps AI-vs-AI decisive with active defenders: dribbled
+            // small waves would stalemate forever, but each loss makes the next
+            // commitment larger until a wave overwhelms the defense.
+            self.failed_attacks = (self.failed_attacks + 1).min(MAX_ESCALATION);
             let base = self.base_center(world);
             for &unit in &team.members {
                 out.push(Command::Move {
@@ -807,6 +867,32 @@ impl AiPlayer {
         self.team = Some(team);
     }
 
+    /// Commit every armed, non-harvester unit to a relentless assault on enemy
+    /// production (M7.11 P1d, `Do_All_To_Hunt`). Only idle or auto-guarding units
+    /// are (re)ordered, so an already-attacking unit keeps its target and command
+    /// volume stays low; as production buildings fall, `enemy_target` re-points the
+    /// army at the next-weakest one until the enemy is finished.
+    fn all_out_assault(&self, world: &World, out: &mut Vec<Command>) {
+        let Some(target) = self.enemy_target(world) else {
+            return;
+        };
+        for h in world.units.handles() {
+            if let Some(u) = world.units.get(h) {
+                if u.house == self.house
+                    && u.weapon.is_some()
+                    && !u.is_harvester
+                    && (u.target.is_none() || u.guard_target)
+                {
+                    out.push(Command::Attack {
+                        unit: h,
+                        target,
+                        house: self.house,
+                    });
+                }
+            }
+        }
+    }
+
     /// Form a composed team from idle forces: a weighted vehicle+infantry mix
     /// (`team_vehicles` vehicles + 0..2 infantry), a staging cell near the base
     /// edge toward the enemy, and — occasionally — a harvester-harassment mission
@@ -869,9 +955,20 @@ impl AiPlayer {
         }
 
         // Composition: a weighted vehicle+infantry mix. Vehicles: difficulty base
-        // ±1; infantry: 0..2. Clamped to what is actually idle + reachable.
-        let want_i = rng.range(0, 2).clamp(0, infantry.len() as i32) as usize;
-        let mut want_v = (self.difficulty.team_vehicles() + rng.range(-1, 1))
+        // ±1; infantry: 0..2. Clamped to what is actually idle + reachable. The
+        // RNG draws (infantry count, then vehicle jitter) stay in a fixed order so
+        // same-seed runs match; the escalation term is added deterministically.
+        let want_i_raw = rng.range(0, 2);
+        let jitter = rng.range(-1, 1);
+        // M7.11 P1a — escalating waves: each consecutive decimated team adds to the
+        // next wave's target size (vehicles ~2x infantry), so a stalled offensive
+        // ratchets up until it commits an overwhelming force. `escalation` is 0 for
+        // a fresh/successful attacker (unchanged behaviour) and grows to
+        // `MAX_ESCALATION`, at which point a wave takes effectively every reachable
+        // armed unit.
+        let escalation = self.failed_attacks as i32;
+        let want_i = (want_i_raw + escalation).clamp(0, infantry.len() as i32) as usize;
+        let mut want_v = (self.difficulty.team_vehicles() + jitter + escalation * 2)
             .clamp(0, vehicles.len() as i32) as usize;
         // Top up the vehicle count so the team reaches the difficulty's minimum
         // force when enough units exist (a pure-vehicle team still qualifies) —
@@ -949,15 +1046,68 @@ impl AiPlayer {
         }
     }
 
-    /// The designated enemy's nearest building to our base, else any nearest
-    /// enemy target — the objective a base-assault team heads for.
+    /// The objective a base-assault team heads for. Target selection follows the
+    /// original's quarry preference `QUARRY_FACTORIES` (attack production buildings,
+    /// `defines.h:2477`): **focus and finish** by going for the enemy's *production*
+    /// (war factory / construction yard / barracks) first, so a breakthrough
+    /// cripples the enemy's ability to reinforce and drives the game to a decision
+    /// (M7.11 P1c). Among candidate production buildings we pick the one in the
+    /// **weakest-defended sector** — lowest summed nearby defense strength, a
+    /// simplified `HouseClass::Adjust_Threat` region scan (house.cpp:2475) — so the
+    /// team attacks the enemy base at its soft point (M7.11 P1b), tie-broken by
+    /// nearest to our base. Falls back to the nearest building, then nearest unit.
     fn enemy_target(&self, world: &World) -> Option<Target> {
         let base = self.base_center(world);
-        // Prefer the designated enemy's base (Expert_AI `Enemy`).
+
+        // Candidate production buildings, preferring the designated enemy's; if the
+        // designated enemy has none live, consider every enemy's production.
+        let want_house = |house: u8| match self.enemy {
+            Some(e) => house == e,
+            None => house != self.house,
+        };
+        let mut pick: Option<(i64, i64, crate::Handle)> = None; // (threat, dist², handle)
+        for (h, b) in world.buildings.iter() {
+            if b.is_alive() && !b.is_wall && want_house(b.house) && is_production(world, b) {
+                let cell = b.center_cell();
+                let threat = self.sector_threat(world, b.house, cell);
+                let dist = sq_dist(cell, base);
+                if pick
+                    .map(|(pt, pd, _)| (threat, dist) < (pt, pd))
+                    .unwrap_or(true)
+                {
+                    pick = Some((threat, dist, h));
+                }
+            }
+        }
+        // If the designated enemy had no production building, retry across ALL
+        // enemies before giving up on the production quarry (a designated enemy
+        // reduced to non-production buildings still shouldn't make us ignore a
+        // reachable enemy factory elsewhere).
+        if pick.is_none() && self.enemy.is_some() {
+            for (h, b) in world.buildings.iter() {
+                if b.is_alive() && !b.is_wall && b.house != self.house && is_production(world, b) {
+                    let cell = b.center_cell();
+                    let threat = self.sector_threat(world, b.house, cell);
+                    let dist = sq_dist(cell, base);
+                    if pick
+                        .map(|(pt, pd, _)| (threat, dist) < (pt, pd))
+                        .unwrap_or(true)
+                    {
+                        pick = Some((threat, dist, h));
+                    }
+                }
+            }
+        }
+        if let Some((_, _, h)) = pick {
+            return Some(Target::Building(h));
+        }
+
+        // No production buildings left anywhere: fall to the designated enemy's
+        // nearest building, then the nearest enemy target of any kind.
         if let Some(e) = self.enemy {
             let mut best: Option<(i64, crate::Handle)> = None;
             for (h, b) in world.buildings.iter() {
-                if b.house == e && b.is_alive() {
+                if b.house == e && b.is_alive() && !b.is_wall {
                     let d = sq_dist(b.center_cell(), base);
                     if best.map(|(bd, _)| d < bd).unwrap_or(true) {
                         best = Some((d, h));
@@ -969,6 +1119,30 @@ impl AiPlayer {
             }
         }
         self.nearest_enemy_target(world, base)
+    }
+
+    /// Summed defense strength of `house`'s armed, non-wall buildings within
+    /// [`SECTOR_THREAT_RADIUS`] cells of `at` — a simplified port of
+    /// `HouseClass::Adjust_Threat`'s region threat accumulation (house.cpp:2475),
+    /// collapsed to a single local sum. Used to route attacks toward the enemy
+    /// base's weakest-defended production building (M7.11 P1b).
+    fn sector_threat(&self, world: &World, house: u8, at: CellCoord) -> i64 {
+        let cat = &world.catalog;
+        let mut threat = 0i64;
+        for (_, b) in world.buildings.iter() {
+            if b.house == house
+                && b.is_alive()
+                && !b.is_wall
+                && cat
+                    .building(b.type_id)
+                    .map(|p| p.weapon.is_some())
+                    .unwrap_or(false)
+                && cell_distance(b.center_cell(), at) <= SECTOR_THREAT_RADIUS
+            {
+                threat += b.health as i64;
+            }
+        }
+        threat
     }
 
     /// The nearest enemy harvester to our base (harassment target), if any.
@@ -1342,6 +1516,20 @@ enum Role {
     Refinery,
     WarFactory,
     Barracks,
+}
+
+/// Radius (cells) of the local defense-threat scan used to route attacks toward
+/// the enemy base's weakest-defended production building (M7.11 P1b). A modest
+/// sector around each candidate — large enough to feel a base-defense cluster,
+/// small enough to distinguish the guarded side from the soft side.
+const SECTOR_THREAT_RADIUS: i32 = 6;
+
+/// Whether a building is a **production** building (the `QUARRY_FACTORIES` quarry,
+/// `defines.h:2477`): a war factory, construction yard, or barracks. These are the
+/// "focus and finish" priority targets (M7.11 P1c) — killing them stops the enemy
+/// reinforcing.
+fn is_production(_world: &World, b: &crate::building::Building) -> bool {
+    b.is_war_factory || b.is_construction_yard || b.is_barracks
 }
 
 /// Cell distance between two cells (Chebyshev — the max of the axis deltas),

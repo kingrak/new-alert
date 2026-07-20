@@ -97,14 +97,22 @@ fn skirmish_world() -> World {
 }
 
 // ===========================================================================
-// §1 — skirmish-vs-campaign scoping (Q18's "campaign only" gate), both
-// directions pinned. This is the audit's headline claim: a skirmish world's
-// idle armed unit near an enemy must NOT auto-acquire (M7 retaliate-only
-// preserved); the identical geometry in a campaign world MUST.
+// §1 — universal guard acquisition (M7.11 — the Q18 "campaign only" gate is
+// REMOVED). Proactive Guard acquisition and the base-alert now run in ALL
+// worlds, matching the original (`Enter_Idle_Mode` → MISSION_GUARD is universal,
+// `unit.cpp:1343`). These pins previously encoded the OLD skirmish-scoped
+// behaviour; they now pin the NEW universal behaviour: a skirmish world's idle
+// armed unit near an enemy MUST auto-acquire, exactly as a campaign one does.
+// The M7.11 milestone retunes the skirmish AI (see `ai.rs`) to stay decisive
+// with active defenders rather than by suppressing acquisition.
 // ===========================================================================
 
 #[test]
-fn skirmish_world_idle_armed_unit_never_auto_acquires_a_nearby_enemy() {
+fn skirmish_world_idle_armed_unit_auto_acquires_a_nearby_enemy() {
+    // M7.11: FLIPPED from the M7.5-B `..._never_auto_acquires_...` pin. Guard
+    // acquisition is now universal, so a skirmish world behaves exactly like the
+    // campaign one below — this is the whole point of the milestone (the playtest
+    // complaint "AI players still don't do active fight" in skirmish).
     let mut w = skirmish_world();
     let guard = w.spawn_unit(0, 1, CellCoord::new(10, 10), Facing(0), 400, stats());
     w.set_unit_combat(guard, 0, Some(gun()), true);
@@ -114,18 +122,24 @@ fn skirmish_world_idle_armed_unit_never_auto_acquires_a_nearby_enemy() {
     w.set_unit_combat(enemy, 0, Some(gun()), true);
     w.set_unit_mission(enemy, Mission::Sleep); // keep the enemy passive too
 
-    for _ in 0..80 {
+    let mut acquired = false;
+    for _ in 0..40 {
         w.tick(&[]);
+        if w.units.get(guard).unwrap().target.is_some() {
+            acquired = true;
+        }
+        if w.units.get(enemy).unwrap().health < 400 {
+            break;
+        }
     }
     assert!(
-        w.units.get(guard).unwrap().target.is_none(),
-        "M7 retaliate-only must be preserved in skirmish: an idle Guard unit \
-         must never proactively acquire, no matter how long it waits"
+        acquired,
+        "M7.11: a skirmish Guard unit MUST proactively acquire a nearby enemy \
+         (the campaign-only gate is gone; acquisition is now universal)"
     );
-    assert_eq!(
-        w.units.get(enemy).unwrap().health,
-        400,
-        "no shot was ever fired by either side"
+    assert!(
+        w.units.get(enemy).unwrap().health < 400,
+        "acquisition must lead to an actual engagement even in skirmish"
     );
 }
 
@@ -150,9 +164,8 @@ fn campaign_world_identical_geometry_does_auto_acquire() {
     }
     assert!(
         acquired,
-        "the identical geometry in a campaign world must auto-acquire \
-         (the M7.5-B fix — the ONLY difference from the skirmish case above is \
-         `World::campaign.is_some()`)"
+        "a campaign world must auto-acquire (M7.11: now the SAME code path as \
+         the skirmish case above — the campaign/skirmish distinction is gone)"
     );
     assert!(
         w.units.get(enemy).unwrap().health < 400,
@@ -160,32 +173,33 @@ fn campaign_world_identical_geometry_does_auto_acquire() {
     );
 }
 
-/// `guard_target` — the flag that gates the leash — must never be set in a
-/// skirmish world (it is only ever set from the two campaign-gated
-/// functions), which is *why* the M7.10 `ai.rs` recruit-filter relaxation
-/// (`u.target.is_none() || u.guard_target`) is a no-op for skirmish: the extra
-/// disjunct can never be true there. This is the structural reason the coder's
-/// "zero golden re-pins" claim holds for the AI brain too, not just missions.
+/// `guard_target` — the flag that gates the leash — is now set in skirmish
+/// worlds too (M7.11: universal guard acquisition). This FLIPS the M7.5-B
+/// `..._never_becomes_true` pin: a skirmish Guard unit that proactively
+/// acquires flags its auto-target `guard_target=true` (so the leash applies),
+/// exactly as a campaign one does.
 #[test]
-fn skirmish_world_guard_target_flag_never_becomes_true() {
+fn skirmish_world_guard_target_flag_becomes_true_on_proactive_acquire() {
     let mut w = skirmish_world();
     let guard = w.spawn_unit(0, 1, CellCoord::new(10, 10), Facing(0), 400, stats());
     w.set_unit_combat(guard, 0, Some(gun()), true);
     let enemy = w.spawn_unit(0, 2, CellCoord::new(11, 10), Facing(0), 400, stats());
     w.set_unit_combat(enemy, 0, Some(gun()), true);
-    // Let the enemy retaliate normally (default Guard) to exercise the
-    // Attack-command / retaliation paths too, none of which ever set
-    // `guard_target` in a skirmish world.
-    w.tick(&[Command::Attack {
-        unit: guard,
-        target: Target::Unit(enemy),
-        house: 1,
-    }]);
+    w.set_unit_mission(enemy, Mission::Sleep); // passive: only proactive acquire can set the flag
+
+    let mut flagged = false;
     for _ in 0..40 {
         w.tick(&[]);
+        if w.units.get(guard).unwrap().guard_target {
+            flagged = true;
+            break;
+        }
     }
-    assert!(!w.units.get(guard).unwrap().guard_target);
-    assert!(!w.units.get(enemy).unwrap().guard_target);
+    assert!(
+        flagged,
+        "M7.11: a skirmish Guard unit's proactively-acquired target must be \
+         flagged `guard_target` (leashed), just like in campaign"
+    );
 }
 
 // ===========================================================================

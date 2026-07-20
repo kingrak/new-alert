@@ -3732,23 +3732,27 @@ const AREA_GUARD_MAX_RANGE: i32 = 0x0A00;
 /// the leash (plain Guard never chases; Area Guard chases but races home when it
 /// strays more than weapon range from its post).
 fn maybe_acquire_guard_target(world: &mut World, handle: Handle) {
-    // Proactive guard acquisition (and the base-alert below) is scoped to
-    // **campaign** worlds. This is the M7.5-B fix for the playtest complaint
-    // ("enemy units don't fight actively"): scenario-placed Guard/Area-Guard units
-    // now engage. A pure **skirmish** world (`campaign == None`) deliberately keeps
-    // the M7 retaliate-only behaviour — enabling proactive guard there strengthens
-    // defence so much that the tuned AI-vs-AI balance no longer reaches a decisive
-    // outcome within its budget, and every skirmish/synthetic golden would move.
-    // A documented, coordinator-sanctioned scoping (QUIRKS Q18): campaign is where
-    // the complaint lives, and this keeps skirmish byte- and behaviour-identical.
-    if world.campaign.is_none() {
-        return;
-    }
+    // Proactive guard acquisition (and the base-alert in `explosion_damage`) runs
+    // in **all** worlds — skirmish and campaign alike (M7.11). This is the
+    // original's universal behaviour: `Enter_Idle_Mode` puts every produced/placed
+    // unit into `MISSION_GUARD` (`unit.cpp:1343`), and a guarding unit auto-acquires
+    // via `Target_Something_Nearby` (`foot.cpp:594`, `techno.cpp:5912`) regardless of
+    // single-player-vs-skirmish. The M7.5-B campaign-only gate (QUIRKS Q18) has been
+    // removed: the playtest complaint ("AI players still don't do active fight") is
+    // skirmish-specific, and the skirmish AI is retuned (M7.11 P1) to stay decisive
+    // with active defenders rather than by suppressing them.
     let (mission, house, coord, post, range) = match world.units.get(handle) {
         Some(u) => {
             let range = match u.weapon {
-                Some(w) => w.range,
-                None => return,
+                // A **healer** (negative-damage "weapon", e.g. the medic's Heal —
+                // capability derived from `damage < 0`, Q10/Q11d) must NOT proactively
+                // guard-acquire: it would target the nearest *enemy* and then fire its
+                // heal at it, healing the enemy. Medics only ever act through
+                // `maybe_acquire_heal_target` (friendly wounded infantry). Exclude
+                // them here (and in `alert_nearby_guards`) so universal guard
+                // acquisition doesn't turn medics into enemy-healers.
+                Some(w) if w.damage >= 0 => w.range,
+                _ => return,
             };
             if !u.mission.is_guarding() || !u.is_alive() || u.target.is_some() || !u.path.is_empty()
             {
@@ -3809,7 +3813,9 @@ fn alert_nearby_guards(
         .filter(|(_, u)| {
             u.is_alive()
                 && u.mission.is_guarding()
-                && u.weapon.is_some()
+                // Armed with a real (damage-dealing) weapon — a healer (negative
+                // damage) is excluded, same reason as `maybe_acquire_guard_target`.
+                && u.weapon.map(|w| w.damage >= 0).unwrap_or(false)
                 && u.target.is_none()
                 && u.path.is_empty()
                 && !world.are_allies(u.house, source_house)
@@ -4179,15 +4185,14 @@ fn explosion_damage(
         }
     }
 
-    // --- Base-under-attack alert (M7.5-B) ---
+    // --- Base-under-attack alert (M7.5-B; universal since M7.11) ---
     // A live enemy shot landing here wakes nearby idle friendly guards to the
     // attacker, so a guarded base fights back as a whole even when the shooter is
-    // out of an individual guard's sight/acquire range. Campaign-scoped, for the
-    // same reason as `maybe_acquire_guard_target` (skirmish keeps M7 behaviour).
-    if world.campaign.is_some() {
-        if let Some(sh) = source_house {
-            alert_nearby_guards(world, impact_cell, sh, source);
-        }
+    // out of an individual guard's sight/acquire range. Runs in all worlds now
+    // (skirmish + campaign), matching the removal of the guard-acquisition gate
+    // above — see `maybe_acquire_guard_target` and QUIRKS Q18.
+    if let Some(sh) = source_house {
+        alert_nearby_guards(world, impact_cell, sh, source);
     }
 }
 
@@ -5581,7 +5586,12 @@ mod tests {
     fn attack_needs_ownership_and_a_weapon() {
         let mut w = world();
         let armed = spawn_tank(&mut w, 1, CellCoord::new(5, 5), 400);
-        let tgt = w.spawn_unit(0, 2, CellCoord::new(6, 5), Facing(0), 100, stats());
+        // Place the enemy FAR out of weapon range: since M7.11 an idle armed
+        // default-Guard unit proactively auto-acquires any enemy within weapon
+        // range (universal guard acquisition), which would mask the "command
+        // ignored" behaviour this test isolates. Out of range, the only way
+        // `armed` could gain a target is the (rejected) Attack command.
+        let tgt = w.spawn_unit(0, 2, CellCoord::new(60, 60), Facing(0), 100, stats());
         // Wrong house: ignored.
         w.tick(&[Command::Attack {
             unit: armed,

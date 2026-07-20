@@ -404,3 +404,118 @@ proptest! {
         apply_ops(&mut a, &ops);
     }
 }
+
+// ===========================================================================
+// M7.5-C depth (ra-tester): explicit, deterministic coverage of the briefing
+// difficulty-selector row's five focus positions (START/BACK/EASY/NORMAL/
+// HARD). The proptest monkeys above reach `Briefing` and can land on any of
+// these by chance, but nothing pins that every single one is exercised and
+// that each produces exactly the documented transition -- a self-loop
+// (Briefing -> Briefing) for the three difficulty buttons, or the pre-
+// existing documented edges for START/BACK. This closes that gap without
+// relying on proptest's randomness to eventually cover all five.
+// ===========================================================================
+
+/// Navigate from a fresh `App` to `Briefing` (mission 0).
+fn fresh_app_at_briefing() -> ra_client::menu::App {
+    let mut a = menu_app_with_campaign();
+    a.handle(InputEvent::KeyDown(Key::Down)); // focus CAMPAIGN
+    a.handle(InputEvent::KeyDown(Key::Confirm)); // -> CampaignList
+    a.handle(InputEvent::KeyDown(Key::Confirm)); // select mission 0 -> Briefing
+    assert_eq!(a.state(), AppState::Briefing);
+    a
+}
+
+#[test]
+fn briefing_every_focus_position_produces_only_a_documented_transition() {
+    use ra_client::menu::DIFFICULTIES;
+
+    // Item order is [START(0), BACK(1), EASY(2), NORMAL(3), HARD(4)]
+    // (`items_briefing`, menu.rs). Confirm each position from a fresh app so
+    // there is no cross-iteration state to reason about.
+    for idx in 0..5usize {
+        let mut a = fresh_app_at_briefing();
+        let before = a.state();
+        for _ in 0..idx {
+            a.handle(InputEvent::KeyDown(Key::Down));
+        }
+        a.handle(InputEvent::KeyDown(Key::Confirm));
+        let after = a.state();
+
+        match idx {
+            0 => assert_eq!(
+                after,
+                AppState::InGame,
+                "START MISSION (idx 0) must enter InGame"
+            ),
+            1 => assert_eq!(
+                after,
+                AppState::CampaignList,
+                "BACK (idx 1) must return to CampaignList"
+            ),
+            2..=4 => {
+                assert_eq!(
+                    after,
+                    AppState::Briefing,
+                    "difficulty button (idx {idx}) must self-loop on Briefing, not transition away"
+                );
+                let want = DIFFICULTIES[idx - 2].1;
+                assert_eq!(
+                    a.campaign_difficulty(),
+                    want,
+                    "idx {idx} must select {:?}",
+                    DIFFICULTIES[idx - 2].0
+                );
+            }
+            _ => unreachable!(),
+        }
+        // Every transition here (or the `before == after` self-loop) must be
+        // one `valid_transition` already documents.
+        if before != after {
+            assert!(
+                valid_transition(before, after),
+                "idx {idx}: undocumented transition {before:?} -> {after:?}"
+            );
+        }
+    }
+}
+
+/// Selecting each of the three difficulty buttons in sequence (without
+/// leaving Briefing) must each independently take effect — no "sticks on the
+/// first selection" bug, and focus wraparound after a selection lands back on
+/// a sane position (self-loop every time).
+#[test]
+fn briefing_difficulty_selection_is_idempotent_and_re_selectable() {
+    use ra_client::menu::DIFFICULTIES;
+    let mut a = fresh_app_at_briefing();
+    assert_eq!(
+        a.campaign_difficulty(),
+        ra_sim::Difficulty::Normal,
+        "default is Normal"
+    );
+
+    // EASY (idx 2), then HARD (idx 4), then NORMAL (idx 3), then EASY again --
+    // each selection from the Briefing screen, focus reset via BACK+re-enter
+    // is not needed since each difficulty press is itself a self-loop.
+    let sequence = [2usize, 4, 3, 2];
+    let mut focus = 0usize; // Briefing always starts at focus 0 (START).
+    for &idx in &sequence {
+        // Move focus from wherever it currently sits to idx (wrapping Down).
+        let steps = (idx + 5 - focus) % 5;
+        for _ in 0..steps {
+            a.handle(InputEvent::KeyDown(Key::Down));
+        }
+        a.handle(InputEvent::KeyDown(Key::Confirm));
+        assert_eq!(
+            a.state(),
+            AppState::Briefing,
+            "stays on Briefing after selecting idx {idx}"
+        );
+        assert_eq!(
+            a.campaign_difficulty(),
+            DIFFICULTIES[idx - 2].1,
+            "idx {idx} took effect"
+        );
+        focus = idx;
+    }
+}
