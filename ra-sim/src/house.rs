@@ -199,6 +199,14 @@ pub struct House {
     /// enemy scoring). `None` until first attacked. Not hashed (same rationale as
     /// the kill tallies).
     pub last_attacker: Option<u8>,
+    /// The house's **IQ rating** (`HouseClass::IQ`, `house.cpp:7454`), gating which
+    /// automatic behaviours it may perform against the `[IQ]` thresholds
+    /// ([`crate::IqRules`]). A computer house runs at `Rule.MaxIQ`
+    /// (`scenario.cpp:2890`); a human runs at `0` — set by [`crate::World::set_ai`]
+    /// for skirmish AI houses (M7.14 P0). Defaults to `0`. Folded into the hash
+    /// **only when non-zero**, so every human/synthetic house (iq 0) is
+    /// byte-identical to the pre-M7.14 layout and only AI-bearing houses change.
+    pub iq: i32,
 }
 
 impl House {
@@ -218,6 +226,7 @@ impl House {
             units_killed_by: Vec::new(),
             buildings_killed_by: Vec::new(),
             last_attacker: None,
+            iq: 0,
         }
     }
 
@@ -419,6 +428,13 @@ impl House {
         if !self.handicap.is_neutral() {
             h.write_u8(0x2A);
             self.handicap.hash_into(h);
+        }
+        // House IQ (M7.14 P0). Folded in ONLY when non-zero, so every human /
+        // synthetic house (iq 0) appends no bytes and hashes identically to the
+        // pre-M7.14 layout; only AI-bearing houses (iq = MaxIQ) change.
+        if self.iq != 0 {
+            h.write_u8(0x1B);
+            h.write_i32(self.iq);
         }
     }
 }

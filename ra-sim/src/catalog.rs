@@ -12,6 +12,160 @@
 use crate::combat::WeaponProfile;
 use crate::unit::MoveStats;
 
+/// The rules.ini `[IQ]` control table (`RulesClass::IQ`, `rules.cpp:IQ()`), which
+/// gates *which* automatic behaviours a house is allowed to perform based on its
+/// `IQ` rating. Each field is the **minimum IQ** at which the named ability turns
+/// on; a house acts on ability `X` iff `house.iq >= iq.X`. Computer houses run at
+/// `max_iq`; the human runs at `0` (`scenario.cpp:2890`, `house.cpp:7452`).
+/// Defaults are the reference compile-time values (`rules.cpp:137-147`); the
+/// real-asset loader overrides them from rules.ini `[IQ]` (where stock RA ships
+/// `Harvester=2`, `RepairSell=1`, etc.).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct IqRules {
+    /// Number of discrete IQ levels; computer houses run at this (`MaxIQLevels`).
+    pub max_iq: i32,
+    /// IQ to auto-fire super weapons (`SuperWeapons`).
+    pub super_weapons: i32,
+    /// IQ to auto-control building/unit production (`Production`).
+    pub production: i32,
+    /// IQ at which newly produced units start in **Guard Area** mode (`GuardArea`).
+    pub guard_area: i32,
+    /// IQ to auto repair/sell damaged buildings (`RepairSell`).
+    pub repair_sell: i32,
+    /// IQ to auto-crush crushable antagonists (`AutoCrush`).
+    pub auto_crush: i32,
+    /// IQ to **scatter from incoming threats** (grenades/artillery) — the gate on
+    /// `CellClass::Incoming` (`Scatter`, `cell.cpp:2025`).
+    pub scatter: i32,
+    /// IQ to consider transport contents when target-picking (`ContentScan`).
+    pub content_scan: i32,
+    /// IQ to auto-replace aircraft (`Aircraft`).
+    pub aircraft: i32,
+    /// IQ to **auto-replace lost harvesters** (`Harvester`, `house.cpp:6075`).
+    pub harvester: i32,
+    /// IQ to sell buildings back (`SellBack`).
+    pub sell_back: i32,
+}
+
+impl Default for IqRules {
+    fn default() -> IqRules {
+        // Reference compile-time defaults (rules.cpp:137-147).
+        IqRules {
+            max_iq: 5,
+            super_weapons: 4,
+            production: 5,
+            guard_area: 4,
+            repair_sell: 3,
+            auto_crush: 2,
+            scatter: 3,
+            content_scan: 4,
+            aircraft: 4,
+            harvester: 3,
+            sell_back: 2,
+        }
+    }
+}
+
+/// The rules.ini `[AI]` section (`RulesClass::AI`, `rules.cpp:AI()`) — the
+/// base-composition ratio table and attack cadence that drive `HouseClass::
+/// AI_Building`/`AI_Unit`. Ratios are stored as **raw 16.16 fixed** (a rules.ini
+/// `.16` becomes `0.16 × 65536`); a category's desired count is
+/// `Round_Up(ratio × CurBuildings)`, clamped to its `*_limit`. Defaults are the
+/// reference compile-time values (`rules.cpp:94-115`); the loader overrides from
+/// rules.ini.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AiRules {
+    /// Average minutes between computer attacks (`AttackInterval`, fixed raw).
+    pub attack_interval: i32,
+    /// Average delay before the first attack (`AttackDelay`, fixed raw).
+    pub attack_delay: i32,
+    /// Cash floor below which repair won't begin (`CreditReserve`; overrides
+    /// `RepairThreshhold`).
+    pub credit_reserve: i32,
+    /// Build power plants until surplus ≥ this (`PowerSurplus`).
+    pub power_surplus: i32,
+    /// Computer base may be at most `largest human base + this` (`BaseSizeAdd`).
+    pub base_size_add: i32,
+    /// Ratio of base that should be refineries (`RefineryRatio`, fixed raw).
+    pub refinery_ratio: i32,
+    /// Hard cap on refineries (`RefineryLimit`).
+    pub refinery_limit: i32,
+    /// Ratio of base that should be barracks (`BarracksRatio`, fixed raw).
+    pub barracks_ratio: i32,
+    /// Hard cap on barracks (`BarracksLimit`).
+    pub barracks_limit: i32,
+    /// Ratio of base that should be war factories (`WarRatio`, fixed raw).
+    pub war_ratio: i32,
+    /// Hard cap on war factories (`WarLimit`).
+    pub war_limit: i32,
+    /// Ratio of base that should be defensive structures (`DefenseRatio`, fixed raw).
+    pub defense_ratio: i32,
+    /// Hard cap on defensive buildings (`DefenseLimit`).
+    pub defense_limit: i32,
+    /// Ratio of base that should be anti-air (`AARatio`, fixed raw). Folded into
+    /// the defense category here (no aircraft threat modelled).
+    pub aa_ratio: i32,
+    /// Hard cap on anti-air (`AALimit`).
+    pub aa_limit: i32,
+    /// Ratio of base that should be tesla coils (`TeslaRatio`, fixed raw). Folded
+    /// into the defense category (we pick the strongest buildable defense).
+    pub tesla_ratio: i32,
+    /// Hard cap on tesla coils (`TeslaLimit`).
+    pub tesla_limit: i32,
+    /// Ratio of base that should be helipads (`HelipadRatio`, fixed raw). Unused
+    /// (no aircraft), parsed for completeness.
+    pub helipad_ratio: i32,
+    /// Hard cap on helipads (`HelipadLimit`).
+    pub helipad_limit: i32,
+    /// Power fraction below which the AI sells to raise power (`PowerEmergency`,
+    /// fixed raw).
+    pub power_emergency: i32,
+}
+
+impl Default for AiRules {
+    fn default() -> AiRules {
+        // Reference compile-time defaults (rules.cpp:94-115, 263).
+        AiRules {
+            attack_interval: 3 << 16,
+            attack_delay: 5 << 16,
+            // Reference RepairThreshhold default (rules.cpp:263). Stock rules.ini
+            // overrides this to 100 via `CreditReserve`; the default is kept at
+            // 1000 so synthetic catalogs keep the pre-M7.14 AI repair behaviour.
+            credit_reserve: 1000,
+            power_surplus: 50,
+            base_size_add: 3,
+            refinery_ratio: fixed_raw_hundredths(16), // .16
+            refinery_limit: 4,
+            barracks_ratio: fixed_raw_hundredths(16), // .16
+            barracks_limit: 2,
+            war_ratio: fixed_raw_hundredths(10), // .1
+            war_limit: 2,
+            defense_ratio: fixed_raw_hundredths(50), // .5
+            defense_limit: 40,
+            aa_ratio: fixed_raw_hundredths(14), // .14
+            aa_limit: 10,
+            tesla_ratio: fixed_raw_hundredths(16), // .16
+            tesla_limit: 10,
+            helipad_ratio: fixed_raw_hundredths(12), // .12
+            helipad_limit: 5,
+            power_emergency: (3 << 16) / 4, // .75
+        }
+    }
+}
+
+/// A rules.ini fixed value expressed in hundredths (e.g. `.16` → `16`) as raw
+/// 16.16 fixed, for the [`AiRules`] ratio defaults.
+const fn fixed_raw_hundredths(h: i32) -> i32 {
+    (h * (1 << 16)) / 100
+}
+
+/// `Round_Up(ratio_raw × n)` (`common/fixed.h Round_Up`): the ceiling of a raw
+/// 16.16 ratio times an integer count, used for the `[AI]` base-composition
+/// desired counts (`Round_Up(Rule.*Ratio * fixed(CurBuildings))`, house.cpp:5765+).
+pub fn round_up_fixed(ratio_raw: i32, n: i32) -> i32 {
+    (((ratio_raw as i64 * n as i64) + 0xFFFF) >> 16) as i32
+}
+
 /// Economy constants, from rules.ini `[General]` (defaults are the RA stock
 /// values, `redalert/rules.cpp`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -83,6 +237,12 @@ pub struct EconRules {
     pub urepair_percent_num: i32,
     /// Denominator for [`EconRules::urepair_percent_num`].
     pub urepair_percent_den: i32,
+    /// The `[IQ]` control table (M7.14 P0) — the minimum-IQ thresholds gating each
+    /// automatic house behaviour (scatter, harvester replacement, guard-area, …).
+    pub iq: IqRules,
+    /// The `[AI]` base-composition + cadence table (M7.14 P1) — the ratios/limits
+    /// that drive ratio-based `AI_Building`.
+    pub ai: AiRules,
 }
 
 impl Default for EconRules {
@@ -110,6 +270,8 @@ impl Default for EconRules {
             urepair_step: 10,
             urepair_percent_num: 20,
             urepair_percent_den: 100,
+            iq: IqRules::default(),
+            ai: AiRules::default(),
         }
     }
 }

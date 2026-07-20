@@ -27,9 +27,9 @@ use ra_formats::tmpl::Template;
 
 use ra_sim::coords::{CellCoord, Facing};
 use ra_sim::{
-    BuildItem, BuildingProto, Campaign, Catalog, EconRules, Handicap, Handle, Mission, MoveStats,
-    OreField, Passability, SpawnProto, TActionDef, TEventDef, TeamClass, TeamMission, TeamType,
-    TriggerType, UnitProto, World,
+    AiRules, BuildItem, BuildingProto, Campaign, Catalog, EconRules, Handicap, Handle, IqRules,
+    Mission, MoveStats, OreField, Passability, SpawnProto, TActionDef, TEventDef, TeamClass,
+    TeamMission, TeamType, TriggerType, UnitProto, World,
 };
 
 use crate::appcore::AppCore;
@@ -1335,7 +1335,73 @@ fn econ_rules(rules: &Ini) -> EconRules {
             (d.urepair_percent_num, d.urepair_percent_den),
         )
         .1,
+        // `[IQ]` control table (M7.14 P0, `RulesClass::IQ`) and `[AI]` base
+        // composition (M7.14 P1, `RulesClass::AI`). Both fall back to the reference
+        // compile-time defaults when a key or the whole section is absent.
+        iq: iq_rules(rules, d.iq),
+        ai: ai_rules(rules, d.ai),
         ..d
+    }
+}
+
+/// Read the rules.ini `[IQ]` control table (`RulesClass::IQ`, rules.cpp:IQ()).
+/// Each key is the minimum-IQ threshold gating one automatic behaviour; a missing
+/// key keeps the reference compile-time default carried in `def`.
+fn iq_rules(rules: &Ini, def: IqRules) -> IqRules {
+    let g = |key: &str, dv: i32| rules.get_int("IQ", key).unwrap_or(dv as i64) as i32;
+    IqRules {
+        max_iq: g("MaxIQLevels", def.max_iq),
+        super_weapons: g("SuperWeapons", def.super_weapons),
+        production: g("Production", def.production),
+        guard_area: g("GuardArea", def.guard_area),
+        repair_sell: g("RepairSell", def.repair_sell),
+        auto_crush: g("AutoCrush", def.auto_crush),
+        scatter: g("Scatter", def.scatter),
+        content_scan: g("ContentScan", def.content_scan),
+        aircraft: g("Aircraft", def.aircraft),
+        harvester: g("Harvester", def.harvester),
+        sell_back: g("SellBack", def.sell_back),
+    }
+}
+
+/// Read the rules.ini `[AI]` base-composition + cadence table (`RulesClass::AI`,
+/// rules.cpp:AI()). Ratios (`.16` etc.) parse as fixed-point raw; ints are plain.
+/// `PowerEmergency` is a `NN%`/fixed fraction. Missing keys keep `def`.
+fn ai_rules(rules: &Ini, def: AiRules) -> AiRules {
+    let gi = |key: &str, dv: i32| rules.get_int("AI", key).unwrap_or(dv as i64) as i32;
+    let gf = |key: &str, dv: i32| match rules.get("AI", key) {
+        Some(v) => ra_data::combat::parse_fixed_raw(v) as i32,
+        None => dv,
+    };
+    let power_emergency = match rules.get("AI", "PowerEmergency") {
+        Some(v) if v.contains('%') => {
+            let n: i64 = v.trim().trim_end_matches('%').trim().parse().unwrap_or(75);
+            ((n << 16) / 100) as i32
+        }
+        Some(v) => ra_data::combat::parse_fixed_raw(v) as i32,
+        None => def.power_emergency,
+    };
+    AiRules {
+        attack_interval: gf("AttackInterval", def.attack_interval),
+        attack_delay: gf("AttackDelay", def.attack_delay),
+        credit_reserve: gi("CreditReserve", def.credit_reserve),
+        power_surplus: gi("PowerSurplus", def.power_surplus),
+        base_size_add: gi("BaseSizeAdd", def.base_size_add),
+        refinery_ratio: gf("RefineryRatio", def.refinery_ratio),
+        refinery_limit: gi("RefineryLimit", def.refinery_limit),
+        barracks_ratio: gf("BarracksRatio", def.barracks_ratio),
+        barracks_limit: gi("BarracksLimit", def.barracks_limit),
+        war_ratio: gf("WarRatio", def.war_ratio),
+        war_limit: gi("WarLimit", def.war_limit),
+        defense_ratio: gf("DefenseRatio", def.defense_ratio),
+        defense_limit: gi("DefenseLimit", def.defense_limit),
+        aa_ratio: gf("AARatio", def.aa_ratio),
+        aa_limit: gi("AALimit", def.aa_limit),
+        tesla_ratio: gf("TeslaRatio", def.tesla_ratio),
+        tesla_limit: gi("TeslaLimit", def.tesla_limit),
+        helipad_ratio: gf("HelipadRatio", def.helipad_ratio),
+        helipad_limit: gi("HelipadLimit", def.helipad_limit),
+        power_emergency,
     }
 }
 

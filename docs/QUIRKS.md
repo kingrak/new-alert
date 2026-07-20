@@ -1313,3 +1313,145 @@ so no non-AI golden moved).
   `ui_menu_golden_frames`), the synthetic single-unit movement oracle (`determinism.rs`), and
   **all campaign goldens** (`campaign_scg01ea`, `campaign_activation_*`, `campaign_difficulty
   _depth_suite`) — campaign already ran guard acquisition, so its behaviour is unchanged.
+
+---
+
+## Q21 — House IQ + the `[IQ]`/`[AI]` tables: ratio-driven base building, auto-harvester, IQ-gated scatter (M7.14)
+
+**Milestone:** M7.14 (the dedicated AI-fidelity milestone: "AI building/mining/
+fighting must be smart — clone the old game's tricks"). Adds the two rules.ini
+control tables the AI was missing and rebuilds base construction on the original's
+ratio system.
+
+### P0 — house IQ + the `[IQ]` table + the scatter gate
+
+**`[IQ]` table (`RulesClass::IQ`, rules.cpp:IQ()).** Parsed into
+[`IqRules`](../ra-sim/src/catalog.rs) on `EconRules` — `MaxIQLevels` + the
+per-behaviour thresholds (`SuperWeapons`/`Production`/`GuardArea`/`RepairSell`/
+`AutoCrush`/`Scatter`/`ContentScan`/`Aircraft`/`Harvester`/`SellBack`). Defaults
+are the reference compile-time values (rules.cpp:137-147); the loader
+(`assets.rs::iq_rules`) reads the real rules.ini overrides (stock RA:
+`Harvester=2`, `RepairSell=1`, `DefenseRatio=.4`, …).
+
+**House IQ.** New [`House::iq`](../ra-sim/src/house.rs). A **computer** house runs
+at `Rule.MaxIQ` (`scenario.cpp:2890`: skirmish/MP `Session.Type != GAME_NORMAL →
+IQ = Rule.MaxIQ`) — assigned in [`World::set_ai`] for every skirmish AI house; the
+**human** and every synthetic-catalog house keep IQ `0`. **Campaign is left at IQ
+0** on purpose: in `GAME_NORMAL` the scenario INI's `IQ=` key defaults to `0`
+(`house.cpp:7454`), so campaign enemies stay scripted (and every campaign golden is
+byte-identical). `iq` is folded into the house hash **only when non-zero**, so
+human/synthetic houses append no bytes — only AI-bearing houses change.
+
+**The scatter gate (`CellClass::Incoming`, cell.cpp:2025).** The gate is
+`nokidding || Rule.IsScatter || House->IQ >= Rule.IQScatter` — computer units
+auto-scatter from threats/blockers, a human does not, unless the call *forces* it
+with `nokidding`. Ported as [`scatter_gate`](../ra-sim/src/world.rs).
+
+- **The human harvester-dock case is resolved faithfully with NO deviation.** The
+  M7.12 movement-deadlock reaction (mover committed to its sole landing cell, a
+  friendly stationary blocker there, no detour) is the original's **`nokidding ==
+  true`** site — `drive.cpp:1090/1214`, `Incoming(0,true,true)` — which forces the
+  blocker out **regardless of IQ**. So a *human* harvester (IQ 0) still nudges a
+  parked ally aside and reaches its dock (the original Q5 complaint), exactly as the
+  real game does. The M7.12 quirk's earlier citation of `drive.cpp:970/1034`
+  (`nokidding == false`) was imprecise: those softer sites *give up* first
+  (`Distance(NavCom) < CloseEnoughDistance && !In_Radio_Contact → return`), whereas
+  our port *forces* — the `nokidding == true` behaviour. Corrected in the Q5 call-
+  site comment. **Consequence: every M7.13 scatter test stays green untouched, no
+  synthetic house needed a high IQ or a `PlayerScatter` override, and no golden
+  moved.** The gate is genuinely wired (each occupier consults `scatter_gate` with
+  `nokidding = true`), so it is ready for the IQ-gated combat/threat scatter (the
+  artillery-dodge, `nokidding == false`), which is where the gate visibly bites —
+  see the P3 cut below.
+
+### P1 — ratio-driven `AI_Building` (the "building" trick) + auto-harvester (the "mining" trick)
+
+**`[AI]` table (`RulesClass::AI`, rules.cpp:AI()).** Parsed into
+[`AiRules`](../ra-sim/src/catalog.rs): `AttackInterval`/`AttackDelay`/
+`CreditReserve`/`PowerSurplus`/`BaseSizeAdd`, and the per-category
+**`*Ratio`/`*Limit`** pairs (Refinery/Barracks/War/Defense/AA/Tesla/Helipad) plus
+`PowerEmergency`. Ratios stored as raw 16.16 fixed.
+
+**Ratio-driven base composition** ([`ai.rs::next_structure`], port of
+`HouseClass::AI_Building`, house.cpp:5696). Replaces the old fixed
+power→refinery→factory priority ladder. Each category is a build *choice* iff
+`current < Round_Up(Rule.<Cat>Ratio × CurBuildings) && current < <Cat>Limit` (and
+its money/prereq gate); each choice carries an **urgency** (`UrgencyType`,
+defines.h:663 — refinery `HIGH` when none, power `LOW`/`MEDIUM`, most others
+`MEDIUM`); the AI builds the **most urgent**, ties resolving to the
+earlier-declared category (the original's strict `Urgency > best` scan,
+house.cpp:5990). Declaration order matches the source: power → refinery → barracks
+→ war factory → radar → defense.
+- **Reference note.** Desired counts multiply `CurBuildings` directly — the
+  `BaseSizeAdd` cap in `AI_Building` is present but **commented out**
+  (house.cpp:5716), so the shipped game uses the raw ratio (rule 3: reference is
+  ground truth; the brief's "+ BaseSizeAdd" description is the commented-out path).
+- **Self-limiting (removes the M7.11 runaway).** The ratio×limit fixed point bounds
+  base size naturally (e.g. defense `.4`, limit 40, converges to a modest base), so
+  the M7.11 spare-power-plant "wall-in" runaway can no longer happen — the old
+  discretionary spare-power tail and its reliance on the rubber-band building cap
+  are gone from `next_structure` (the `max_units` combat-vehicle cap is retained).
+- **Taxonomy adaptation (deviation).** We fold AA/Tesla into the single "defense"
+  category (no aircraft modelled; the defense pick takes the strongest buildable
+  armed building, reverse catalog order) and skip Helipad/Airstrip (no aircraft
+  sim). Ratios/limits are 100% rules.ini; only the category *mapping* is adapted.
+
+**Auto-harvester replacement** ([`ai.rs::produce_units`], port of
+`HouseClass::AI_Unit`, house.cpp:6075). Now **IQ-gated**: `iq >= Rule.IQHarvester
+&& BQuantity[REFINERY] > UQuantity[HARVESTER]` queues a replacement harvester in the
+war factory. A computer house (IQ = MaxIQ ≥ IQHarvester) keeps one harvester per
+refinery — kill an AI harvester and it buys another (the economic reflex ours
+lacked). A human (IQ 0) gets no free replacement.
+- **Deviation (cited).** The original also skips replacement on
+  `Difficulty == DIFF_HARD` (house.cpp:6076). We do **not** replicate it — our
+  difficulty labels are inverted for AI opponents (Q15) and the acceptance bar
+  requires economic recovery at *every* difficulty, so a killed AI harvester is
+  always replaced. (A refinery's *free* harvester on placement, house.cpp:2640, is
+  ungated in both engines.)
+
+**CreditReserve.** `[AI] CreditReserve` (stock 100) overrides `RepairThreshhold`
+(the AI repair-affordability floor, rules.cpp:AI()); the synthetic default stays
+`1000` so synthetic AI repair behaviour is unchanged, and the real-asset AI repairs
+down to 100 credits.
+
+### Determinism / goldens
+
+`IqRules`/`AiRules` live on the immutable `Catalog` (not hashed). `House::iq` is
+hash-gated to non-zero (AI houses only). The ratio-driven `next_structure` is
+deterministic (no new sim-RNG draw; the weighted unit pick is unchanged), so
+same-seed AI-vs-AI stays reproducible. **Re-pins (documented):**
+`ai_suite::ai_builds_full_roster_in_next_structure_priority_order` — the fixture's
+`PBOX` prereq was `vec![]` (buildable from tick 0), which under the faithful ratio
+system let the MEDIUM-urgency defense category outrank the LOW-urgency early power
+plant (the real AI never does this — RA's pillbox has a production-building
+prereq). Corrected the fixture prereq to `[WEAP]` (matching its own comment) and
+re-pinned the order to `POWR < PROC < BARR < WEAP < DOME < PBOX` (barracks is
+declared before the war factory in `AI_Building`, so BARR now precedes WEAP — more
+faithful than the old fixed WEAP<BARR). New acceptance coverage:
+`ra-sim/tests/ai_ratio_suite.rs` (killed-harvester recovery, IQ-0 no-replacement,
+base-composition ratio/limit bounds).
+
+### Cuts (honest, cut from the bottom per the milestone's priority order)
+
+- **P2 (Expert_AI urgency ranking across competing actions) — CUT.** The brief's
+  P2 asks to rank build/attack/raise-money/raise-power/fire-sale/team-dispatch by
+  urgency each pass and act on the highest (house.cpp:4874), replacing the fixed
+  `step()` sequence. **Not done.** The existing AI already ports the substantive
+  Expert_AI pieces — weighted **enemy selection** + rubber-band caps (Q16 b/c),
+  **composed teams** with weakest-sector routing + escalation + all-out (Q16 d,
+  Q20), and **economic reflexes** repair/sell/fire-sale (Q16 e) — just driven as a
+  fixed per-tick sequence rather than a single urgency arbiter. Rewriting `step()`
+  as one urgency loop is a substantial refactor with real regression risk to the
+  M7.10/M7.11-tuned decisiveness, and the observable "fighting" behaviour is already
+  competent, so it is deferred to keep this milestone green and committable.
+- **P3 (combat reflexes) — CUT.** (a) Produced units getting **Area Guard** when
+  `IQ >= IQGuardArea`; (b) the **artillery-dodge** — a unit scattering from an
+  inbound slow/ballistic projectile via the IQ-gated `Incoming(threat,false,false)`
+  (infantry.cpp:3841 / the `nokidding == false` combat path); (c) `RepairSell`
+  IQ-gating of the existing auto repair/sell. The P0 scatter gate is built and ready
+  to host (b), but wiring bullet-in-flight → threat-scatter is its own chunk and is
+  deferred. **New-beats-old baseline harness** (a `AiProfile::Legacy` preserving the
+  pre-M7.14 build path for an AI-vs-AI A/B) is likewise **not** built — the old
+  fixed-priority path was replaced in place; the ratio system's fidelity is validated
+  by `ai_ratio_suite` + the (unchanged) real-asset `ui_ai_vs_ai` decisiveness/
+  Hard-beats-Easy/determinism suite instead.

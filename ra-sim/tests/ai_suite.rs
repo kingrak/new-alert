@@ -603,14 +603,21 @@ fn full_roster_catalog() -> Catalog {
                 false,
                 None,
             ),
-            // Cheap defense: always buildable once a war factory is up.
+            // Cheap defense: buildable once a war factory is up. (M7.14: the
+            // prereq is now the war factory the comment already describes — it was
+            // formerly `vec![]` (buildable from tick 0), which under the faithful
+            // ratio-driven `AI_Building` let the MEDIUM-urgency defense category
+            // outrank the LOW-urgency early power plant and build a pillbox before
+            // any power — the real AI never does this because RA's pillbox has a
+            // production-building prereq (`Can_Build`). Restoring the intended
+            // prereq makes the natural build order emerge, matching the original.)
             bproto(
                 "PBOX",
                 1,
                 1,
                 0,
                 25,
-                vec![],
+                vec![FR_WEAP],
                 false,
                 false,
                 false,
@@ -846,17 +853,22 @@ fn ai_builds_full_roster_in_next_structure_priority_order() {
             "{house_label}: POWR ({powr}) should precede PROC ({proc})"
         );
         assert!(
-            proc < weap,
-            "{house_label}: PROC ({proc}) should precede WEAP ({weap})"
+            proc < barr,
+            "{house_label}: PROC ({proc}) should precede BARR ({barr})"
+        );
+        // M7.14 P1: the ratio-driven `AI_Building` declares the **barracks**
+        // category before the **war factory** (house.cpp:5787 vs :5831), so on a
+        // MEDIUM-urgency tie the barracks builds first — BARR now precedes WEAP
+        // (the old fixed-priority ladder had WEAP before BARR; the new order
+        // matches the original's declaration order).
+        assert!(
+            barr < weap,
+            "{house_label}: BARR ({barr}) should precede WEAP ({weap}) — the barracks \
+             category is declared before the war factory in AI_Building's ratio scan"
         );
         assert!(
-            weap < barr,
-            "{house_label}: WEAP ({weap}) should precede BARR ({barr})"
-        );
-        assert!(
-            barr < dome,
-            "{house_label}: BARR ({barr}) should precede DOME ({dome}) — barracks (3b) is \
-             checked before the radar dome (3b2) in next_structure's source order"
+            weap < dome,
+            "{house_label}: WEAP ({weap}) should precede DOME ({dome})"
         );
         assert!(
             dome < pbox,

@@ -423,10 +423,16 @@ impl World {
     }
 
     pub fn set_ai(&mut self, ai: Vec<AiPlayer>) {
+        // A computer-controlled (skirmish/multiplayer) house runs at `Rule.MaxIQ`
+        // (`scenario.cpp:2890`: `Session.Type != GAME_NORMAL → IQ = Rule.MaxIQ`),
+        // which unlocks the IQ-gated automatic behaviours (scatter, harvester
+        // replacement, guard-area). The human keeps the default IQ 0.
+        let max_iq = self.catalog.econ.iq.max_iq;
         for a in &ai {
             let h = self.catalog.difficulty_handicap(a.difficulty);
             if let Some(house) = self.houses.get_mut(a.house as usize) {
                 house.handicap = h;
+                house.iq = max_iq;
             }
         }
         self.ai = ai;
@@ -5043,8 +5049,10 @@ fn move_units(world: &mut World) {
                 // friendly is MOVE_MOVING_BLOCK and handled by the yield tie-break
                 // above; an enemy is MOVE_DESTROYABLE/MOVE_NO and never scattered).
                 // Radio it to get out of the way (`Start_Of_Move` →
-                // `CellClass::Incoming(0,true,false)` → `DriveClass::Scatter`,
-                // drive.cpp:970/1034 → drive.cpp:181). The blocker picks a random
+                // `CellClass::Incoming(0,true,true)` → `DriveClass::Scatter`,
+                // drive.cpp:1090/1214 → drive.cpp:181; nokidding=true — the mover
+                // has committed to this landing cell, so the friendly blocker is
+                // forced out regardless of IQ, M7.14 P0). The blocker picks a random
                 // adjacent MOVE_OK cell (one SYNC-RNG draw) and steps aside; the
                 // mover holds this tick and retries next tick (our indefinite
                 // hold-and-retry stands in for the original's `TryTryAgain`/
@@ -5153,13 +5161,37 @@ fn adjacent_cell(c: CellCoord, face: u8) -> CellCoord {
     CellCoord::new(c.x + dx, c.y + dy)
 }
 
+/// The `CellClass::Incoming` scatter gate (`cell.cpp:2025`): a techno object
+/// scatters from an incoming threat/blocker only when the call is `nokidding`,
+/// or the global `Rule.IsScatter` (player-scatter) is on, or the object's house
+/// has enough IQ (`House->IQ >= Rule.IQScatter`). Computer houses run at
+/// `Rule.MaxIQ` (≥ `IQScatter`) so they auto-scatter; a human (IQ 0) does not,
+/// **unless** the call forces it with `nokidding` (M7.14 P0).
+///
+/// **Where this bites.** The movement-deadlock reaction (mover committed to its
+/// only landing cell, a friendly stationary blocker there) is the original's
+/// `nokidding == true` site (`drive.cpp:1090/1214`, `Incoming(0,true,true)`) — it
+/// forces the blocker out **regardless of IQ**, which is exactly why a *human*
+/// harvester nudges a parked ally aside and reaches its dock (the Q5 complaint),
+/// with no player-scatter deviation needed. The IQ-gated (`nokidding == false`)
+/// path is the *combat* threat-scatter (artillery dodge), where a human's units
+/// deliberately stand their ground and only computer units dodge.
+fn scatter_gate(world: &World, house: u8, nokidding: bool) -> bool {
+    if nokidding {
+        return true;
+    }
+    let iq = world.houses.get(house as usize).map(|h| h.iq).unwrap_or(0);
+    iq >= world.catalog.econ.iq.scatter
+}
+
 /// Ask every friendly, stationary unit occupying `cell` to scatter out of the
-/// way of the mover — the sim's port of `Start_Of_Move`'s MOVE_TEMP reaction
-/// (`drive.cpp:962-975` / `1026-1039`): when the mover's immediate next cell is
-/// blocked by an *ally that is not itself moving*, it fires
-/// `CellClass::Incoming(0, true, false)`, which scatters each occupier
-/// (`cell.cpp:2013`). Enemy occupiers and *moving* allies never reach here (they
-/// aren't MOVE_TEMP), matching the original.
+/// way of the mover — the sim's port of `Start_Of_Move`'s MOVE_TEMP reaction.
+/// The mover has committed to entering `cell` (its sole landing cell, no detour),
+/// so this is the `nokidding == true` variant (`drive.cpp:1090/1214`,
+/// `CellClass::Incoming(0, true, true)`): the friendly temp blocker is forced out
+/// **regardless of IQ** (each occupier scattered, `cell.cpp:2013`). Enemy
+/// occupiers and *moving* allies never reach here (they aren't MOVE_TEMP),
+/// matching the original.
 fn scatter_friendly_blockers(world: &mut World, mover: Handle, cell: CellCoord, grid: &UnitGrid) {
     let Some(mover_house) = world.units.get(mover).map(|u| u.house) else {
         return;
@@ -5193,11 +5225,15 @@ fn scatter_friendly_blockers(world: &mut World, mover: Handle, cell: CellCoord, 
         // `Can_Enter_Cell` returns MOVE_TEMP only for a *friendly*, *stationary*
         // occupier (`unit.cpp:3336`: `is_moving == false`, i.e. no NavCom / not
         // rotating / not driving — our "empty path"). A busy ally is
-        // MOVE_MOVING_BLOCK, not scattered.
-        let ask = world
-            .units
-            .get(b)
-            .is_some_and(|u| world.are_allies(mover_house, u.house) && u.path.is_empty());
+        // MOVE_MOVING_BLOCK, not scattered. The `CellClass::Incoming` gate
+        // (`scatter_gate`, cell.cpp:2025) is applied per-occupier with
+        // `nokidding = true` — the forced move-out — so it always fires here,
+        // regardless of the blocker's house IQ (the human-harvester case, Q5).
+        let ask = world.units.get(b).is_some_and(|u| {
+            world.are_allies(mover_house, u.house)
+                && u.path.is_empty()
+                && scatter_gate(world, u.house, true)
+        });
         if ask && !visited.contains(&b) {
             visited.push(b);
             scatter_blocker(world, b, grid, &mut visited);
@@ -5318,6 +5354,7 @@ fn scatter_blocker(
                 world.are_allies(house, u.house)
                     && u.path.is_empty()
                     && !(u.is_harvester && u.harvest.status == HarvStatus::Unloading)
+                    && scatter_gate(world, u.house, true)
             });
             if eligible {
                 visited.push(nb);

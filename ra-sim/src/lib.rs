@@ -50,7 +50,7 @@ pub use campaign::{
     Campaign, EnemyActivation, SpawnProto, TActionDef, TEventDef, TeamClass, TeamMission, TeamType,
     TriggerType,
 };
-pub use catalog::{BuildingProto, Catalog, EconRules, UnitProto};
+pub use catalog::{AiRules, BuildingProto, Catalog, EconRules, IqRules, UnitProto};
 pub use combat::{modify_damage, Target, WarheadProfile, WeaponProfile, ARMOR_COUNT};
 pub use coords::{
     spot_index, CellCoord, Facing, Lepton, Locomotor, WorldCoord, LEPTONS_PER_CELL, SPOT_OFFSET,

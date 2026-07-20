@@ -37,7 +37,7 @@
 //! jitter (`house.cpp:1056`), and the team composition draws (harass roll, vehicle
 //! count, infantry count). Expert_AI scoring is deterministic (no draw).
 
-use crate::catalog::Catalog;
+use crate::catalog::{round_up_fixed, Catalog};
 use crate::coords::CellCoord;
 use crate::hash::Fnv1a;
 use crate::house::{BuildItem, House};
@@ -162,8 +162,10 @@ impl Team {
 /// the rally cell.
 const STAGE_TIMEOUT: u32 = 200;
 
-/// Minimum available money before the AI will start a building repair
-/// (`Rule.RepairThreshhold`, rules.cpp:263 = 1000) — it won't repair itself broke.
+/// Money floor at/above which the AI may auto-repair a damaged building (the
+/// reference `Rule.RepairThreshhold` compile-time default, rules.cpp:263 = 1000).
+/// See [`AiPlayer::economic_reflexes`] for why the stock `CreditReserve=100`
+/// override is deliberately not used with our simplified repair reflex.
 const REPAIR_THRESHOLD: i32 = 1000;
 
 /// Money floor below which a moneyless AI sells a non-essential building to raise
@@ -499,124 +501,170 @@ impl AiPlayer {
         }
     }
 
-    /// The next structure to build, by role, mirroring `AI_Building`'s urgency
-    /// ordering for the starter catalog: power when low → refinery when none →
-    /// war factory → a second power/refinery to keep growing.
+    /// The next structure to build — a faithful port of `HouseClass::AI_Building`'s
+    /// **ratio-driven base composition** (house.cpp:5696). For each category the AI
+    /// wants `Round_Up(Rule.<Cat>Ratio × CurBuildings)` structures (clamped to the
+    /// category `Limit`); if it holds fewer, that category becomes a build *choice*
+    /// with an urgency, and the AI builds the **most urgent** choice this pass.
+    ///
+    /// **Reference note.** The desired count multiplies `CurBuildings` (this house's
+    /// live building count), *not* `CurBuildings + BaseSizeAdd` — the `BaseSizeAdd`
+    /// cap in the original is present but commented out (house.cpp:5716), so the
+    /// shipped game uses the raw ratio (rule 3: reference is ground truth). This is
+    /// what replaces the old fixed power→refinery→factory priority ladder.
+    ///
+    /// **Taxonomy adaptation.** We fold AA/Tesla into the single "defense" category
+    /// (we model no aircraft, and pick the strongest buildable armed building), and
+    /// skip Helipad/Airstrip (no aircraft sim). Ratios/limits are 100% rules.ini.
     fn next_structure(&self, world: &World, hs: &House, cat: &Catalog) -> Option<u32> {
-        let owns = |id: u32| hs.owns_building(id);
-        let can_afford = world.house_credits(self.house) > 0;
-        if !can_afford {
-            return None;
-        }
-        let power_id = self.role_building(cat, Role::Power);
+        let ai = &cat.econ.ai;
+        // `Available_Money` (house.cpp): the spendable pool. `hasincome` is the
+        // original's refinery+harvester+not-short gate that lets a category build
+        // even when cash is momentarily below its price (income is coming).
+        let money = world.house_credits(self.house);
         let refinery_id = self.role_building(cat, Role::Refinery);
-        let factory_id = self.role_building(cat, Role::WarFactory);
+        let has_income = refinery_id
+            .map(|r| self.count_owned(world, r) > 0)
+            .unwrap_or(false)
+            && self.has_harvester(world);
+        // CurBuildings — this house's live, non-wall buildings.
+        let cur = self.building_size(world, self.house);
 
-        let has_power_building = power_id.map(owns).unwrap_or(false);
-        let has_refinery = refinery_id.map(owns).unwrap_or(false);
-        let has_factory = factory_id.map(owns).unwrap_or(false);
-        let low_power = hs.low_power();
+        let cost_of = |id: u32| cat.building(id).map(|b| b.cost).unwrap_or(0);
 
-        // 1) Power: build the first plant, or another when running a deficit.
-        if let Some(p) = power_id {
-            if (!has_power_building || low_power) && self.buildable(world, hs, p) {
-                return Some(p);
+        // Build choices in the original's declaration order (so ties resolve to the
+        // earlier-declared category, matching the `Urgency > best` scan,
+        // house.cpp:5990): power, refinery, barracks, war factory, radar, defense.
+        let mut choices: Vec<(Urgency, u32)> = Vec::new();
+
+        // Power — build until `Power <= Drain + PowerSurplus` (house.cpp:5744).
+        if let Some(p) = self.role_building(cat, Role::Power) {
+            let short_power = hs.power_output <= hs.power_drain + ai.power_surplus;
+            if short_power && cost_of(p) < money && self.buildable(world, hs, p) {
+                let refineries = refinery_id.map(|r| self.count_owned(world, r)).unwrap_or(0);
+                let urg = if refineries == 0 {
+                    Urgency::Low
+                } else {
+                    Urgency::Medium
+                };
+                choices.push((urg, p));
             }
         }
-        // 2) Refinery (economy) — HIGH urgency when none yet (house.cpp:5765).
+
+        // Refinery — `current < Round_Up(RefineryRatio × cur) && < RefineryLimit`
+        // (house.cpp:5762). HIGH when the house has none yet.
         if let Some(r) = refinery_id {
-            if !has_refinery && self.buildable(world, hs, r) {
-                return Some(r);
+            let current = self.count_owned(world, r);
+            let desired = round_up_fixed(ai.refinery_ratio, cur);
+            if current < desired
+                && current < ai.refinery_limit
+                && (money > cost_of(r) || has_income)
+                && self.buildable(world, hs, r)
+            {
+                let urg = if current == 0 {
+                    Urgency::High
+                } else {
+                    Urgency::Medium
+                };
+                choices.push((urg, r));
             }
         }
-        // 3) War factory.
-        if let Some(f) = factory_id {
-            if !has_factory && self.buildable(world, hs, f) {
-                return Some(f);
+
+        // Barracks — `current < Round_Up(BarracksRatio × cur) && < BarracksLimit`
+        // and `(money > 300 || hasincome)` (house.cpp:5787).
+        if let Some(b) = self.role_building(cat, Role::Barracks) {
+            let current = self.count_owned(world, b);
+            let desired = round_up_fixed(ai.barracks_ratio, cur);
+            if current < desired
+                && current < ai.barracks_limit
+                && (money > 300 || has_income)
+                && (cost_of(b) < money || has_income)
+                && self.buildable(world, hs, b)
+            {
+                let urg = if current > 0 {
+                    Urgency::Low
+                } else {
+                    Urgency::Medium
+                };
+                choices.push((urg, b));
             }
         }
-        // 3b) Barracks (cheap infantry factory) once the war factory is up.
-        if has_factory {
-            if let Some(bar) = self.role_building(cat, Role::Barracks) {
-                if !owns(bar) && self.buildable(world, hs, bar) {
-                    return Some(bar);
-                }
+
+        // War factory — `current < Round_Up(WarRatio × cur) && < WarLimit` and
+        // `(money > 2000 || hasincome)` (house.cpp:5831).
+        if let Some(f) = self.role_building(cat, Role::WarFactory) {
+            let current = self.count_owned(world, f);
+            let desired = round_up_fixed(ai.war_ratio, cur);
+            if current < desired
+                && current < ai.war_limit
+                && (money > 2000 || has_income)
+                && (cost_of(f) < money || has_income)
+                && self.buildable(world, hs, f)
+            {
+                let urg = if current > 0 {
+                    Urgency::Low
+                } else {
+                    Urgency::Medium
+                };
+                choices.push((urg, f));
             }
         }
-        // 3b2) Radar dome (`AI_Building` builds a radar for tech + minimap once the
-        // economy is running, `house.cpp:5696`). One is enough. Matched by catalog
-        // name so it needs no new role enum.
-        if has_factory {
+
+        // Radar dome — the original builds a radar as part of AA/tech
+        // (house.cpp:5900); we build one for the minimap/tech gate once the economy
+        // runs. Matched by catalog name (no new role enum). MEDIUM, one is enough.
+        if has_income {
             if let Some(dome) = cat
                 .buildings
                 .iter()
                 .position(|p| p.name.eq_ignore_ascii_case("DOME"))
                 .map(|i| i as u32)
             {
-                if !owns(dome) && self.buildable(world, hs, dome) {
-                    return Some(dome);
+                if !hs.owns_building(dome)
+                    && (cost_of(dome) < money || has_income)
+                    && self.buildable(world, hs, dome)
+                {
+                    choices.push((Urgency::Medium, dome));
                 }
             }
         }
-        // 3c) Base defense (`AI_Building` base-defense urgency, `house.cpp:5696`).
-        // Once a war factory is up, keep a handful of combat defenses scaled to the
-        // base size. Simplified to a deterministic priority tier — no new sim-RNG
-        // draw in building selection (the whole `next_structure` is deterministic
-        // priority, not the original's weighted-random). We prefer the *strongest*
-        // buildable defense (reverse catalog order → TSLA/GUN before PBOX) so a
-        // teched-up base fields tesla coils, not just pillboxes.
-        if has_factory {
-            let refineries = refinery_id.map(|r| self.count_owned(world, r)).unwrap_or(0);
+
+        // Defense — `owned < Round_Up(DefenseRatio × cur) && < DefenseLimit`
+        // (house.cpp:5851). AA/Tesla ratios are folded in here (max of the three,
+        // since we pick one strongest buildable armed building). We prefer the
+        // strongest (reverse catalog order → tesla/gun before pillbox).
+        {
             let mut owned_def = 0i32;
-            let mut pick: Option<u32> = None;
+            let mut strongest: Option<u32> = None;
             for (id, p) in cat.buildings.iter().enumerate().rev() {
                 if p.weapon.is_some() && !p.is_wall {
                     owned_def += self.count_owned(world, id as u32);
-                    if pick.is_none() && self.buildable(world, hs, id as u32) {
-                        pick = Some(id as u32);
+                    if strongest.is_none()
+                        && (p.cost < money || has_income)
+                        && self.buildable(world, hs, id as u32)
+                    {
+                        strongest = Some(id as u32);
                     }
                 }
             }
-            // Target a small, base-scaled number of defenses (2 + one per refinery).
-            if owned_def < 2 + refineries {
-                if let Some(d) = pick {
-                    return Some(d);
+            let desired = round_up_fixed(ai.defense_ratio, cur)
+                .max(round_up_fixed(ai.aa_ratio, cur))
+                .max(round_up_fixed(ai.tesla_ratio, cur));
+            if owned_def < desired && owned_def < ai.defense_limit {
+                if let Some(d) = strongest {
+                    choices.push((Urgency::Medium, d));
                 }
             }
         }
-        // 4) Keep expanding: a second refinery, then a spare power plant — but only
-        // up to the rubber-band **building cap** (M7.10 c). Without this the
-        // discretionary spare-power fallback builds forever, spamming plants until
-        // the base walls itself in (units can't path out to attack). `0` cap
-        // (pre-Expert_AI) means uncapped.
-        //
-        // **M7.11 runaway fix.** The rubber-band cap `max(self, avg_enemy+10)`
-        // (house.cpp:5010) is a positive feedback loop: two symmetric bases raise
-        // each other's cap without bound, so `under_bcap` stays true forever and the
-        // spare-power tail spammed *hundreds* of plants, walling the base in so no
-        // unit could ever path out to attack (an eternal stalemate — surfaced by the
-        // synthetic AI-vs-AI fixture once active defenders made attacks fail before
-        // damaging the enemy base). We now gate the spare power plant on an actual
-        // power **deficit** (`low_power`) — step 1 already covers real deficits, so
-        // this discretionary tail no longer runs when power is already sufficient,
-        // bounding base growth to what the economy/defense/tech steps above justify.
-        let under_bcap = self.max_buildings == 0
-            || self.building_size(world, self.house) < self.max_buildings as i32;
-        if under_bcap {
-            if let Some(r) = refinery_id {
-                if self.count_owned(world, r) < 2 && self.buildable(world, hs, r) {
-                    return Some(r);
-                }
-            }
-            if low_power {
-                if let Some(p) = power_id {
-                    if self.buildable(world, hs, p) {
-                        return Some(p);
-                    }
-                }
-            }
-        }
-        None
+
+        // Pick the most urgent choice; the FIRST at the top urgency wins (the
+        // original's strict `Urgency > best` scan keeps the earlier-declared
+        // category on a tie, house.cpp:5990).
+        let best = choices.iter().map(|(u, _)| *u).max()?;
+        choices
+            .into_iter()
+            .find(|(u, _)| *u == best)
+            .map(|(_, id)| id)
     }
 
     // ---- Unit production (AI_Unit skirmish mode, house.cpp:6166) ------------
@@ -633,8 +681,21 @@ impl AiPlayer {
             .map(|f| hs.owns_building(f))
             .unwrap_or(false);
         if hs.unit_prod.is_none() && world.house_credits(self.house) > 0 && has_factory {
-            // Replacement harvester first, if the refinery outnumbers harvesters
-            // (house.cpp:6075).
+            // **Auto harvester replacement** (the "mining" trick, house.cpp:6075):
+            // `IQ >= Rule.IQHarvester && !IsTiberiumShort && !IsHuman &&
+            // BQuantity[REFINERY] > UQuantity[HARVESTER]` → queue a harvester. So a
+            // computer house (IQ = MaxIQ ≥ IQHarvester) keeps one harvester per
+            // refinery, and when one is destroyed it buys a replacement — the
+            // economic reflex our AI otherwise lacked. IQ-gated per the original;
+            // the human (IQ 0) never gets a free replacement.
+            //
+            // **Deviation (cited):** the original also skips this on
+            // `Difficulty == DIFF_HARD` (house.cpp:6076). We do *not* replicate that
+            // carve-out — our difficulty labels are inverted for AI opponents
+            // (Q15), and the acceptance bar requires economic recovery at *every*
+            // difficulty, so a killed AI harvester is always replaced.
+            let iq = hs.iq;
+            let iq_ok = iq >= cat.econ.iq.harvester;
             let refineries = self
                 .role_building(cat, Role::Refinery)
                 .map(|r| self.count_owned(world, r))
@@ -645,7 +706,7 @@ impl AiPlayer {
                 .filter(|(_, u)| u.house == self.house && u.is_harvester)
                 .count() as i32;
             let mut issued = false;
-            if refineries > harvesters {
+            if iq_ok && refineries > harvesters {
                 if let Some((id, _)) = cat.units.iter().enumerate().find(|(_, p)| p.is_harvester) {
                     if self.unit_buildable(world, hs, id as u32) {
                         out.push(Command::StartProduction {
@@ -1207,7 +1268,21 @@ impl AiPlayer {
         // (`Available_Money >= Rule.RepairThreshhold`), start repairing the
         // most-damaged own building not already repairing. One per pass
         // (`House->DidRepair`). Reuses the P1 `Command::Repair` machinery.
-        if money >= REPAIR_THRESHOLD {
+        //
+        // **Threshold = 1000 (tuning, not the stock CreditReserve — cited).** The
+        // real rules.ini `[AI] CreditReserve=100` overrides `RepairThreshhold`
+        // (rules.cpp:AI()), but our *simplified* repair reflex (repair the most-
+        // damaged building whenever affordable, no per-building nuance) repairs far
+        // more eagerly than the original's `Repair_AI`; wiring it to 100 made a
+        // symmetric Normal AI-vs-AI grind repair its base down to ~100 credits every
+        // pass and **starve its own army production**, deadlocking scg05ea
+        // Normal-vs-Normal (verified: froze at ~2-3 units/side). We keep the
+        // reference *compile-time* `RepairThreshhold` default (1000) as the repair
+        // floor so the AI only auto-repairs when genuinely flush, preserving the
+        // M7.10/M7.11 decisiveness. `CreditReserve` is parsed into `AiRules` and
+        // available; it is deliberately **not** applied to this simplified gate.
+        let repair_threshold = REPAIR_THRESHOLD;
+        if money >= repair_threshold {
             let mut worst: Option<(i32, crate::Handle)> = None;
             for (h, b) in world.buildings.iter() {
                 if b.house == self.house && b.is_alive() && !b.is_wall && !b.is_repairing {
@@ -1520,6 +1595,20 @@ enum Role {
     Refinery,
     WarFactory,
     Barracks,
+}
+
+/// Build-choice urgency (`UrgencyType`, defines.h:663) — the priority a category
+/// carries into `AI_Building`'s max-urgency selection. Ordered so `max`/`>`
+/// compares correctly (`None < Low < Medium < High < Critical`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum Urgency {
+    #[allow(dead_code)]
+    None,
+    Low,
+    Medium,
+    High,
+    #[allow(dead_code)]
+    Critical,
 }
 
 /// Radius (cells) of the local defense-threat scan used to route attacks toward
