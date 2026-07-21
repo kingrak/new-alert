@@ -38,11 +38,11 @@
 //! count, infantry count). Expert_AI scoring is deterministic (no draw).
 
 use crate::catalog::{round_up_fixed, BuildingProto, Catalog};
-use crate::coords::CellCoord;
+use crate::coords::{CellCoord, Locomotor};
 use crate::hash::Fnv1a;
 use crate::house::{BuildItem, House};
 use crate::rng::RandomLcg;
-use crate::world::{Command, World};
+use crate::world::{Command, World, LOCO_WATER_INDEX};
 use crate::Target;
 
 /// AI difficulty (the three rules.ini `[Easy]`/`[Normal]`/`[Difficult]` sets,
@@ -463,6 +463,16 @@ impl AiPlayer {
         // (stage → attack → dissolve) every tick, and on the attack cadence form a
         // new one from idle forces.
         self.manage_team(world, rng, out);
+
+        // 4) Naval offensive (naval arc P0): send idle vessels to hunt the nearest
+        // enemy ship reachable over water. Separate from the land attack teams
+        // (`form_team` recruits only units that can `find_path` to a *land* staging
+        // cell, which no vessel can), so ships never stall the land war and the land
+        // war remains the game's decider. On the decide cadence to bound work; issues
+        // no commands and draws no RNG when the AI owns no vessels (every land map).
+        if self.decide_timer == DECIDE_PERIOD || self.decide_timer == 0 {
+            self.command_navy(world, out);
+        }
     }
 
     // ---- Expert_AI: enemy selection + rubber-band caps (house.cpp:4877) -----
@@ -699,6 +709,53 @@ impl AiPlayer {
             }
         }
 
+        // Whether a war factory is owned (vessels — like helis — share the vehicle
+        // lane, and the naval yard/helipad are late-tier additions gated behind it).
+        let has_war = self
+            .role_building(cat, Role::WarFactory)
+            .map(|f| self.count_owned(world, f) > 0)
+            .unwrap_or(false);
+
+        // Naval yard (SYRD) — naval arc P0. RA has **no** `NavalRatio` in rules.ini
+        // (the reference `AI_Building` never builds a shipyard; skirmish vessels come
+        // only from naval team types via `AI_Vessel`, house.cpp — GAME_NORMAL builds
+        // vessels solely to fill teams, and our skirmish has no naval teams). So this
+        // is a documented *addition* over the strict port: the AI builds **one** naval
+        // yard, gated on the economy running, a war factory owned, and — critically —
+        // an actual **shore placement existing near the base** (`placement_cell`
+        // succeeds only where SYRD's water-adjacency footprint rule is satisfiable,
+        // via `can_place_building`→`footprint_placeable`). That placement gate IS the
+        // coastline heuristic: a **landlocked** base can never place a yard, so this
+        // choice is never added, the AI never produces a shipyard it cannot place
+        // (no stuck `ready_building`), and **all** downstream naval code is dead — the
+        // AI is byte-identical to the pre-naval build on land maps. One yard is enough
+        // (like the DOME); DD/CA it enables are surface combatants *and* sub detectors.
+        //
+        // **Declared BEFORE dome/helipad and at HIGH urgency (first yard only).** The
+        // yard must be built during the calm base build-out, while the AI still holds
+        // its starting credits — deferring it to a Medium slot after the whole
+        // economy/air tier meant it only won once the war had drained the house to
+        // 0 credits, where the (cheap, 650) build stalled unpaid until the yard died
+        // (observed on scm11ea). High + early guarantees completion; it is one 650
+        // building, so it does not meaningfully delay the economy, and it is still
+        // fully gated on `has_income && has_war` (economy already standing).
+        if has_income && has_war {
+            if let Some(yard) = cat
+                .buildings
+                .iter()
+                .position(|p| p.name.eq_ignore_ascii_case("SYRD"))
+                .map(|i| i as u32)
+            {
+                if !hs.owns_building(yard)
+                    && (cost_of(yard) < money || has_income)
+                    && self.buildable(world, hs, yard)
+                    && self.placement_cell(world, yard).is_some()
+                {
+                    choices.push((Urgency::High, yard));
+                }
+            }
+        }
+
         // Radar dome — the original builds a radar as part of AA/tech
         // (house.cpp:5900); we build one for the minimap/tech gate once the economy
         // runs. Matched by catalog name (no new role enum). MEDIUM, one is enough.
@@ -726,10 +783,6 @@ impl AiPlayer {
         // Gated on the economy running *and* a war factory owned (helis share the
         // vehicle lane), so air is a late-game addition, never preempting the
         // economy/army core. Matched by catalog name.
-        let has_war = self
-            .role_building(cat, Role::WarFactory)
-            .map(|f| self.count_owned(world, f) > 0)
-            .unwrap_or(false);
         if has_income && has_war {
             if let Some(pad) = cat
                 .buildings
@@ -941,12 +994,20 @@ impl AiPlayer {
         };
         let cat = &world.catalog;
 
-        // --- Vehicle lane (war factory) ---
+        // --- Vehicle / naval lane (war factory / naval yard, shared unit lane) ---
         let has_factory = self
             .role_building(cat, Role::WarFactory)
             .map(|f| hs.owns_building(f))
             .unwrap_or(false);
-        if hs.unit_prod.is_none() && world.house_credits(self.house) > 0 && has_factory {
+        // A live naval yard lets the same unit-production lane build vessels (naval
+        // arc P0). On a landlocked map the AI never owns one, so `has_shipyard` is
+        // permanently false and every naval branch below is dead — the AI produces
+        // exactly as it did pre-naval (byte-identical land behaviour).
+        let has_shipyard = self.owns_shipyard(world);
+        if hs.unit_prod.is_none()
+            && world.house_credits(self.house) > 0
+            && (has_factory || has_shipyard)
+        {
             // **Auto harvester replacement** (the "mining" trick, house.cpp:6075):
             // `IQ >= Rule.IQHarvester && !IsTiberiumShort && !IsHuman &&
             // BQuantity[REFINERY] > UQuantity[HARVESTER]` → queue a harvester. So a
@@ -978,7 +1039,7 @@ impl AiPlayer {
                 .filter(|(_, u)| u.house == self.house && u.is_harvester)
                 .count() as i32;
             let mut issued = false;
-            if iq_ok && refineries > harvesters {
+            if has_factory && iq_ok && refineries > harvesters {
                 if let Some((id, _)) = cat.units.iter().enumerate().find(|(_, p)| p.is_harvester) {
                     if self.unit_buildable(world, hs, id as u32) {
                         out.push(Command::StartProduction {
@@ -995,7 +1056,33 @@ impl AiPlayer {
             // (before the first Expert_AI pass) means "uncapped".
             let under_cap =
                 self.max_units == 0 || self.army_size(world, self.house) < self.max_units as i32;
-            if !issued && under_cap {
+            // Naval production (naval arc P0) — builds combat vessels up to a modest
+            // cap when a shipyard is owned. **Gated on the land army being near its
+            // cap** (≥ ¾ of the rubber-band `MaxUnit`): the shared unit lane serves
+            // the land army *first*, and vessels are only built with the *spare* lane
+            // capacity left once the land force is substantially built. This is the
+            // decisiveness guard — on a water-heavy map (scm11ea) the land war keeps
+            // essentially full strength (so it still resolves in budget), and the navy
+            // is a surplus-funded supplement, never an early tax on the army that
+            // would let the enemy entrench into an unreachable remnant (the observed
+            // stall when ships were built early). Before the first Expert_AI pass
+            // (`max_units == 0`) the cap is unknown, so hold naval until it is set.
+            // Dead on landlocked maps (`has_shipyard` false), so no RNG is drawn and
+            // land production is byte-identical.
+            let army_near_cap = self.max_units > 0
+                && self.army_size(world, self.house) * 2 >= self.max_units as i32;
+            // Or when the house is genuinely wealthy (a large cash surplus): it can
+            // fund a navy *and* its army at once, so building ships is not a tax on
+            // the land war. `NAVAL_SURPLUS` is well above any single land-unit price.
+            let money_surplus = world.house_credits(self.house) > NAVAL_SURPLUS;
+            if !issued
+                && has_shipyard
+                && (army_near_cap || money_surplus)
+                && self.produce_vessel(world, rng, hs, out)
+            {
+                issued = true;
+            }
+            if !issued && under_cap && has_factory {
                 // Weighted-random pick among buildable **vehicles** — the original
                 // `AI_Unit` table (`house.cpp:6172`): each buildable non-harvester
                 // unit weighs **20 if it has a primary weapon, else 1** (so the
@@ -1009,6 +1096,13 @@ impl AiPlayer {
                         !p.is_harvester
                             && !p.is_infantry
                             && p.deploys_to.is_none()
+                            // Vessels (Water locomotor) build in the dedicated naval
+                            // branch above (bounded by the naval cap), NOT in the
+                            // weight-20 land pool — otherwise DD/CA/SS would flood the
+                            // vehicle mix once a shipyard exists and starve the land
+                            // army (the naval analogue of the M7.17-A AA-flood stall).
+                            // Inert on land maps (vessels are prereq-excluded there).
+                            && p.locomotor != LOCO_WATER_INDEX
                             // Aircraft (helis) build on the vehicle lane, gated on a
                             // helipad by their `Prerequisite=hpad` (enforced in
                             // `unit_buildable`), so they only enter the pool once the
@@ -1884,6 +1978,165 @@ impl AiPlayer {
             .any(|(_, u)| u.house != self.house && u.is_alive() && u.is_aircraft())
     }
 
+    /// Whether the house owns a live naval yard (SYRD/SPEN). Identified by catalog
+    /// name (the §3.8 table-free role pattern, mirroring `world::building_is_shipyard`).
+    fn owns_shipyard(&self, world: &World) -> bool {
+        world.buildings.iter().any(|(_, b)| {
+            b.house == self.house
+                && b.is_alive()
+                && world
+                    .catalog
+                    .building(b.type_id)
+                    .map(|p| matches!(p.name.as_str(), "SYRD" | "SPEN"))
+                    .unwrap_or(false)
+        })
+    }
+
+    /// Naval production (naval arc P0): if under the naval cap, start a weighted-
+    /// random buildable vessel and return `true`. Weighting matches the land
+    /// `AI_Unit` table (armed → 20, else 1, house.cpp:6172). RNG is drawn only when
+    /// a vessel is actually producible, so a catalog with no vessels (every land
+    /// map / synthetic fixture) draws nothing.
+    fn produce_vessel(
+        &self,
+        world: &World,
+        rng: &mut RandomLcg,
+        hs: &House,
+        out: &mut Vec<Command>,
+    ) -> bool {
+        let vessels = world
+            .units
+            .iter()
+            .filter(|(_, u)| {
+                u.house == self.house && u.is_alive() && u.locomotor == Locomotor::Water
+            })
+            .count() as i32;
+        if vessels >= NAVAL_DESIRED {
+            return false;
+        }
+        let eligible: Vec<(u32, i32)> = world
+            .catalog
+            .units
+            .iter()
+            .enumerate()
+            .filter(|(id, p)| {
+                p.locomotor == LOCO_WATER_INDEX
+                    && !p.is_harvester
+                    && self.unit_buildable(world, hs, *id as u32)
+            })
+            .map(|(id, p)| (id as u32, if p.weapon.is_some() { 20 } else { 1 }))
+            .collect();
+        let total: i32 = eligible.iter().map(|(_, w)| *w).sum();
+        if total == 0 {
+            return false;
+        }
+        let mut choice = rng.range(0, total - 1);
+        for (id, w) in &eligible {
+            if choice < *w {
+                out.push(Command::StartProduction {
+                    house: self.house,
+                    item: BuildItem::Unit(*id),
+                });
+                return true;
+            }
+            choice -= *w;
+        }
+        false
+    }
+
+    /// Naval offensive (naval arc P0): order each idle armed vessel to attack the
+    /// **nearest enemy vessel reachable over water**. Ships hunt ships and subs;
+    /// a submerged enemy submarine is only a valid target to a **detector**
+    /// (DD/CA), mirroring the sim's `is_hidden_submarine` cloak rule. Reachability
+    /// is confirmed with the real water pathfinder, so an unreachable enemy (a
+    /// disconnected sea, or a purely land enemy) leaves the vessel guarding its
+    /// waters rather than chasing a target it can never close on. Deterministic
+    /// (slot-order iteration, stable distance sort); issues nothing when the house
+    /// owns no vessels.
+    fn command_navy(&self, world: &World, out: &mut Vec<Command>) {
+        for h in world.units.handles() {
+            let Some(u) = world.units.get(h) else {
+                continue;
+            };
+            if u.house != self.house
+                || !u.is_alive()
+                || u.locomotor != Locomotor::Water
+                || u.weapon.is_none()
+            {
+                continue;
+            }
+            // Leave a vessel already pursuing a real (non-auto-guard) target alone.
+            if u.target.is_some() && !u.guard_target {
+                continue;
+            }
+            let from = u.cell();
+            let is_detector = u.is_detector;
+            let range = u.weapon.map(|w| w.range).unwrap_or(0);
+            // 1) Nearest enemy VESSEL reachable over water (ships hunt ships / subs).
+            let mut cands: Vec<(i64, crate::Handle, CellCoord)> = Vec::new();
+            for (eh, e) in world.units.iter() {
+                if !e.is_alive()
+                    || e.house == self.house
+                    || e.locomotor != Locomotor::Water
+                    || (e.is_submarine && e.submerged && !is_detector)
+                {
+                    continue;
+                }
+                cands.push((sq_dist(from, e.cell()), eh, e.cell()));
+            }
+            // Stable sort by distance keeps slot order for ties (determinism).
+            cands.sort_by_key(|(d, _, _)| *d);
+            let mut ordered = false;
+            for (_, eh, ecell) in cands {
+                if crate::path::find_path(world.passability(), from, ecell, Locomotor::Water)
+                    .is_some()
+                {
+                    out.push(Command::Attack {
+                        unit: h,
+                        target: Target::Unit(eh),
+                        house: self.house,
+                    });
+                    ordered = true;
+                    break;
+                }
+            }
+            if ordered {
+                continue;
+            }
+            // 2) Else BOMBARD the nearest enemy coastal building — a structure with a
+            // water cell within weapon range that the vessel can reach. This lets a
+            // dominant navy finish an enemy base the land army cannot reach across
+            // water (the decisiveness path on water-heavy maps). Skips walls.
+            let mut bcands: Vec<(i64, crate::Handle)> = Vec::new();
+            for (bh, bld) in world.buildings.iter() {
+                if bld.is_alive() && !bld.is_wall && bld.house != self.house {
+                    bcands.push((sq_dist(from, bld.center_cell()), bh));
+                }
+            }
+            bcands.sort_by_key(|(d, _)| *d);
+            for (_, bh) in bcands {
+                let Some(bld) = world.buildings.get(bh) else {
+                    continue;
+                };
+                let Some(station) =
+                    crate::world::nearest_water_approach(world.passability(), bld, from, range)
+                else {
+                    continue;
+                };
+                if crate::path::find_path(world.passability(), from, station, Locomotor::Water)
+                    .is_some()
+                {
+                    out.push(Command::Attack {
+                        unit: h,
+                        target: Target::Building(bh),
+                        house: self.house,
+                    });
+                    break;
+                }
+            }
+        }
+    }
+
     /// The first building id in the catalog matching a role.
     fn role_building(&self, cat: &Catalog, role: Role) -> Option<u32> {
         cat.buildings
@@ -1936,6 +2189,19 @@ enum Urgency {
 /// sector around each candidate — large enough to feel a base-defense cluster,
 /// small enough to distinguish the guarded side from the soft side.
 const SECTOR_THREAT_RADIUS: i32 = 6;
+
+/// Modest per-house target count of combat vessels the AI keeps at sea (naval arc
+/// P0). RA has no `NavalRatio`; the reference AI's hard vessel cap is
+/// `MaxVessel = Rule.VesselMax / 6` (≈16, house.cpp:793). We use a much smaller
+/// behaviour-tuned target so naval stays a *supplement* to the land army — which
+/// remains the game's decider — rather than draining the shared unit lane.
+const NAVAL_DESIRED: i32 = 4;
+
+/// Cash surplus above which the AI will fund vessel production even before its
+/// land army is near its rubber-band cap — a wealthy house can afford both a full
+/// army and a navy, so building ships is not a tax on the decisive land war. Well
+/// above any single land-unit price (naval arc P0).
+const NAVAL_SURPLUS: i32 = 4000;
 
 /// Whether a building is a **production** building (the `QUARRY_FACTORIES` quarry,
 /// `defines.h:2477`): a war factory, construction yard, or barracks. These are the

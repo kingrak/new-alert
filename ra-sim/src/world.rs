@@ -3293,11 +3293,30 @@ fn run_combat(world: &mut World) {
             // sits inside an impassable footprint, so path to the nearest passable
             // footprint-adjacent cell instead (else `find_path` to the occupied
             // centre returns `None` and the attacker never closes in).
+            //
+            // **Naval bombardment (naval arc P0).** A *vessel* (Water locomotor)
+            // cannot stand on a land-adjacent cell, so `nearest_adjacent_passable`
+            // (a *ground*-passable cell) is unreachable to it and it could never
+            // shell a coastal base. Instead it closes to the nearest **water** cell
+            // within weapon range of the building (`nearest_water_approach`) and
+            // bombards from there — a cruiser/destroyer shelling the shore. This is
+            // Water-locomotor-gated, so ground attackers are byte-identical.
+            let atk_loco = world
+                .units
+                .get(handle)
+                .map(|u| u.locomotor)
+                .unwrap_or(Locomotor::Track);
             let goal = match target {
                 Target::Building(t) => world
                     .buildings
                     .get(t)
-                    .and_then(|b| nearest_adjacent_passable(&world.passable, b, coord.cell()))
+                    .and_then(|b| {
+                        if atk_loco == Locomotor::Water {
+                            nearest_water_approach(&world.passable, b, coord.cell(), weapon.range)
+                        } else {
+                            nearest_adjacent_passable(&world.passable, b, coord.cell())
+                        }
+                    })
                     .unwrap_or_else(|| target_coord.cell()),
                 _ => target_coord.cell(),
             };
@@ -4561,6 +4580,41 @@ fn maybe_acquire_hunt_target(world: &mut World, handle: Handle) {
             u.target = Some(Target::Building(h));
         }
     }
+}
+
+/// The **water** cell nearest to `from` that lies within `range` leptons of the
+/// building — a naval bombardment station from which a vessel can shell a coastal
+/// structure (naval arc P0). Returns `None` if no open-water cell sits within
+/// weapon range of the building (a purely inland structure no ship can reach).
+/// Scans a box sized to `range` around the building centre.
+pub(crate) fn nearest_water_approach(
+    passable: &Passability,
+    building: &Building,
+    from: CellCoord,
+    range: i32,
+) -> Option<CellCoord> {
+    let center = building.center_cell();
+    // Leptons → cells (256 leptons/cell), plus a one-cell margin.
+    let r_cells = (range / 256) + 1;
+    let mut best: Option<(i32, CellCoord)> = None;
+    for dy in -r_cells..=r_cells {
+        for dx in -r_cells..=r_cells {
+            let c = CellCoord::new(center.x + dx, center.y + dy);
+            if !passable.is_water(c) {
+                continue;
+            }
+            if leptons_distance(c.center(), center.center()) > range {
+                continue;
+            }
+            // Manhattan distance to the vessel — nearest bombardment station wins
+            // (deterministic; ties resolve to the scan's row-major order).
+            let d = (c.x - from.x).abs() + (c.y - from.y).abs();
+            if best.map(|(bd, _)| d < bd).unwrap_or(true) {
+                best = Some((d, c));
+            }
+        }
+    }
+    best.map(|(_, c)| c)
 }
 
 /// The passable cell in a building's one-cell footprint ring that is nearest to

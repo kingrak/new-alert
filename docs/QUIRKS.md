@@ -1995,3 +1995,122 @@ LST load/cross/unload and any AI-naval goldens. The P0 smoke proof is
 directions, determinism, shore placement). A **coastal scenario must be identified**
 for the real-asset acceptance (ship-on-water, sub-stealth, shipyard-spawns-in-water
 PNG evidence) — the current land-locked maps cannot exercise it.
+
+---
+
+## Q26 — Naval arc P0/P1: AI fields naval on coastal maps + authored campaign naval spawn (M7.18)
+
+**Milestone:** Completes the M7.18-A naval cuts (AI naval, authored spawn) — the
+follow-up to Q25's skirmish-buildable naval core. Closes the two audit blockers:
+the AI never built naval (naval was human-only), and the scenario/campaign catalog
+dropped every naval type so authored ships never spawned.
+
+**P0 — AI builds & uses naval, coastline-gated, decisiveness-safe.** (`ra-sim/src/ai.rs`)
+
+- **Coastline gating via the placement rule (no wasted production).** The AI adds a
+  naval-yard build choice (SYRD) only when `has_income && has_war` **and**
+  `placement_cell(SYRD).is_some()`. That last gate IS the coastline heuristic:
+  `placement_cell` spirals `can_place_building`→`footprint_placeable`, which for a
+  shipyard requires a land footprint whose ring touches open water (Q25). A
+  **landlocked** base can never satisfy it, so the choice is never added, the AI
+  never produces a yard it cannot place (no stuck `ready_building`), and **every
+  downstream naval path is dead** — byte-identical to the pre-naval AI on land maps.
+  RA has **no `NavalRatio`** (`AI_Building` never builds a shipyard; `AI_Vessel`,
+  house.cpp, builds vessels in GAME_NORMAL only to fill naval *team types*, which
+  our skirmish lacks), so this is a documented *addition* over the strict port: one
+  yard, like the DOME.
+- **Yard declared HIGH + early (before dome/helipad).** A cheap 650-cost yard
+  deferred to a late Medium slot only won urgency once the war had drained the house
+  to 0 credits, where it stalled unpaid until its construction yard died (observed on
+  scm11ea). High + early builds it during the calm build-out while starting credits
+  remain; it is one building, gated on the economy already standing, so it does not
+  meaningfully delay the army.
+- **Ship production is a surplus-funded supplement, NOT a tax on the land war (the
+  decisiveness guard).** Vessels (DD/CA/SS) build on the shared unit lane, but only
+  when the land army is **≥ ½ its rubber-band `MaxUnit`** *or* the house holds a
+  large **cash surplus** (`NAVAL_SURPLUS`), capped at `NAVAL_DESIRED = 4` (a small
+  behaviour-tuned bound; the reference cap is `MaxVessel = VesselMax/6 ≈ 16`,
+  house.cpp:793). Vessels are **excluded from the weight-20 land vehicle pool** so
+  they never flood it once a yard exists (the naval analogue of the M7.17-A AA-flood
+  stall). This ordering keeps the land army at full strength — the land war remains
+  the game's decider and still resolves in budget.
+- **Naval attack behaviour (`command_navy`).** Idle armed vessels attack the nearest
+  enemy **vessel** reachable over water (ships hunt ships; a submerged enemy sub is
+  targetable only by a detector, mirroring `is_hidden_submarine`); when no enemy
+  vessel is reachable they **bombard the nearest enemy coastal building** — a
+  structure with a water cell within weapon range the vessel can reach — so a
+  dominant navy can finish a coastal base the land army cannot reach across water.
+- **Ship bombardment of coastal structures (`ra-sim/src/world.rs`).** `run_combat`'s
+  building-approach is **Water-locomotor-gated**: a vessel closes to the nearest
+  **water** cell within weapon range of the building (`nearest_water_approach`) and
+  shells from there, instead of `nearest_adjacent_passable` (a *ground* cell it can
+  never occupy). Ground attackers are byte-identical (the branch only fires for
+  `Locomotor::Water`).
+
+**Decisiveness — coastal vs. landlocked (both verified).**
+- **scm11ea (58% water, coastal):** AI-vs-AI Hard-vs-Hard, both houses build naval
+  yards; with a surplus economy both field combat vessels (peak 4/3) that hunt +
+  bombard, and the game reaches a **decisive** outcome at **tick 25200 (~28 min)**,
+  inside the 45-min budget. (At the stock 6000-credit tight economy the fast Hard
+  game resolves via land ~t16476 before any surplus accrues — yards built, navy-less,
+  still decisive.) *Note:* scm11ea's two AI bases sit on separate landmasses (naval
+  trap); the map is fragile — at Normal it is an inherent stalemate (armies never
+  engage) with **or** without naval. Verified in `ra-client/tests/naval_ai_vs_ai.rs`.
+- **scg05ea / scm01ea (landlocked-in-harness):** the pinned land AI-vs-AI suite
+  (`ui_ai_vs_ai.rs`) runs over **water-zeroed** passability (`Passability::new`), so
+  the naval code is provably dead there — resolution ticks are **byte-identical** to
+  pre-naval (scg05ea Hard 4997 / Normal 16693 / Easy 25274, scm01ea 21977, all exact
+  matches). This is the landlocked-unchanged proof. (Under the *real* per-locomotor
+  water passability those two maps do carry some water, so they are not a clean
+  "no-naval" real-asset control — the water-zeroed harness is the invariant's home.)
+
+**P1 — authored scenario/campaign naval spawn (the audit's single blocker).**
+(`ra-client/src/assets.rs`) `register_campaign_unit` dropped every naval/air class
+(`is_naval_or_air` → `None`). Replaced with **`campaign_locomotor`**, which resolves
+the real locomotor: vessels (DD/CA/SS/MSUB/PT/LST) → Water, helicopters (HELI/HIND)
+→ Air, else Foot/Wheel; only the classes we still cannot simulate (fixed-wing
+MIG/YAK/U2/BADR, the TRAN air-transport, CARR/PTBOAT placeholders) return `None` and
+stay dropped. The spawn path (`spawn_placed_unit`→sim) already derives
+submarine/detector flags and Water spawning from `proto.locomotor` (Q25), so nothing
+else was needed. **RA campaign naval is authored entirely in `[TeamTypes]`** (no
+mission places a vessel in `[UNITS]`), so "authored vessels" means the scripted
+reinforcement/attack teams. Verified (`naval_campaign_probe.rs`): scu08ea's 16 /
+scu11ea's 22 naval team members now resolve to Water protos (0 before), none remain
+in the loader `skipped` list, and driving the missions spawns real vessels during
+play — **scu11ea: LST + CA, scu13ea: DD + LST, scu09ea: PT, scg03ea: the `aqua` LST**.
+The scg04ea AFLD `[Base]` pin is untouched (that is a *building* path; `campaign_locomotor`
+only affects units) — the campaign land suites (scg01/03/04ea) stay green.
+
+**Determinism / golden discipline.** Naval `Unit` state is hashed only for
+vessels/submarines (Q25); the AI naval paths are shipyard-gated (dead on landlocked
+maps → no RNG drawn, byte-identical); the `run_combat` bombardment branch is
+Water-gated (ground combat byte-identical); campaign naval protos are **appended**
+to the catalog (existing unit ids unshifted) and only enter the hash when a vessel
+actually spawns. Result: the **full `ra-sim` suite, the full `ra-client` suite
+(all UI/golden/determinism/campaign frames), and all other crates are green with
+ZERO re-pins**; fmt clean; clippy clean on default, `--no-default-features`, and
+`--features window`.
+
+**PNG evidence** (`/tmp/.../scratchpad/`): `naval_ai_battle_scm11ea.png` (an AI
+destroyer firing on open water), `naval_authored_scu11ea_ships.png` (scu11ea's
+scripted LST + cruiser afloat) — plus Q25's `naval_realmap_suite` frames.
+
+**Cuts (reported, from the bottom of the priority stack).**
+- **P2 — LST naval transport + skirmish-buildable.** The landing craft now **spawns
+  and floats** (P1: it is a Water unit and appears in campaign teams), but the
+  load-at-shore → cross → unload-at-far-shore choreography is **not** wired: the
+  transport system (Q18) is infantry-only and would need extending to vehicles with
+  shore-aware, locomotor-respecting unload cells. LST is also **not** yet added to
+  the skirmish build catalog. Deferred.
+- **P3 — PT gunboat as a skirmish buildable, naval combat render polish** (wake,
+  depth-charge/torpedo/periscope anim, submerged-sub stealth visual). Not started.
+  (PT already resolves + spawns in campaign teams via P1; it is just not a skirmish
+  buildable and has no bespoke art.)
+
+**Handoff to ra-tester.** Exhaustive coverage owed: AI naval determinism proptest
+(same-seed-twice with vessels + bombardment); AI ship-vs-ship + sub-hunt outcomes;
+the coastal-bombardment approach on varied shore geometries; a broader coastal-map
+survey for AI-vs-AI decisiveness (scm11ea is naval-trap-fragile); and — once wired —
+LST load/cross/unload and PT. Smoke proofs added: `ra-client/tests/naval_ai_vs_ai.rs`
+(coastal decisive + naval built; PNG) and `ra-client/tests/naval_campaign_probe.rs`
+(authored naval resolves + spawns; PNG).

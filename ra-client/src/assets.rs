@@ -374,14 +374,24 @@ pub struct CampaignMission {
 /// strength, trigger, is_civ_evac)`.
 type InfantrySpawn = (u32, u8, CellCoord, u8, u8, u16, Option<u16>, bool, Mission);
 
-/// Whether a type name is a naval or aircraft unit we do not simulate yet (so a
-/// team member of this class is dropped, documented — M7.5 deferral).
-fn is_naval_or_air(name: &str) -> bool {
-    matches!(
-        name.to_ascii_uppercase().as_str(),
-        "CA" | "PT" | "DD" | "SS" | "LST" | "MSUB" | "CARR" | "PTBOAT" // naval
-            | "TRAN" | "HELI" | "HIND" | "MIG" | "YAK" | "U2" | "BADR" | "MH60" | "ORCA" // air
-    )
+/// Campaign/scenario locomotor for a placed class, or `None` if it is a naval/air
+/// class we still cannot simulate (dropped, documented). Naval arc P1: the
+/// combat vessels (DD/CA/SS/MSUB/PT), the landing craft (LST), and the
+/// helicopters (HELI/HIND) now resolve to their real locomotors so authored
+/// `[UNITS]`/`[TeamTypes]` placements spawn; fixed-wing aircraft (MIG/YAK/U2/
+/// BADR), the air/sea transports we don't model (TRAN chinook), and the
+/// carrier/gunboat placeholders (CARR/PTBOAT) stay dropped.
+fn campaign_locomotor(name: &str, is_inf: bool) -> Option<u8> {
+    match name.to_ascii_uppercase().as_str() {
+        // Simulatable vessels (Water locomotor) — combat ships, subs, landing craft.
+        "DD" | "CA" | "SS" | "MSUB" | "PT" | "LST" => Some(ra_sim::LOCO_WATER_INDEX),
+        // Simulatable aircraft (Air locomotor) — helicopters.
+        "HELI" | "HIND" => Some(ra_sim::LOCO_AIR_INDEX),
+        // Still-unsupported naval/air (fixed-wing, air/sea transport, carrier).
+        "CARR" | "PTBOAT" | "TRAN" | "MIG" | "YAK" | "U2" | "BADR" | "MH60" | "ORCA" => None,
+        _ if is_inf => Some(LOCO_FOOT as u8),
+        _ => Some(LOCO_WHEEL as u8),
+    }
 }
 
 /// Whether a type name is infantry (sub-cell), by RA naming convention — enough
@@ -434,11 +444,12 @@ fn register_campaign_unit(
     if let Some(&id) = id_by_name.get(&key) {
         return Some(id);
     }
-    if is_naval_or_air(&key) {
-        return None;
-    }
-    let ustats = unit_stats(rules, &key)?;
     let is_inf = is_campaign_infantry(&key);
+    // Naval arc P1: resolve the real locomotor (Water for vessels, Air for helis,
+    // else Foot/Wheel). A `None` here is a naval/air class we still can't simulate
+    // — dropped exactly as the old `is_naval_or_air` skip did.
+    let locomotor = campaign_locomotor(&key, is_inf)?;
+    let ustats = unit_stats(rules, &key)?;
     // Infantry art lives in lores.mix; vehicle art in conquer.mix. A missing
     // sprite degrades to a frameless sprite (the unit still simulates).
     let sprite = if is_inf {
@@ -468,11 +479,7 @@ fn register_campaign_unit(
         has_turret: combat.as_ref().map(|c| c.has_turret).unwrap_or(false),
         is_harvester: key == "HARV",
         is_infantry: is_inf,
-        locomotor: if is_inf {
-            LOCO_FOOT as u8
-        } else {
-            LOCO_WHEEL as u8
-        },
+        locomotor,
         deploys_to: None,
         cost: rules.get_int(&key, "Cost").unwrap_or(0) as i32,
         prereq: Vec::new(),
