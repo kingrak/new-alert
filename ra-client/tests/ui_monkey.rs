@@ -889,6 +889,7 @@ fn zero_and_overflow_columns_core(seed: u32) -> (AppCore, Vec<ra_sim::BuildItem>
         prereq: vec![],
         sight: 2,
         passengers: 0,
+        ammo: 0,
     };
     let n_units = 12;
     let units: Vec<UnitProto> = (0..n_units).map(uproto).collect();
@@ -985,6 +986,7 @@ fn small_non_overflow_columns_core(seed: u32) -> (AppCore, Vec<ra_sim::BuildItem
         prereq: vec![],
         sight: 2,
         passengers: 0,
+        ammo: 0,
     };
     let units: Vec<UnitProto> = (0..2).map(uproto).collect();
 

@@ -1683,3 +1683,114 @@ post-tick diff and `compose_game`); it never mutates the sim or draws the sim RN
   `ui_sell_repair_effects` PNGs/asserts and the extended `ui_cosmetic_determinism`.
 - New `SoundEvent` variants (`Sell`/`StructureSold`/`Repair`) and `EffectKind::
   Deconstruct` are additive; the audio queue and effect layer stay §4.2-cosmetic.
+
+---
+
+## Q24 — Aircraft: the flight locomotor, helicopters, the helipad, and AA defense (P0 aircraft arc)
+
+**Milestone:** P0 aircraft arc (the skirmish-buildable air core — new
+`Locomotor::Air` + `UnitKind::Aircraft`, `run_aircraft`, HPAD/AGUN/SAM).
+
+**What we implemented (with reference cites).**
+
+- **Flight locomotor (`fly.cpp`/`aircraft.cpp`).** Aircraft are a third
+  [`UnitKind::Aircraft`] on the shared `Units` arena with an `altitude` (leptons,
+  `0..=FLIGHT_LEVEL`=256, `object.h:299`), `ammo`, an [`AirState`] FSM, a `home`
+  helipad, and a `rearm_timer`. They fly **straight to their goal at altitude,
+  ignoring all ground land-type passability** (`FlyClass::Physics`, `fly.cpp:74`
+  `Coord_Move` along facing; `Passability::is_passable_loco` returns `true` for
+  `Locomotor::Air`). Movement rotates the flight facing toward the goal at the
+  craft's `ROT` and steps `MaxSpeed` leptons/tick, snapping within one step
+  (`Process_Fly_To`, `aircraft.cpp:2206`); an off-map step is refused
+  (`IMPACT_EDGE`, `fly.cpp:92`). Aircraft occupy **no** ground cell — they are
+  skipped by the ground movement grid, the one-vehicle-per-cell invariant, and
+  `vehicle_in_cell`/`vehicle_targeting`, so several may overfly one cell (the
+  original's air-layer has no cell occupancy). All state is integer/fixed — no
+  float — and hashed **only for aircraft**, so every prior golden is byte-identical
+  (verified: full `ra-sim --no-fail-fast` green, **zero** re-pins).
+
+- **Helicopter attack + rearm cycle (`aircraft.cpp`).** `run_aircraft` is a
+  slimmed, deterministic port of the `AircraftClass` mission handlers. A heli with
+  a target and ammo takes off, flies into weapon range, hovers, aims and fires on
+  ROF cadence (`Mission_Attack` `FIRE_AT_TARGET`, `aircraft.cpp:2642`), decrementing
+  `ammo` per shot; at `ammo == 0` it flies to its home helipad (`MISSION_ENTER`
+  after `Ammo == 0`, `aircraft.cpp:3869`), descends to land (altitude → 0), and
+  the pad **reloads one round per `Rule.ReloadRate` cadence** (default `.05` min =
+  45 ticks/round at full power, `building.cpp:4438`) until full, then takes off and
+  re-attacks. Verified end-to-end in `ra-sim/tests/aircraft_suite.rs`
+  (`heli_strafes_returns_to_helipad_rearms_and_reattacks`): 3-round magazine —
+  **emptied @ tick 17, landed @ 84, refilled @ 219**, then re-attacks.
+
+- **Helipad (HPAD) + buildability.** HPAD is a plain `2×2` building identified by
+  **catalog name** (the table-free DOME/FIX role pattern, Q10 / §3.8) — no new
+  `BuildingProto` flag. Aircraft dock there to rearm and land there when idle
+  (`Enter_Idle_Mode`). Helicopters (HELI Longbow, HIND Hind) build on the **vehicle
+  (Unit) production lane but gated on a live helipad** (not a war factory): a new
+  `need_helipad` branch in `apply_start_production`, and produced aircraft
+  materialise **on the helipad, airborne, full** (`AircraftClass` ctor,
+  `aircraft.cpp:254`; exit routed to the pad in `finish_or_retry`).
+
+- **AA defense (AGUN / SAM).** Anti-air emplacements are identified by catalog name
+  (`building_is_aa`, AGUN/SAM) and fire **only at airborne aircraft**; every other
+  defense fires **only at ground targets**. This is the reference's projectile
+  `IsAntiAircraft`/`IsAntiGround` gate against target `Height > 0` (`Can_Fire`,
+  `techno.cpp:2895`), threaded through `acquire_nearest_enemy`/
+  `validate_building_target` as an `aa` selector. Ground weapons cannot acquire,
+  retaliate against, or alert-respond to an airborne attacker (they have no way to
+  hit it); a **landed/docked** aircraft (`altitude == 0`) is a ground target like
+  any vehicle. Verified (`aa_gun_downs_an_airborne_heli_but_a_pillbox_cannot`): the
+  AGUN downs the heli @ tick 80 while the adjacent PBOX never targets it.
+
+- **Damage / crash.** Aircraft take damage through the normal `explosion_damage`
+  path (they are units), with **half damage while airborne** (`if (Height) damage
+  /= 2`, `aircraft.cpp:1685`), and are removed on death like any unit (the client
+  draws the shared explosion — the crash spin/fireball is cosmetic, deferred).
+
+**Deviations / simplifications (documented).**
+1. **AA capability derived by building name, not a weapon/warhead flag.** The
+   reference AA gate is a projectile `AA=`/`AG=` bool. We derive "is AA emplacement"
+   from the catalog name (AGUN/SAM) instead of adding `anti_air`/`anti_ground` to
+   `WeaponProfile` — because that struct is hashed on every armed unit/building/
+   bullet and constructed by ~30 test literals, so a field there would churn every
+   combat golden's struct/hash for a value that never changes at runtime. The
+   name-derived check is the same §3.8 table-free role pattern already used for
+   DOME/FIX. Consequence: a *unit-mounted* AA weapon (e.g. the mammoth's
+   MammothTusk vs. air) is **not** modelled — only building AA (AGUN/SAM). Air-to-
+   air is likewise deferred (helis attack ground only).
+2. **Rearm cadence is the compile-time `ReloadRate=.05` default**, and the
+   power-fraction slowdown (`Inverse(pfrac)`, `building.cpp:4438`) is deferred —
+   rearm is a flat 45 ticks/round regardless of pad power.
+3. **Altitude take-off/landing** is a linear `±Pixel_To_Lepton(1)` (≈10 leptons)
+   per tick between 0 and `FLIGHT_LEVEL` (`Landing_Takeoff_AI`, `aircraft.cpp:4195`),
+   without the staged approach-circuit speeds; the `Good_Fire_Location` reposition
+   scan and `Rule.IsCurleyShuffle` between-shots repositioning are deferred (the
+   heli hovers at its first in-range point and strafes).
+4. **Player Move of an aircraft** flies straight to the ordered cell (no ground A*,
+   terrain-ignoring); this is also how the fly-over-impassable-terrain acceptance
+   is exercised.
+
+**Cuts (reported, cut from the bottom of the priority stack).**
+- **P1 — Chinook (TRAN) evac + fixed-wing (MIG/YAK/AFLD).** Not implemented.
+  Campaign mission 1's Einstein evac stays the existing reach-the-LZ
+  `EVAC_CIVILIAN` win (unchanged, still winnable — `campaign_scg01ea` green), and
+  the `scg04ea` `[Base]` **still drops both AFLD nodes** (that golden pin is
+  untouched — I deliberately did **not** add the AFLD footprint, so the count stays
+  13/15). Scenario-placed aircraft remain dropped by `is_naval_or_air` (no campaign
+  golden moves).
+- **P2/P3 — BADGER/U2, passenger unload, and all AI air.** The AI does **not**
+  build helipads/aircraft/AA and does not fly attack waves; `HelipadRatio`/`AARatio`
+  stay parsed-but-unused. So AI-vs-AI has no aircraft and is **unchanged** (still
+  decisive, every AI golden byte-identical) — the safe "cut from bottom" that keeps
+  the chunk green rather than risking the decisiveness invariant.
+- **Sidebar cameos.** HPAD/AGUN/SAM/HELI/HIND are registered in the catalog and
+  buildable via `Command::StartProduction` (proven headless), but kept **out of the
+  sidebar `buildables` strip** for now — adding cameos moves the real-asset
+  `compose_game` sidebar goldens, which is a deliberate ra-tester re-pin pass, not
+  an incidental change here.
+
+**Handoff to ra-tester.** Exhaustive adversarial coverage owed: rearm-under-low-
+power, SAM landed-aircraft special case, multi-heli air-collision overlap,
+determinism proptest with aircraft, AA-vs-multiple-aircraft retarget, and — once
+wired — the sidebar-cameo re-pin and any AI-air goldens. The P0 smoke proof is
+`ra-sim/tests/aircraft_suite.rs` (5 tests: attack/rearm cycle, AA-downs-air +
+pillbox-cannot, fly-over-impassable-terrain, determinism, idle hover/land).

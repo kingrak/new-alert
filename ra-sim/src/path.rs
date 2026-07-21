@@ -127,12 +127,16 @@ impl Passability {
         cell.x >= 0 && cell.y >= 0 && cell.x < self.width && cell.y < self.height
     }
 
-    /// The static-terrain mask for a locomotor.
+    /// The static-terrain mask for a *ground* locomotor. Aircraft
+    /// ([`Locomotor::Air`]) have no ground mask — they are handled specially in
+    /// [`Passability::is_passable_loco`] and never reach here.
     fn loco_mask(&self, loco: Locomotor) -> &[bool] {
         match loco {
             Locomotor::Foot => &self.foot,
             Locomotor::Track => &self.track,
             Locomotor::Wheel => &self.wheel,
+            // Aircraft ignore ground terrain; short-circuited before this call.
+            Locomotor::Air => &self.track,
         }
     }
 
@@ -150,6 +154,12 @@ impl Passability {
     pub fn is_passable_loco(&self, cell: CellCoord, loco: Locomotor) -> bool {
         if !self.in_bounds(cell) {
             return false;
+        }
+        // Aircraft fly over any terrain and any building footprint (they occupy the
+        // air, not the ground cell) — `FlyClass::Physics`, `fly.cpp`. Only the map
+        // bounds constrain them.
+        if loco == Locomotor::Air {
+            return true;
         }
         let i = (cell.y * self.width + cell.x) as usize;
         self.loco_mask(loco)[i] && !self.blocked[i]

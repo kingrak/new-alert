@@ -477,6 +477,10 @@ fn register_campaign_unit(
         prereq: Vec::new(),
         sight: ustats.sight,
         passengers: rules.get_int(&key, "Passengers").unwrap_or(0).clamp(0, 255) as u8,
+        ammo: rules
+            .get_int(&key, "Ammo")
+            .unwrap_or(0)
+            .clamp(0, u16::MAX as i64) as u16,
     });
     unit_sprites.push(sprite);
     infantry_anim.push(if is_inf {
@@ -1497,6 +1501,10 @@ const B_FIX: u32 = 15;
 const B_APWR: u32 = 16;
 const B_ATEK: u32 = 17;
 const B_STEK: u32 = 18;
+// P0 aircraft arc: helipad + AA defenses (ids appended so prior ids stay stable).
+const B_HPAD: u32 = 19;
+const B_AGUN: u32 = 20;
+const B_SAM: u32 = 21;
 /// Fixed unit-proto ids.
 const U_MCV: u32 = 0;
 const U_HARV: u32 = 1;
@@ -1519,6 +1527,9 @@ const U_E4: u32 = 15;
 const U_DOG: u32 = 16;
 const U_MEDI: u32 = 17;
 const U_E6: u32 = 18;
+// P0 aircraft arc: helicopters (ids appended).
+const U_HELI: u32 = 19; // Longbow (Allied, Hellfire missiles)
+const U_HIND: u32 = 20; // Hind (Soviet, chaingun)
 
 /// Map a prerequisite short-name to its building type id (only the starter set
 /// is modelled; unknown prereqs — e.g. `fix` for the MCV — are dropped, which is
@@ -1532,6 +1543,7 @@ fn prereq_ids(names: &[String]) -> Vec<u32> {
             "proc" => Some(B_PROC),
             "weap" => Some(B_WEAP),
             "tent" | "barr" => Some(B_TENT),
+            "hpad" => Some(B_HPAD),
             _ => None,
         })
         .collect()
@@ -1727,13 +1739,18 @@ pub fn build_content(
         ("APWR", false, false, false, false), // advanced power plant
         ("ATEK", false, false, false, false), // allied tech centre (prereq gate)
         ("STEK", false, false, false, false), // soviet tech centre (prereq gate)
+        // P0 aircraft arc: helipad (aircraft dock/rearm) + AA defenses.
+        ("HPAD", false, false, false, false), // helipad
+        ("AGUN", false, false, false, false), // AA gun (anti-air only)
+        ("SAM", false, false, false, false),  // SAM site (anti-air only)
     ];
     // Per-name defense/wall attributes: GUN has a rotating turret; TSLA charges;
     // SBAG/CYCL/BRIK are walls (1×1 buildable segments — QUIRKS Q9).
     let defense_attrs = |name: &str| -> (bool, bool, bool) {
         match name {
-            "GUN" => (true, false, false),                    // has_turret
-            "TSLA" => (false, true, false),                   // charges
+            // GUN + the AA gun / SAM aim a rotating turret at their target.
+            "GUN" | "AGUN" | "SAM" => (true, false, false), // has_turret
+            "TSLA" => (false, true, false),                 // charges
             "SBAG" | "CYCL" | "BRIK" => (false, false, true), // is_wall
             _ => (false, false, false),
         }
@@ -1792,7 +1809,8 @@ pub fn build_content(
     // rules.ini `Tracked=` (`udata.cpp:1301`): all the new vehicles are `Tracked=yes`
     // (Track) except TRUK (no key → the SPEED_WHEEL default). Ids are *appended* so
     // the existing MCV..E3 ids stay stable (no golden churn from renumbering).
-    let uspecs: [(&str, bool, Option<u32>, bool, u8); 19] = [
+    // Aircraft use locomotor index 3 (`ra_sim::LOCO_AIR_INDEX` = `Locomotor::Air`).
+    let uspecs: [(&str, bool, Option<u32>, bool, u8); 21] = [
         ("MCV", false, Some(B_FACT), false, LOCO_TRACK as u8),
         ("HARV", true, None, false, LOCO_TRACK as u8),
         ("1TNK", false, None, false, LOCO_TRACK as u8),
@@ -1814,6 +1832,9 @@ pub fn build_content(
         ("DOG", false, None, true, LOCO_FOOT as u8), // Attack dog (DogJaw/Organic — no leap anim)
         ("MEDI", false, None, true, LOCO_FOOT as u8), // Medic (Heal weapon — negative damage)
         ("E6", false, None, true, LOCO_FOOT as u8), // Engineer (captures enemy buildings)
+        // --- P0 aircraft arc: helicopters (locomotor Air = 3) ---
+        ("HELI", false, None, false, ra_sim::LOCO_AIR_INDEX), // Longbow (Hellfire missiles)
+        ("HIND", false, None, false, ra_sim::LOCO_AIR_INDEX), // Hind (chaingun)
     ];
     let mut units = Vec::new();
     let mut unit_sprites = Vec::new();
@@ -1826,6 +1847,7 @@ pub fn build_content(
     for (id, (name, is_harv, deploys_to, is_inf, loco)) in uspecs.iter().enumerate() {
         let ustats = unit_stats(rules, name).ok_or_else(|| format!("no unit stats for {name}"))?;
         let combat = resolve_unit_combat(rules, name);
+        let is_air = *loco == ra_sim::LOCO_AIR_INDEX;
         unit_sprites.push(if *is_inf {
             // Infantry art (lores.mix) is optional: if it is absent the infantry
             // still exist in the catalog (buildable, simulated) with no sprite —
@@ -1833,6 +1855,9 @@ pub fn build_content(
             // degrades elsewhere. Keeps headless/AI harnesses (no lores) working.
             load_unit_sprite_from(&inf_archives, name)
                 .unwrap_or_else(|_| UnitSprite { frames: Vec::new() })
+        } else if is_air {
+            // Aircraft art degrades to a frameless sprite too (headless harnesses).
+            load_unit_sprite(conquer, name).unwrap_or_else(|_| UnitSprite { frames: Vec::new() })
         } else {
             load_unit_sprite(conquer, name)?
         });
@@ -1875,6 +1900,11 @@ pub fn build_content(
             prereq: prereq_ids(&prereq),
             sight: ustats.sight,
             passengers: rules.get_int(name, "Passengers").unwrap_or(0).clamp(0, 255) as u8,
+            // Aircraft magazine (`Ammo=`); ground units have no magazine (0).
+            ammo: rules
+                .get_int(name, "Ammo")
+                .unwrap_or(0)
+                .clamp(0, u16::MAX as i64) as u16,
         });
     }
 
@@ -1927,7 +1957,16 @@ pub fn build_content(
         BuildItem::Unit(U_DOG),
         BuildItem::Unit(U_MEDI),
         BuildItem::Unit(U_E6),
+        // NOTE (P0 aircraft arc): HPAD/AGUN/SAM and HELI/HIND are registered in the
+        // catalog (buildable via `Command::StartProduction`) but intentionally kept
+        // OUT of the sidebar cameo strip for now — adding cameos moves the
+        // real-asset sidebar `compose_game` goldens, which is a deliberate ra-tester
+        // re-pin pass, not an incidental change in this landing. The flight/AA/rearm
+        // mechanics are proven headless in `ra-sim/tests/aircraft_suite.rs`.
     ];
+    // Keep the aircraft-support id constants referenced so a future sidebar pass
+    // (and the AI) can wire them without a dead-code warning churn.
+    let _ = (B_HPAD, B_AGUN, B_SAM, U_HELI, U_HIND);
     Ok(GameContent {
         catalog,
         unit_sprites,

@@ -149,6 +149,7 @@ fn units_overflow_core(seed: u32, n_units: usize) -> (AppCore, CellCoord) {
         prereq: vec![],
         sight: 2,
         passengers: 0,
+        ammo: 0,
     };
     let units: Vec<UnitProto> = (0..n_units).map(|i| uproto(i, format!("U{i}"))).collect();
 

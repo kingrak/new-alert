@@ -37,7 +37,7 @@
 //! jitter (`house.cpp:1056`), and the team composition draws (harass roll, vehicle
 //! count, infantry count). Expert_AI scoring is deterministic (no draw).
 
-use crate::catalog::{round_up_fixed, Catalog};
+use crate::catalog::{round_up_fixed, BuildingProto, Catalog};
 use crate::coords::CellCoord;
 use crate::hash::Fnv1a;
 use crate::house::{BuildItem, House};
@@ -724,7 +724,7 @@ impl AiPlayer {
             let mut owned_def = 0i32;
             let mut strongest: Option<u32> = None;
             for (id, p) in cat.buildings.iter().enumerate().rev() {
-                if p.weapon.is_some() && !p.is_wall {
+                if p.weapon.is_some() && !p.is_wall && !is_air_only_defense(p) {
                     owned_def += self.count_owned(world, id as u32);
                     if strongest.is_none()
                         && (p.cost < money || has_income)
@@ -821,7 +821,7 @@ impl AiPlayer {
             let mut owned_def = 0i32;
             let mut pick: Option<u32> = None;
             for (id, p) in cat.buildings.iter().enumerate().rev() {
-                if p.weapon.is_some() && !p.is_wall {
+                if p.weapon.is_some() && !p.is_wall && !is_air_only_defense(p) {
                     owned_def += self.count_owned(world, id as u32);
                     if pick.is_none() && self.buildable(world, hs, id as u32) {
                         pick = Some(id as u32);
@@ -932,6 +932,11 @@ impl AiPlayer {
                         !p.is_harvester
                             && !p.is_infantry
                             && p.deploys_to.is_none()
+                            // Aircraft (P0 aircraft arc): the AI does not build/fly
+                            // air yet (AI-air is a documented cut), so exclude them
+                            // from the vehicle lane — otherwise it wastes production
+                            // slots on helis it has no helipad to build.
+                            && p.locomotor != crate::LOCO_AIR_INDEX
                             && self.unit_buildable(world, hs, *id as u32)
                     })
                     .map(|(id, p)| (id as u32, if p.weapon.is_some() { 20 } else { 1 }))
@@ -1799,6 +1804,15 @@ impl AiPlayer {
             })
             .map(|i| i as u32)
     }
+}
+
+/// Whether a building is an **anti-air-only** emplacement (AGUN/SAM) the AI must
+/// not pick as a *ground* defense — its projectile only hits aircraft, so against
+/// the ground-only AI-vs-AI game it is a useless "defense". Identified by catalog
+/// name (the §3.8 table-free role pattern), matching `world::building_is_aa`.
+/// (P0 aircraft arc: AI-air is a documented cut, so the AI ignores AA buildings.)
+fn is_air_only_defense(p: &BuildingProto) -> bool {
+    matches!(p.name.as_str(), "AGUN" | "SAM")
 }
 
 /// A building role the AI shops for.

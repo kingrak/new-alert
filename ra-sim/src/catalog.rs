@@ -391,6 +391,11 @@ pub struct UnitProto {
     /// transport (APC); 0 for everything else. Drives the Load/Unload commands
     /// (M7.5-B P1).
     pub passengers: u8,
+    /// Ammunition capacity for **aircraft** (`Ammo=`, `Class->MaxAmmo`,
+    /// `techno.cpp:7066`). Combined with `locomotor == Air`, a produced/placed
+    /// aircraft spawns with this many rounds and rearms at a helipad when empty. `0`
+    /// for ground units (no magazine). (P0 aircraft arc.)
+    pub ammo: u16,
 }
 
 /// The immutable catalog handed to [`crate::World`] at construction.

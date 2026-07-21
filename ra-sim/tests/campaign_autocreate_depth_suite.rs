@@ -87,6 +87,7 @@ fn catalog() -> Catalog {
             prereq: vec![],
             sight: 5,
             passengers: 0,
+            ammo: 0,
         }],
         econ: EconRules {
             // Keep TPM small so the AlertTime re-arm range is small and the

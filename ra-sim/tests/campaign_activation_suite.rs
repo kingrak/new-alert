@@ -89,6 +89,7 @@ fn catalog() -> Catalog {
         prereq: vec![],
         sight: 5,
         passengers: 0,
+        ammo: 0,
     };
     let bldg = |name: &str, yard: bool, weap: bool| BuildingProto {
         name: name.into(),

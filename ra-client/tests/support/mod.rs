@@ -412,6 +412,7 @@ fn econ_catalog() -> ra_sim::Catalog {
             prereq,
             sight: 2,
             passengers: 0,
+            ammo: 0,
         };
     ra_sim::Catalog {
         buildings: vec![

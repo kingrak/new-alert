@@ -93,6 +93,7 @@ fn catalog() -> Catalog {
             prereq: vec![],
             sight: 5,
             passengers: 0,
+            ammo: 0,
         }],
         econ: EconRules {
             ticks_per_minute: 60,

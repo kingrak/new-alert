@@ -119,6 +119,7 @@ fn catalog() -> Catalog {
                 prereq: vec![],
                 sight: 4,
                 passengers: 0,
+                ammo: 0,
             },
             UnitProto {
                 is_infantry: false,
@@ -137,6 +138,7 @@ fn catalog() -> Catalog {
                 prereq: vec![],
                 sight: 4,
                 passengers: 0,
+                ammo: 0,
             },
         ],
         econ: EconRules::default(),

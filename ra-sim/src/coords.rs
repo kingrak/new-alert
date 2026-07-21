@@ -301,6 +301,14 @@ pub enum Locomotor {
     Track,
     /// Wheeled vehicle (`SPEED_WHEEL`) — jeep, APC, harvester.
     Wheel,
+    /// Aircraft (`SPEED_WINGED`/`SPEED_HOVER`, `defines.h`): flies at altitude and
+    /// **ignores ground land-type passability entirely** — an aircraft may occupy
+    /// the air over any cell (water, cliff, rock) a ground unit cannot cross
+    /// (`FlyClass::Physics`, `fly.cpp` — flight is altitude-based, not cell-based).
+    /// Aircraft never use grid A* (they fly straight to their target,
+    /// [`crate::world`]'s `run_aircraft`); this variant exists so the passability
+    /// query and the loader's locomotor index round-trip an aircraft cleanly.
+    Air,
 }
 
 /// Number of infantry sub-cell spots per cell (`center + 4 quadrants`).

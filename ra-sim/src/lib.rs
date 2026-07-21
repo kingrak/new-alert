@@ -62,5 +62,7 @@ pub use ore::{OreCell, OreField};
 pub use path::Passability;
 pub use rng::RandomLcg;
 pub use shroud::Shroud;
-pub use unit::{HarvStatus, HarvestState, Mission, MoveStats, Passenger, Unit, UnitKind};
-pub use world::{apply, Command, GameOver, World};
+pub use unit::{
+    AirState, HarvStatus, HarvestState, Mission, MoveStats, Passenger, Unit, UnitKind, FLIGHT_LEVEL,
+};
+pub use world::{apply, Command, GameOver, World, LOCO_AIR_INDEX};

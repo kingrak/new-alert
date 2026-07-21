@@ -855,6 +855,7 @@ fn catalog45() -> Catalog {
                 prereq: vec![],
                 sight: 4,
                 passengers: 0,
+                ammo: 0,
             },
             UnitProto {
                 is_infantry: true,
@@ -873,6 +874,7 @@ fn catalog45() -> Catalog {
                 prereq: vec![],
                 sight: 4,
                 passengers: 0,
+                ammo: 0,
             },
         ],
         econ: EconRules::default(),
@@ -1111,6 +1113,7 @@ fn ai_catalog() -> Catalog {
         prereq,
         sight: 4,
         passengers: 0,
+        ammo: 0,
     };
     Catalog {
         buildings: vec![

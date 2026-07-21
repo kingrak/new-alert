@@ -128,6 +128,7 @@ fn catalog() -> Catalog {
         prereq,
         sight: 4,
         passengers: 0,
+        ammo: 0,
     };
     Catalog {
         buildings: vec![
@@ -522,6 +523,7 @@ fn full_roster_catalog() -> Catalog {
         prereq,
         sight: 4,
         passengers: 0,
+        ammo: 0,
     };
     Catalog {
         buildings: vec![

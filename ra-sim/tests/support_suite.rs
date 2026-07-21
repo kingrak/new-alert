@@ -123,6 +123,7 @@ fn catalog() -> Catalog {
             prereq: vec![],
             sight: 2,
             passengers: 0,
+            ammo: 0,
         }],
         econ: EconRules::default(),
     }

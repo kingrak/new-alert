@@ -22,6 +22,34 @@ pub enum UnitKind {
     Vehicle,
     /// A foot soldier occupying a sub-cell spot (E1/E2/E3).
     Infantry,
+    /// An aircraft (helicopter/fixed-wing). Flies at [`Unit::altitude`] over any
+    /// terrain, occupies **no** ground cell (`AircraftClass`, `aircraft.cpp`), and
+    /// is driven by its own FSM (`crate::world::run_aircraft`) rather than the
+    /// ground movement/combat systems. Only weapons with an anti-air projectile can
+    /// hit it while airborne (`Height > 0`).
+    Aircraft,
+}
+
+/// An aircraft's flight-mission FSM state — a simplified port of the
+/// `AircraftClass` mission handlers (`aircraft.cpp`). Meaningful only when
+/// [`Unit::kind`] is [`UnitKind::Aircraft`]; hashed only for aircraft.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum AirState {
+    /// No target, ammo available: fly home and settle on the helipad (or hover in
+    /// place if it has no home pad). `Enter_Idle_Mode` → `MISSION_GUARD`
+    /// (`aircraft.cpp:2134`).
+    #[default]
+    Idle,
+    /// Has a target and ammo: fly to a firing position and strafe it
+    /// (`Mission_Attack`, `aircraft.cpp:2527`).
+    Attack,
+    /// Out of ammo (or ordered home): fly to the home helipad to rearm
+    /// (`MISSION_ENTER` after `Ammo == 0`, `aircraft.cpp:3869`).
+    Returning,
+    /// Docked on the helipad (altitude 0): the pad reloads one round per
+    /// `RELOAD` cadence until full, then the craft takes off again
+    /// (`BuildingClass::Mission_Repair` `RADIO_RELOAD`, `building.cpp:4433`).
+    Rearming,
 }
 
 /// A unit's standing mission — the INI `[UNITS]`/`[INFANTRY]` order (Guard, Area
@@ -300,7 +328,37 @@ pub struct Unit {
     /// scripted team `UNLOAD` mission so a campaign assault disgorges at the
     /// objective. Cleared once it unloads. Hashed only when `Some`.
     pub unload_at: Option<CellCoord>,
+
+    // --- Aircraft / flight (P0 aircraft arc) ---
+    /// Height above the ground in **leptons**, `0..=`[`FLIGHT_LEVEL`]
+    /// (`AbstractClass::Height`, `abstract.h:69`). Meaningful only when
+    /// `kind == Aircraft`: `FLIGHT_LEVEL` = full flight, `0` = landed/docked. An
+    /// aircraft is a valid target for a **ground** weapon only at `altitude == 0`
+    /// (`Can_Fire`, `techno.cpp:2895`), and takes half damage while `altitude > 0`
+    /// (`AircraftClass::Take_Damage`, `aircraft.cpp:1685`). Hashed only for aircraft.
+    pub altitude: i32,
+    /// Rounds of ammunition remaining (`TechnoClass::Ammo`). An aircraft that hits
+    /// `0` flies home to rearm; a value of `max_ammo` is full. Hashed only for
+    /// aircraft (non-aircraft leave it `0`).
+    pub ammo: u16,
+    /// Ammunition capacity (`Class->MaxAmmo`, rules.ini `Ammo=`). A type constant
+    /// (like `sight`/`capacity`) — **not** hashed; its effect flows through the
+    /// hashed `ammo`.
+    pub max_ammo: u16,
+    /// Flight-mission FSM state. Hashed only for aircraft.
+    pub air_state: AirState,
+    /// The home helipad this aircraft rearms/lands at (`Find_Docking_Bay`), if any.
+    /// Hashed only for aircraft.
+    pub home: Option<Handle>,
+    /// Rearm cadence countdown while docked (ticks until the next `+1` ammo). The
+    /// pad reloads one round each time this reaches 0 (`Rule.ReloadRate`,
+    /// `building.cpp:4438`). Hashed only for aircraft.
+    pub rearm_timer: u16,
 }
+
+/// `FLIGHT_LEVEL` — full flight altitude in leptons (`ObjectClass` enum,
+/// `object.h:299`): one cell (256 leptons) of altitude.
+pub const FLIGHT_LEVEL: i32 = 256;
 
 /// A boarded passenger — the minimal state needed to re-materialise a unit on
 /// unload (`InfantryClass`/`FootClass` limbo state). Stored on the transport's
@@ -387,7 +445,39 @@ impl Unit {
             cargo: Vec::new(),
             board_target: None,
             unload_at: None,
+            altitude: 0,
+            ammo: 0,
+            max_ammo: 0,
+            air_state: AirState::Idle,
+            home: None,
+            rearm_timer: 0,
         }
+    }
+
+    /// Turn this unit into an **aircraft** (helicopter/fixed-wing): the `Air`
+    /// locomotor, spawned at [`FLIGHT_LEVEL`] with a full magazine, occupying no
+    /// ground cell. Called by the loader/production right after spawning a HELI/
+    /// HIND/TRAN/… (`AircraftClass` ctor: `Height = FLIGHT_LEVEL`, `Ammo =
+    /// Class->MaxAmmo`, `aircraft.cpp:254`).
+    pub fn make_aircraft(&mut self, max_ammo: u16) {
+        self.kind = UnitKind::Aircraft;
+        self.locomotor = Locomotor::Air;
+        self.max_ammo = max_ammo;
+        self.ammo = max_ammo;
+        self.altitude = FLIGHT_LEVEL;
+        self.air_state = AirState::Idle;
+    }
+
+    /// Whether this unit is an aircraft (flies at altitude, own FSM).
+    pub fn is_aircraft(&self) -> bool {
+        self.kind == UnitKind::Aircraft
+    }
+
+    /// Whether this unit is an aircraft currently **airborne** (`Height > 0`), i.e.
+    /// only an anti-air weapon can hit it (`Can_Fire`, `techno.cpp:2895`). A landed/
+    /// docked aircraft (`altitude == 0`) is a ground target like any vehicle.
+    pub fn is_airborne(&self) -> bool {
+        self.kind == UnitKind::Aircraft && self.altitude > 0
     }
 
     /// Set this unit's ground locomotor (from its type — tanks Track, jeep/harv
@@ -596,6 +686,26 @@ impl Unit {
             h.write_u8(0x32);
             h.write_i32(c.x);
             h.write_i32(c.y);
+        }
+
+        // Aircraft / flight state (P0 aircraft arc). Folded ONLY for aircraft,
+        // appending no bytes for vehicles/infantry — so every pre-aircraft world
+        // (all prior goldens) hashes byte-identically. `max_ammo` is a type
+        // constant (like `sight`), captured through `ammo`, so it is not hashed.
+        if self.kind == UnitKind::Aircraft {
+            h.write_u8(0x33);
+            h.write_i32(self.altitude);
+            h.write_u16(self.ammo);
+            h.write_u8(self.air_state as u8);
+            h.write_u16(self.rearm_timer);
+            match self.home {
+                Some(handle) => {
+                    h.write_u8(1);
+                    h.write_u32(handle.index);
+                    h.write_u32(handle.gen);
+                }
+                None => h.write_u8(0),
+            }
         }
     }
 }

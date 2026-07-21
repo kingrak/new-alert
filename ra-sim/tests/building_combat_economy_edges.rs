@@ -116,6 +116,7 @@ fn catalog() -> Catalog {
             prereq,
             sight: 2,
             passengers: 0,
+            ammo: 0,
         };
     Catalog {
         buildings: vec![

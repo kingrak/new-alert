@@ -68,6 +68,10 @@ pub fn footprint(name: &str) -> Option<(u8, u8)> {
         "GUN" => (1, 1),  // gun turret,          BSIZE_11
         "FTUR" => (1, 1), // flame turret,        BSIZE_11
         "TSLA" => (1, 2), // tesla coil,          BSIZE_12
+        // --- Aircraft support + AA defenses (P0 aircraft arc) ---
+        "HPAD" => (2, 2), // helipad,             BSIZE_22 (bdata.cpp:785)
+        "AGUN" => (1, 2), // AA gun,              BSIZE_12 (bdata.cpp:576)
+        "SAM" => (2, 1),  // SAM site,            BSIZE_21 (bdata.cpp:873)
         // --- Walls (M7.7 Chunk B) — 1×1 buildable segments ---
         "SBAG" | "CYCL" | "BRIK" => (1, 1),
         // --- Campaign scenery / neutral structures (M7.5) ---

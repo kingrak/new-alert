@@ -103,6 +103,7 @@ fn catalog() -> Catalog {
         prereq: vec![B_WEAP],
         sight: 4,
         passengers: 0,
+        ammo: 0,
     };
     let econ = ra_sim::EconRules {
         incoming_speed: INCOMING_THRESHOLD,

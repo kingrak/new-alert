@@ -16,7 +16,7 @@ use crate::catalog::Catalog;
 use crate::combat::{aligned_to_fire, modify_damage, Target, WeaponProfile};
 use crate::coords::{
     coord_move, isqrt, leptons_distance, spot_index, CellCoord, Facing, Locomotor, WorldCoord,
-    SUBCELL_COUNT,
+    LEPTONS_PER_CELL, MAP_CELL_H, MAP_CELL_W, SUBCELL_COUNT,
 };
 use crate::hash::Fnv1a;
 use crate::house::{BuildItem, House, ProdKind, Production};
@@ -25,7 +25,7 @@ use crate::ore::OreField;
 use crate::path::{find_path, find_path_avoiding, Passability};
 use crate::rng::RandomLcg;
 use crate::shroud::Shroud;
-use crate::unit::{HarvStatus, Mission, MoveStats, Passenger, Unit};
+use crate::unit::{AirState, HarvStatus, Mission, MoveStats, Passenger, Unit, FLIGHT_LEVEL};
 
 /// A player order. Every command carries the **issuing house** explicitly
 /// (§4.6): ownership is validated by the sim, never inferred from a connection,
@@ -844,6 +844,11 @@ pub fn apply(world: &mut World, tick: u32, commands: &[Command]) {
     // unit combat so RNG (bullet scatter) is drawn in a fixed unit-then-building
     // order.
     run_building_combat(world);
+
+    // System 4.6: aircraft flight + combat FSM (helicopters/fixed-wing). After
+    // building combat so bullet-scatter RNG is drawn in a fixed
+    // unit→building→aircraft order; inert for any world with no aircraft.
+    run_aircraft(world);
 
     // System 5: movement.
     move_units(world);
@@ -2066,10 +2071,23 @@ fn apply_command(world: &mut World, cmd: Command) {
         Command::Move { unit, dest, house } => {
             // Ownership check (§4.6): silently ignore orders for units the
             // issuing house does not own, or stale handles.
-            let (start, loco, is_inf) = match world.units.get(unit) {
-                Some(u) if u.house == house => (u.cell(), u.locomotor, u.is_infantry()),
+            let (start, loco, is_inf, is_air) = match world.units.get(unit) {
+                Some(u) if u.house == house => {
+                    (u.cell(), u.locomotor, u.is_infantry(), u.is_aircraft())
+                }
                 _ => return,
             };
+            // Aircraft fly straight to the ordered cell (no ground A*): just set the
+            // fly destination and clear any attack target; `run_aircraft` flies it
+            // there at altitude, ignoring terrain (`Process_Fly_To`).
+            if is_air {
+                if let Some(u) = world.units.get_mut(unit) {
+                    u.dest = Some(dest);
+                    u.target = None;
+                    u.air_state = AirState::Idle;
+                }
+                return;
+            }
             // Group dispersal (`Adjust_Dest`/scatter, `unit.cpp`): a box-selected
             // group ordered to one cell must not all stack there. Each unit picks
             // the nearest free cell not already claimed by another unit's
@@ -2436,12 +2454,13 @@ fn apply_start_production(world: &mut World, house: u8, item: BuildItem) {
     // Resolve cost + prerequisites + the required factory for this item.
     // Infantry (a unit proto with `is_infantry`) build on their own barracks
     // strip, independent of the war factory's vehicle lane (M7.6).
-    let (cost, prereq, need_yard, need_factory, need_barracks, kind) = match item {
+    let (cost, prereq, need_yard, need_factory, need_barracks, need_helipad, kind) = match item {
         BuildItem::Building(id) => match world.catalog.building(id) {
             Some(p) => (
                 p.cost,
                 p.prereq.clone(),
                 true,
+                false,
                 false,
                 false,
                 ProdKind::Building,
@@ -2455,9 +2474,29 @@ fn apply_start_production(world: &mut World, house: u8, item: BuildItem) {
                 false,
                 false,
                 true,
+                false,
                 ProdKind::Infantry,
             ),
-            Some(p) => (p.cost, p.prereq.clone(), false, true, false, ProdKind::Unit),
+            // Aircraft build from a **helipad** (not the war factory), on the
+            // vehicle (Unit) lane. `SPEED_WINGED` protos need a helipad present.
+            Some(p) if loco_from_index(p.locomotor) == Locomotor::Air => (
+                p.cost,
+                p.prereq.clone(),
+                false,
+                false,
+                false,
+                true,
+                ProdKind::Unit,
+            ),
+            Some(p) => (
+                p.cost,
+                p.prereq.clone(),
+                false,
+                true,
+                false,
+                false,
+                ProdKind::Unit,
+            ),
             None => return,
         },
     };
@@ -2489,9 +2528,14 @@ fn apply_start_production(world: &mut World, house: u8, item: BuildItem) {
         .buildings
         .iter()
         .any(|(_, b)| b.house == house && b.is_barracks);
+    let has_helipad = world
+        .buildings
+        .iter()
+        .any(|(_, b)| b.house == house && b.is_alive() && building_is_helipad(world, b.type_id));
     if (need_yard && !has_yard)
         || (need_factory && !has_factory)
         || (need_barracks && !has_barracks)
+        || (need_helipad && !has_helipad)
     {
         return;
     }
@@ -3000,6 +3044,12 @@ pub fn select_weapon(
 /// sim-RNG draw sequence (bullet scatter) deterministic.
 fn run_combat(world: &mut World) {
     for handle in world.units.handles() {
+        // Aircraft run their own flight+combat FSM (`run_aircraft`); the ground
+        // combat/approach path (which pathfinds on the ground grid) never touches
+        // them.
+        if world.units.get(handle).is_some_and(|u| u.is_aircraft()) {
+            continue;
+        }
         // Decrement the rearm countdown regardless of whether we fire.
         if let Some(u) = world.units.get_mut(handle) {
             if u.arm > 0 {
@@ -3270,10 +3320,17 @@ fn run_building_combat(world: &mut World) {
             }
         }
 
-        // Keep a still-valid target, else auto-acquire the nearest enemy unit.
+        // Keep a still-valid target, else auto-acquire the nearest enemy unit. An
+        // AA emplacement (AGUN/SAM) targets only airborne aircraft; every other
+        // defense targets only ground units.
+        let aa = world
+            .buildings
+            .get(handle)
+            .map(|b| building_is_aa(world, b.type_id))
+            .unwrap_or(false);
         let cur = world.buildings.get(handle).and_then(|b| b.target);
-        let target = validate_building_target(world, cur, house, center, weapon.range)
-            .or_else(|| acquire_nearest_enemy(world, house, center, weapon.range));
+        let target = validate_building_target(world, cur, house, center, weapon.range, aa)
+            .or_else(|| acquire_nearest_enemy(world, house, center, weapon.range, aa));
         if let Some(b) = world.buildings.get_mut(handle) {
             b.target = target;
         }
@@ -3358,6 +3415,405 @@ fn run_building_combat(world: &mut World) {
             b.arm = rof;
         }
     }
+}
+
+/// Aircraft altitude change per tick, in leptons (`Pixel_To_Lepton(1)` — the
+/// per-frame climb/descent rate in `Landing_Takeoff_AI`, `aircraft.cpp:4195`).
+/// `256/24 ≈ 10`, i.e. [`crate::combat::PIXEL_LEPTON_W`].
+const ALT_STEP: i32 = crate::combat::PIXEL_LEPTON_W;
+
+/// Leptons within which an aircraft is considered "arrived" over its fly goal —
+/// `Process_Fly_To` stops the craft at `< 0x0010` (`aircraft.cpp:2233`).
+const AIR_ARRIVE: i32 = 0x0010;
+
+/// System 4.6: **aircraft** flight + combat FSM (helicopters/fixed-wing). A
+/// slimmed, deterministic port of the `AircraftClass` mission handlers
+/// (`aircraft.cpp`): each aircraft flies straight toward its current goal at
+/// altitude — ignoring all ground passability (`FlyClass::Physics`, `fly.cpp`) —
+/// strafes its target until out of ammo, returns to its home helipad, lands,
+/// rearms one round per `ReloadRate` cadence (`BuildingClass::Mission_Repair`
+/// `RADIO_RELOAD`, `building.cpp:4433`), takes off, and resumes. Runs after
+/// building combat so the RNG (bullet scatter) is still drawn in a fixed
+/// unit→building→aircraft order. Aircraft never touch the ground movement/combat
+/// systems (they are skipped there), so this is byte-inert for any world with no
+/// aircraft — every prior golden is unchanged.
+fn run_aircraft(world: &mut World) {
+    // Rearm cadence: `Rule.ReloadRate` default `.05` min at full power
+    // (`rules.cpp:172`); one round per this many ticks. (The rules.ini override and
+    // the power-fraction slowdown, `building.cpp:4438`, are a documented deferral.)
+    let reload_ticks = (world.catalog.econ.ticks_per_minute * 5 / 100).max(1) as u16;
+
+    for handle in world.units.handles() {
+        // Fire cooldown ticks down every frame (like `run_combat`).
+        match world.units.get_mut(handle) {
+            Some(u) if u.is_aircraft() => {
+                if u.arm > 0 {
+                    u.arm -= 1;
+                }
+            }
+            _ => continue,
+        }
+
+        // Snapshot immutable-for-this-frame state.
+        let (
+            coord,
+            altitude,
+            ammo,
+            max_ammo,
+            mut state,
+            target,
+            home,
+            house,
+            weapon,
+            secondary,
+            dest,
+            hunt,
+        ) = match world.units.get(handle) {
+            Some(u) => (
+                u.coord,
+                u.altitude,
+                u.ammo,
+                u.max_ammo,
+                u.air_state,
+                u.target,
+                u.home,
+                u.house,
+                u.weapon,
+                u.secondary,
+                u.dest,
+                u.hunt,
+            ),
+            None => continue,
+        };
+
+        // Resolve/validate the current target's aim point (ground objects only —
+        // aircraft attack the ground). A stale/dead/ally/airborne target is dropped.
+        let target_info: Option<(WorldCoord, u8)> = match target {
+            Some(Target::Unit(t)) => match world.units.get(t) {
+                Some(tu)
+                    if tu.is_alive() && !world.are_allies(house, tu.house) && !tu.is_airborne() =>
+                {
+                    Some((tu.coord, tu.armor))
+                }
+                _ => None,
+            },
+            Some(Target::Building(t)) => match world.buildings.get(t) {
+                Some(tb) if tb.is_alive() && !world.are_allies(house, tb.house) => {
+                    Some((tb.center_cell().center(), tb.armor))
+                }
+                _ => None,
+            },
+            Some(Target::Cell(c)) => Some((c.center(), 1)),
+            None => None,
+        };
+        // Drop an invalidated target.
+        if target.is_some() && target_info.is_none() {
+            if let Some(u) = world.units.get_mut(handle) {
+                u.target = None;
+            }
+        }
+
+        // A hunting aircraft with a magazine and nothing to shoot acquires the
+        // nearest enemy **ground** target (unit, else building) — the AI/attack-team
+        // path (`Mission_Guard` → juicy-target hunt, `aircraft.cpp:3902`).
+        let mut target_info = target_info;
+        if target_info.is_none() && hunt && ammo > 0 && weapon.is_some() {
+            if let Some((tgt, info)) = acquire_air_ground_target(world, house, coord) {
+                if let Some(u) = world.units.get_mut(handle) {
+                    u.target = Some(tgt);
+                }
+                target_info = Some(info);
+            }
+        }
+
+        // --- Decide the goal for this frame ---
+        // Out of ammo (with a weapon) → return to base to rearm.
+        if ammo == 0 && weapon.is_some() && !matches!(state, AirState::Rearming) {
+            state = AirState::Returning;
+        } else if target_info.is_some() && ammo > 0 && matches!(state, AirState::Idle) {
+            state = AirState::Attack;
+        } else if target_info.is_none() && matches!(state, AirState::Attack) {
+            state = AirState::Idle;
+        }
+
+        let speed = world
+            .units
+            .get(handle)
+            .map(|u| u.stats.max_speed)
+            .unwrap_or(0)
+            .max(1);
+        let rot = world.units.get(handle).map(|u| u.stats.rot).unwrap_or(0);
+
+        match state {
+            AirState::Attack => {
+                let (Some((tcoord, tarmor)), Some(primary)) = (target_info, weapon) else {
+                    if let Some(u) = world.units.get_mut(handle) {
+                        u.air_state = AirState::Idle;
+                    }
+                    continue;
+                };
+                // Take off to flight altitude before engaging.
+                if altitude < FLIGHT_LEVEL {
+                    ascend(world, handle);
+                    continue;
+                }
+                let w = select_weapon(primary, secondary, tarmor, leptons_distance(coord, tcoord));
+                let dist = leptons_distance(coord, tcoord);
+                if dist > w.range {
+                    // Fly toward the target.
+                    fly_toward(world, handle, tcoord, speed, rot);
+                } else {
+                    // In range: hover, aim, and fire on ROF cadence.
+                    let desired = Facing::toward(coord, tcoord);
+                    if let (Some(d), Some(u)) = (desired, world.units.get_mut(handle)) {
+                        u.facing = u.facing.rotate_toward(d, rot.wrapping_add(1));
+                        u.turret_facing = u.facing;
+                    }
+                    let (aim, arm_ready) = world
+                        .units
+                        .get(handle)
+                        .map(|u| (u.facing, u.arm == 0))
+                        .unwrap_or((Facing(0), false));
+                    let aligned = desired
+                        .map(|d| aligned_to_fire(aim, d, w.proj_rot))
+                        .unwrap_or(true);
+                    if arm_ready && aligned {
+                        let tgt = world
+                            .units
+                            .get(handle)
+                            .and_then(|u| u.target)
+                            .unwrap_or(Target::Cell(tcoord.cell()));
+                        fire(world, handle, house, coord, aim, tgt, tcoord, &w);
+                        let rof = house_rof_scaled(world, house, w.rof);
+                        if let Some(u) = world.units.get_mut(handle) {
+                            u.arm = rof;
+                            u.ammo = u.ammo.saturating_sub(1);
+                            if u.ammo == 0 {
+                                u.air_state = AirState::Returning;
+                            }
+                        }
+                    }
+                }
+            }
+            AirState::Returning => {
+                // Resolve (or re-find) the home helipad.
+                let pad = valid_home(world, home, house).or_else(|| find_helipad(world, house));
+                if let Some(u) = world.units.get_mut(handle) {
+                    u.home = pad;
+                }
+                let Some(pad) = pad else {
+                    // Nowhere to land — hover in place (a helicopter, unlike a
+                    // fixed-wing, does not crash without a pad; `Mission_Retreat`
+                    // fly-off is deferred to the Chinook arc).
+                    if let Some(u) = world.units.get_mut(handle) {
+                        u.air_state = AirState::Idle;
+                    }
+                    continue;
+                };
+                let pad_center = world
+                    .buildings
+                    .get(pad)
+                    .map(|b| b.center_cell().center())
+                    .unwrap_or(coord);
+                let over_pad = leptons_distance(coord, pad_center) <= AIR_ARRIVE;
+                if !over_pad {
+                    fly_toward(world, handle, pad_center, speed, rot);
+                } else {
+                    // Descend onto the pad; when landed, begin rearming.
+                    descend(world, handle);
+                    let landed = world
+                        .units
+                        .get(handle)
+                        .map(|u| u.altitude == 0)
+                        .unwrap_or(false);
+                    if landed {
+                        if let Some(u) = world.units.get_mut(handle) {
+                            u.air_state = AirState::Rearming;
+                            u.rearm_timer = reload_ticks;
+                        }
+                    }
+                }
+            }
+            AirState::Rearming => {
+                // Docked. Reload one round per `reload_ticks`; when full, take off.
+                if ammo >= max_ammo && max_ammo > 0 {
+                    ascend(world, handle);
+                    let airborne = world
+                        .units
+                        .get(handle)
+                        .map(|u| u.altitude >= FLIGHT_LEVEL)
+                        .unwrap_or(false);
+                    if airborne {
+                        if let Some(u) = world.units.get_mut(handle) {
+                            u.air_state = if u.target.is_some() {
+                                AirState::Attack
+                            } else {
+                                AirState::Idle
+                            };
+                        }
+                    }
+                } else if let Some(u) = world.units.get_mut(handle) {
+                    if u.rearm_timer > 0 {
+                        u.rearm_timer -= 1;
+                    }
+                    if u.rearm_timer == 0 {
+                        u.ammo = (u.ammo + 1).min(u.max_ammo);
+                        u.rearm_timer = reload_ticks;
+                    }
+                }
+            }
+            AirState::Idle => {
+                // Idle: fly to an explicit move destination if ordered; otherwise
+                // return home and settle on the pad (`Enter_Idle_Mode`). With no pad
+                // and no order, hover in place.
+                if let Some(goal) = dest {
+                    let gc = goal.center();
+                    if leptons_distance(coord, gc) <= AIR_ARRIVE {
+                        if let Some(u) = world.units.get_mut(handle) {
+                            u.dest = None;
+                        }
+                    } else {
+                        // Ensure airborne, then fly to the ordered cell.
+                        if altitude < FLIGHT_LEVEL {
+                            ascend(world, handle);
+                        } else {
+                            fly_toward(world, handle, gc, speed, rot);
+                        }
+                    }
+                    continue;
+                }
+                let pad = valid_home(world, home, house).or_else(|| find_helipad(world, house));
+                if let Some(u) = world.units.get_mut(handle) {
+                    u.home = pad;
+                }
+                if let Some(pad) = pad {
+                    let pad_center = world
+                        .buildings
+                        .get(pad)
+                        .map(|b| b.center_cell().center())
+                        .unwrap_or(coord);
+                    if leptons_distance(coord, pad_center) > AIR_ARRIVE {
+                        fly_toward(world, handle, pad_center, speed, rot);
+                    } else {
+                        descend(world, handle); // park on the pad
+                    }
+                }
+                // else: no home — hover (hold position and altitude).
+            }
+        }
+    }
+}
+
+/// Raise an aircraft's altitude one [`ALT_STEP`] toward [`FLIGHT_LEVEL`] (takeoff).
+fn ascend(world: &mut World, handle: Handle) {
+    if let Some(u) = world.units.get_mut(handle) {
+        u.altitude = (u.altitude + ALT_STEP).min(FLIGHT_LEVEL);
+    }
+}
+
+/// Lower an aircraft's altitude one [`ALT_STEP`] toward the ground (landing).
+fn descend(world: &mut World, handle: Handle) {
+    if let Some(u) = world.units.get_mut(handle) {
+        u.altitude = (u.altitude - ALT_STEP).max(0);
+    }
+}
+
+/// Fly `handle` one frame toward `goal`: rotate the flight facing toward it at the
+/// craft's ROT and translate `speed` leptons along the (rotated) facing, snapping
+/// to the goal when within one step — a port of `FlyClass::Physics` +
+/// `Process_Fly_To` (`fly.cpp:58`, `aircraft.cpp:2206`). Straight-line, terrain-
+/// ignoring, clamped to the map so an off-map step is refused (`IMPACT_EDGE`,
+/// `fly.cpp:92`).
+fn fly_toward(world: &mut World, handle: Handle, goal: WorldCoord, speed: i32, rot: u8) {
+    let Some(u) = world.units.get(handle) else {
+        return;
+    };
+    let coord = u.coord;
+    let dist = leptons_distance(coord, goal);
+    let facing = match Facing::toward(coord, goal) {
+        Some(d) => u.facing.rotate_toward(d, rot.wrapping_add(1)),
+        None => u.facing,
+    };
+    let new_coord = if dist <= speed {
+        goal
+    } else {
+        let stepped = coord_move(coord, facing, speed);
+        // Refuse an off-map step (edge), holding position that axis.
+        let max_x = MAP_CELL_W * LEPTONS_PER_CELL - 1;
+        let max_y = MAP_CELL_H * LEPTONS_PER_CELL - 1;
+        WorldCoord::new(stepped.x.0.clamp(0, max_x), stepped.y.0.clamp(0, max_y))
+    };
+    if let Some(u) = world.units.get_mut(handle) {
+        u.coord = new_coord;
+        u.facing = facing;
+        u.turret_facing = facing;
+    }
+}
+
+/// The house's home helipad handle if `home` still names a live, owned helipad;
+/// else `None` (forcing a re-find).
+fn valid_home(world: &World, home: Option<Handle>, house: u8) -> Option<Handle> {
+    let h = home?;
+    let b = world.buildings.get(h)?;
+    if b.is_alive() && b.house == house && building_is_helipad(world, b.type_id) {
+        Some(h)
+    } else {
+        None
+    }
+}
+
+/// Find any live helipad owned by `house` (slot order), for docking/rearm.
+fn find_helipad(world: &World, house: u8) -> Option<Handle> {
+    world
+        .buildings
+        .iter()
+        .find(|(_, b)| b.is_alive() && b.house == house && building_is_helipad(world, b.type_id))
+        .map(|(h, _)| h)
+}
+
+/// Whether a building is a **helipad** (HPAD) — the aircraft dock/rearm structure,
+/// identified by catalog name (the DOME/FIX table-free role pattern, §3.8).
+fn building_is_helipad(world: &World, type_id: u32) -> bool {
+    world
+        .catalog
+        .building(type_id)
+        .map(|b| b.name.as_str() == "HPAD")
+        .unwrap_or(false)
+}
+
+/// Nearest enemy **ground** target for a hunting aircraft: the closest live enemy
+/// non-airborne unit, else the closest live enemy (non-wall) building. Returns the
+/// [`Target`] and its `(aim_coord, armor)`.
+fn acquire_air_ground_target(
+    world: &World,
+    house: u8,
+    from: WorldCoord,
+) -> Option<(Target, (WorldCoord, u8))> {
+    let mut best_u: Option<(i32, Handle, WorldCoord, u8)> = None;
+    for (h, u) in world.units.iter() {
+        if !u.is_alive() || world.are_allies(house, u.house) || u.is_airborne() {
+            continue;
+        }
+        let d = leptons_distance(from, u.coord);
+        if best_u.map(|(bd, ..)| d < bd).unwrap_or(true) {
+            best_u = Some((d, h, u.coord, u.armor));
+        }
+    }
+    if let Some((_, h, c, a)) = best_u {
+        return Some((Target::Unit(h), (c, a)));
+    }
+    let mut best_b: Option<(i32, Handle, WorldCoord, u8)> = None;
+    for (h, b) in world.buildings.iter() {
+        if !b.is_alive() || b.is_wall || world.are_allies(house, b.house) {
+            continue;
+        }
+        let c = b.center_cell().center();
+        let d = leptons_distance(from, c);
+        if best_b.map(|(bd, ..)| d < bd).unwrap_or(true) {
+            best_b = Some((d, h, c, b.armor));
+        }
+    }
+    best_b.map(|(_, h, c, a)| (Target::Building(h), (c, a)))
 }
 
 /// If `handle` is a **medic** (a unit whose weapon does *negative* damage) and it
@@ -3625,7 +4081,14 @@ fn run_repair(world: &mut World) {
         // The nearest friendly, damaged, non-infantry unit adjacent to the depot.
         let mut best: Option<(i32, Handle)> = None;
         for (uh, u) in world.units.iter() {
-            if u.house != house || u.is_infantry() || u.health >= u.max_health || !u.is_alive() {
+            // Aircraft service at the helipad, not the ground depot (FIX repairs
+            // ground vehicles only).
+            if u.house != house
+                || u.is_infantry()
+                || u.is_aircraft()
+                || u.health >= u.max_health
+                || !u.is_alive()
+            {
                 continue;
             }
             let c = u.cell();
@@ -3686,19 +4149,41 @@ fn building_target_position(world: &World, target: Target) -> Option<WorldCoord>
     }
 }
 
+/// Whether a defense building is an **anti-air** emplacement (AGUN / SAM),
+/// identified by its catalog name — the table-free single-role check the codebase
+/// uses for DOME/FIX (Q10, §3.8). An AA emplacement fires *only* at airborne
+/// aircraft (its projectile is `AA=yes, AG=no`, `bbdata.cpp`); every other armed
+/// building fires only at ground targets. Deriving this by name avoids threading an
+/// `anti_air` flag through the widely-constructed `WeaponProfile`/`BuildingProto`
+/// literals (which would churn every combat golden's struct construction).
+fn building_is_aa(world: &World, type_id: u32) -> bool {
+    world
+        .catalog
+        .building(type_id)
+        .map(|b| matches!(b.name.as_str(), "AGUN" | "SAM"))
+        .unwrap_or(false)
+}
+
 /// Keep the building's current target only if it is still a live **enemy** unit
-/// within `range` leptons of `center`; otherwise `None` (forcing a re-acquire).
+/// within `range` leptons of `center` **and** of the right air/ground class for
+/// this weapon (`aa` = anti-air emplacement → target must be airborne; otherwise
+/// the target must be a ground target); else `None` (forcing a re-acquire).
 fn validate_building_target(
     world: &World,
     cur: Option<Target>,
     house: u8,
     center: WorldCoord,
     range: i32,
+    aa: bool,
 ) -> Option<Target> {
     match cur {
         Some(Target::Unit(t)) => {
             let u = world.units.get(t)?;
-            if u.is_alive() && u.house != house && leptons_distance(center, u.coord) <= range {
+            if u.is_alive()
+                && u.house != house
+                && u.is_airborne() == aa
+                && leptons_distance(center, u.coord) <= range
+            {
                 Some(Target::Unit(t))
             } else {
                 None
@@ -3711,16 +4196,20 @@ fn validate_building_target(
 /// The nearest live enemy **unit** within `range` leptons of `center`, in slot
 /// order (ties broken by the earlier handle) — the defense's auto-acquire scan
 /// (`Greatest_Threat`, simplified to nearest by distance). Buildings and the
-/// force-fire cell are not auto-targeted.
+/// force-fire cell are not auto-targeted. `aa` selects the target class: an
+/// anti-air emplacement (`aa == true`) only sees **airborne** aircraft; a normal
+/// defense (`aa == false`) only sees **ground** targets (never an airborne craft
+/// it cannot hit).
 fn acquire_nearest_enemy(
     world: &World,
     house: u8,
     center: WorldCoord,
     range: i32,
+    aa: bool,
 ) -> Option<Target> {
     let mut best: Option<(i32, Handle)> = None;
     for (h, u) in world.units.iter() {
-        if u.house == house || !u.is_alive() {
+        if u.house == house || !u.is_alive() || u.is_airborne() != aa {
             continue;
         }
         let d = leptons_distance(center, u.coord);
@@ -3790,7 +4279,9 @@ fn maybe_acquire_guard_target(world: &mut World, handle: Handle) {
     };
     let mut best: Option<(i32, Handle)> = None;
     for (h, u) in world.units.iter() {
-        if !u.is_alive() || world.are_allies(house, u.house) {
+        // A ground defender's weapon is not anti-air (no unit-mounted AA in P0), so
+        // it cannot acquire an airborne aircraft (`Can_Fire`, `techno.cpp:2895`).
+        if !u.is_alive() || world.are_allies(house, u.house) || u.is_airborne() {
             continue;
         }
         let d = leptons_distance(center, u.coord);
@@ -3877,10 +4368,10 @@ fn maybe_acquire_hunt_target(world: &mut World, handle: Handle) {
     if !armed || !idle {
         return;
     }
-    // Nearest enemy unit.
+    // Nearest enemy unit (ground weapons cannot chase airborne aircraft).
     let mut best_u: Option<(i32, Handle)> = None;
     for (h, u) in world.units.iter() {
-        if !u.is_alive() || world.are_allies(house, u.house) {
+        if !u.is_alive() || world.are_allies(house, u.house) || u.is_airborne() {
             continue;
         }
         let d = leptons_distance(coord, u.coord);
@@ -4090,14 +4581,18 @@ fn explosion_damage(
         .get(source)
         .filter(|u| u.is_alive())
         .map(|u| u.house);
+    // A ground unit cannot retaliate against — nor can nearby guards be alerted to
+    // — an **airborne** attacker they have no way to hit (no anti-air weapon). Only
+    // an AA emplacement engages aircraft, and that runs through building combat.
+    let source_airborne = world.units.get(source).is_some_and(|u| u.is_airborne());
 
     // --- Units in the 3×3 neighbourhood ---
     for h in world.units.handles() {
         if h == source {
             continue;
         }
-        let (coord, armor, target_house) = match world.units.get(h) {
-            Some(u) if u.is_alive() => (u.coord, u.armor, u.house),
+        let (coord, armor, target_house, airborne) = match world.units.get(h) {
+            Some(u) if u.is_alive() => (u.coord, u.armor, u.house, u.is_airborne()),
             _ => continue,
         };
         let uc = coord.cell();
@@ -4108,7 +4603,13 @@ fn explosion_damage(
         if distance >= EXPLOSION_RANGE {
             continue;
         }
-        let dmg = modify_damage(damage, warhead, armor, distance, min_damage, max_damage);
+        let mut dmg = modify_damage(damage, warhead, armor, distance, min_damage, max_damage);
+        // An airborne aircraft takes **half** damage (`AircraftClass::Take_Damage`,
+        // `aircraft.cpp:1685`: `if (Height) damage /= 2`). Applied only to positive
+        // damage (a heal never targets an aircraft anyway).
+        if airborne && dmg > 0 {
+            dmg /= 2;
+        }
         // Armor handicap (M7.9 P2a): the *target's* house scales incoming damage
         // (`techno.cpp:4099`, `damage = damage * House->ArmorBias`). Only positive
         // damage — a heal (negative) is never armor-scaled. Neutral = exact.
@@ -4141,10 +4642,12 @@ fn explosion_damage(
                 if !dead_units.contains(&h) {
                     dead_units.push(h);
                 }
-            } else if source_house.is_some_and(|sh| sh != u.house) {
+            } else if source_house.is_some_and(|sh| sh != u.house) && !source_airborne {
                 // Auto-retaliation (guard-mission return fire, item 2):
                 // `FootClass::Take_Damage` assigns the attacker as TarCom when
-                // the unit survives, is allowed to retaliate, and is idle.
+                // the unit survives, is allowed to retaliate, and is idle. A
+                // ground unit does not retaliate against an airborne attacker it
+                // cannot hit.
                 assign_retaliation(u, source);
             }
         }
@@ -4223,7 +4726,9 @@ fn explosion_damage(
     // (skirmish + campaign), matching the removal of the guard-acquisition gate
     // above — see `maybe_acquire_guard_target` and QUIRKS Q18.
     if let Some(sh) = source_house {
-        alert_nearby_guards(world, impact_cell, sh, source);
+        if !source_airborne {
+            alert_nearby_guards(world, impact_cell, sh, source);
+        }
     }
 }
 
@@ -4423,6 +4928,11 @@ fn finish_or_retry(world: &mut World, house_idx: usize, kind: ProdKind, prod: Op
                 .unwrap_or(Locomotor::Track);
             let exit = match kind {
                 ProdKind::Infantry => find_barracks_exit(world, house),
+                // Aircraft materialise on their home helipad (airborne), not a
+                // ground factory exit (`BuildingClass::Exit_Object` for STRUCT_HELIPAD).
+                _ if loco == Locomotor::Air => find_helipad(world, house)
+                    .and_then(|h| world.buildings.get(h))
+                    .map(|b| b.center_cell()),
                 _ => find_factory_exit(world, house, loco),
             };
             match exit {
@@ -4516,7 +5026,7 @@ fn vehicle_in_cell(world: &World, cell: CellCoord, except: Option<Handle>) -> bo
     world
         .units
         .iter()
-        .any(|(h, u)| !u.is_infantry() && u.cell() == cell && Some(h) != except)
+        .any(|(h, u)| !u.is_infantry() && !u.is_aircraft() && u.cell() == cell && Some(h) != except)
 }
 
 /// The infantry sub-cell spot occupancy bitmask of `cell` (bits 0..5), excluding
@@ -4539,10 +5049,9 @@ fn infantry_cell_full(world: &World, cell: CellCoord, except: Option<Handle>) ->
 /// Whether a vehicle other than `except` is *heading to* `cell` (its ordered
 /// `dest`). Used with [`vehicle_in_cell`] so a same-tick group move spreads.
 fn vehicle_targeting(world: &World, cell: CellCoord, except: Option<Handle>) -> bool {
-    world
-        .units
-        .iter()
-        .any(|(h, u)| !u.is_infantry() && Some(h) != except && u.dest == Some(cell))
+    world.units.iter().any(|(h, u)| {
+        !u.is_infantry() && !u.is_aircraft() && Some(h) != except && u.dest == Some(cell)
+    })
 }
 
 /// How many infantry other than `except` are resting in **or** heading to
@@ -4618,9 +5127,14 @@ fn loco_from_index(i: u8) -> Locomotor {
     match i {
         0 => Locomotor::Foot,
         2 => Locomotor::Wheel,
+        3 => Locomotor::Air,
         _ => Locomotor::Track,
     }
 }
+
+/// Locomotor index for the [`Locomotor::Air`] aircraft class (matches
+/// [`loco_from_index`]). Used by the loader when wiring an aircraft proto.
+pub const LOCO_AIR_INDEX: u8 = 3;
 
 /// Spawn a produced unit at `cell`, wiring its stats from the catalog proto. A
 /// unit whose proto is infantry is placed into a free sub-cell spot of the exit
@@ -4652,6 +5166,18 @@ fn spawn_produced_unit(world: &mut World, unit_id: u32, house: u8, cell: CellCoo
         }
     }
     world.set_unit_sight(handle, proto.sight);
+
+    // Aircraft (Air locomotor): spawn airborne with a full magazine, homed to the
+    // house's helipad (`AircraftClass` ctor, `aircraft.cpp:254`). They run the
+    // flight FSM (`run_aircraft`) and never take the ground guard/area-guard path.
+    if loco_from_index(proto.locomotor) == Locomotor::Air {
+        let home = find_helipad(world, house);
+        if let Some(u) = world.units.get_mut(handle) {
+            u.make_aircraft(proto.ammo);
+            u.home = home;
+        }
+        return;
+    }
 
     // Area-Guard on produce (M7.14 audit P2a). A **computer** house at `IQ >=
     // IQGuardArea` starts each produced, weapon-equipped unit in **Guard Area**
@@ -4952,6 +5478,9 @@ fn move_units(world: &mut World) {
     // Rebuild occupancy from current positions, in slot order.
     for h in world.units.handles() {
         if let Some(u) = world.units.get(h) {
+            if u.is_aircraft() {
+                continue; // aircraft fly over cells — no ground occupancy
+            }
             if u.is_infantry() {
                 grid.claim_spot(u.cell(), u.sub_cell);
             } else {
@@ -4970,7 +5499,11 @@ fn move_units(world: &mut World) {
     let mut moved_this_tick: Vec<Handle> = Vec::new();
     for handle in world.units.handles() {
         let (start_cell, is_inf, start_spot, loco) = match world.units.get(handle) {
-            Some(u) if !u.path.is_empty() => (u.cell(), u.is_infantry(), u.sub_cell, u.locomotor),
+            // Aircraft move through `run_aircraft` (altitude flight), never the
+            // ground path system.
+            Some(u) if !u.path.is_empty() && !u.is_aircraft() => {
+                (u.cell(), u.is_infantry(), u.sub_cell, u.locomotor)
+            }
             _ => continue,
         };
 
@@ -5293,6 +5826,9 @@ fn build_unit_grid(world: &World) -> UnitGrid {
     let mut grid = UnitGrid::new(gw, gh);
     for h in world.units.handles() {
         if let Some(u) = world.units.get(h) {
+            if u.is_aircraft() {
+                continue; // aircraft fly over cells — no ground occupancy
+            }
             if u.is_infantry() {
                 grid.claim_spot(u.cell(), u.sub_cell);
             } else {
@@ -5522,7 +6058,9 @@ fn advance_along_path(
 fn vehicle_excess(world: &World) -> u32 {
     let mut counts: std::collections::BTreeMap<i64, u32> = std::collections::BTreeMap::new();
     for (_, u) in world.units.iter() {
-        if u.is_infantry() {
+        // Aircraft occupy the air, not a ground cell, so they never count toward
+        // the one-vehicle-per-cell invariant (multiple may overfly a cell).
+        if u.is_infantry() || u.is_aircraft() {
             continue;
         }
         let c = u.cell();
@@ -6268,6 +6806,7 @@ mod m5_tests {
                 prereq,
                 sight: 2,
                 passengers: 0,
+                ammo: 0,
             };
         Catalog {
             buildings: vec![

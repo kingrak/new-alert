@@ -110,6 +110,7 @@ fn catalog() -> Catalog {
             prereq: vec![B_WEAP],
             sight: 2,
             passengers: 0,
+            ammo: 0,
         }],
         econ: EconRules {
             build_speed_bias_raw: BUILD_SPEED_BIAS_08,

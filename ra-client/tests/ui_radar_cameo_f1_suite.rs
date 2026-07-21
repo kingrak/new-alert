@@ -401,6 +401,7 @@ fn cameo_row_core(seed: u32) -> AppCore {
         prereq: vec![],
         sight: 2,
         passengers: 0,
+        ammo: 0,
     };
 
     let mut world = World::new(Passability::all_passable(), seed);
@@ -891,6 +892,7 @@ fn two_strip_core(seed: u32, n_units: usize) -> AppCore {
         prereq: vec![],
         sight: 2,
         passengers: 0,
+        ammo: 0,
     };
     let units: Vec<UnitProto> = (0..n_units).map(|i| uproto(format!("U{i}"))).collect();
     let mut world = World::new(Passability::all_passable(), seed);
