@@ -1777,16 +1777,15 @@ post-tick diff and `compose_game`); it never mutates the sim or draws the sim RN
   untouched — I deliberately did **not** add the AFLD footprint, so the count stays
   13/15). Scenario-placed aircraft remain dropped by `is_naval_or_air` (no campaign
   golden moves).
-- **P2/P3 — BADGER/U2, passenger unload, and all AI air.** The AI does **not**
-  build helipads/aircraft/AA and does not fly attack waves; `HelipadRatio`/`AARatio`
-  stay parsed-but-unused. So AI-vs-AI has no aircraft and is **unchanged** (still
-  decisive, every AI golden byte-identical) — the safe "cut from bottom" that keeps
-  the chunk green rather than risking the decisiveness invariant.
-- **Sidebar cameos.** HPAD/AGUN/SAM/HELI/HIND are registered in the catalog and
-  buildable via `Command::StartProduction` (proven headless), but kept **out of the
-  sidebar `buildables` strip** for now — adding cameos moves the real-asset
-  `compose_game` sidebar goldens, which is a deliberate ra-tester re-pin pass, not
-  an incidental change here.
+- **P2/P3 — BADGER/U2, passenger unload, and all AI air.** ~~The AI does not build
+  helipads/aircraft/AA…~~ **AI air CLOSED in M7.17-B (see Q24.1):** the AI now builds
+  a helipad + helis per `HelipadRatio`, AA per `AARatio` (threat-gated), and helis
+  join attack waves — AI-vs-AI stays decisive at all difficulties on both scenarios.
+  BADGER/U2 (fixed-wing) and passenger unload remain cut.
+- **Sidebar cameos.** ~~kept out of the sidebar strip for now~~ **CLOSED in M7.17-B
+  (see Q24.1):** HPAD/AGUN/SAM and HELI/HIND are now in the two strips with their
+  real `<NAME>ICON.SHP` cameos; zero goldens moved (the new rows sit below the
+  default-visible window).
 
 **Handoff to ra-tester.** Exhaustive adversarial coverage owed: rearm-under-low-
 power, SAM landed-aircraft special case, multi-heli air-collision overlap,
@@ -1794,3 +1793,92 @@ determinism proptest with aircraft, AA-vs-multiple-aircraft retarget, and — on
 wired — the sidebar-cameo re-pin and any AI-air goldens. The P0 smoke proof is
 `ra-sim/tests/aircraft_suite.rs` (5 tests: attack/rearm cycle, AA-downs-air +
 pillbox-cannot, fly-over-impassable-terrain, determinism, idle hover/land).
+
+---
+
+## Q24.1 — Aircraft playability: sidebar cameos, altitude/shadow/rotor render, AI air (M7.17-B)
+
+**Milestone:** M7.17-B (the playability follow-up to Q24 — closes the three cuts
+"sidebar cameos", "aircraft render", and "AI air" so aircraft are actually
+player-usable and appear in AI-vs-AI).
+
+**P0 — sidebar cameos surfaced.** HPAD/AGUN/SAM are added to the structures strip
+and HELI/HIND to the units strip in `build_content`'s `buildables`
+(`ra-client/src/assets.rs`). Cameos load automatically from `<NAME>ICON.SHP` in
+`hires.mix` — verified present via `radump`: HPADICON/AGUNICON/SAMICON/HELIICON/
+HINDICON. Prereqs are enforced exactly as for every other buildable
+(`describe_buildable` / `apply_start_production`): HELI/HIND carry
+`Prerequisite=hpad` and HPAD/AGUN/SAM carry `Prerequisite=dome`, so the cameos are
+visible-but-not-buildable until the pad/dome exists. **Re-pin inventory: ZERO.**
+Contrary to the Q24 cut's expectation, no golden moved — the new cameos are
+inserted *after* the defenses (structures) and *after* the vehicles (units), which
+places them **below the sidebar's default ~4-row visible window**; every pinned
+`compose_game` frame renders the same top rows it always did. Verified by the full
+golden suite (`ui_shroud_golden`, `ui_golden_frames`, `ui_menu_golden_frames`,
+`ui_radar_cameo_f1_suite`, `ui_sidebar_scripted_drive`) staying byte-green.
+
+**P1 — aircraft render (altitude / shadow / rotor / AA aim / crash).** In
+`ra-client/src/appcore.rs::draw_units`, an aircraft is lifted by
+`leptons_to_pixel(altitude)` (`FLIGHT_LEVEL`=256 leptons = one cell = `CELL_PIXELS`
+px), with a darkened body-silhouette **shadow** stamped at the ground cell (offset
+`+1,+2`, `draw_sprite_shadow` in `unit_render.rs`) — a port of
+`AircraftClass::Draw_It` (`aircraft.cpp:408`: body at `y - Lepton_To_Pixel(Height)`,
+shadow at ground `y` with `SHAPE_FADING|SHAPE_PREDATOR`). Body/turret/muzzle-flash/
+selection-box/health-bar all draw at the lifted `sy_d`. **Rotor blades**
+(`RROTOR.SHP`, 12 frames, loaded once into `AppCore::rotor_sprite`) are drawn
+spinning over the lifted body on the *cosmetic* clock (`aircraft.cpp:521`
+`Draw_Rotors`: airborne `Fetch_Stage()%4` fast frames 0..4, landed `(%8)+4` idle
+frames 4..12 — we key off `altitude > 0`). Body facing → frame via the existing
+32-facing `frame_for` (HELI/HIND are 32-frame SHPs, no turret). **AA aim:**
+`target_screen_pos` now lifts an airborne-aircraft target by its altitude, so the
+AA emplacement's tracer/muzzle-flash (`draw_defense_effects`) points *up* at the
+flying heli. **Crash:** the existing death→explosion diff now captures each dying
+unit's airborne altitude in the pre-tick snapshot and spawns the fireball *lifted*
+(`Effect::lift_px`), so a downed heli explodes at flight height, not on the ground.
+All of this is **client-side and sim-inert** — it only *reads* `altitude`/
+`air_state`; determinism is unchanged (the sim already hashes aircraft state, Q24).
+
+**P2 — AI builds and flies aircraft (re-enabling the Q24 cut, decisiveness-safe).**
+`ra-sim/src/ai.rs`:
+- The vehicle-lane aircraft exclusion (`locomotor != LOCO_AIR_INDEX`) is **removed**;
+  helis re-enter the weighted-random army pool (armed → weight 20), gated on a
+  helipad by their `Prerequisite=hpad` (`unit_buildable`). They auto-recruit into
+  attack teams (`find_path` returns `Some` for `Locomotor::Air`) and fly to the
+  target via the Q24 `run_aircraft` FSM.
+- `next_structure` gains two categories, declared **before** the catch-all ground
+  defense (the reference keeps base defense in the separate `AI_Base_Defense` pass,
+  `house.cpp:5613`, so the helipad in `AI_Building`'s main list, `house.cpp:5976`,
+  is not starved by the perpetually-unsatisfied defense ratio): (1) a **helipad**
+  per `HelipadRatio` (first one Medium urgency so the AI reliably reaches air, extras
+  Low), gated on income + a war factory; (2) **anti-air** (AGUN/SAM) per `AARatio`,
+  **gated on `enemy_air_threat`** — an enemy live aircraft must actually exist. This
+  threat-gate is the M7.17-A stall guard: a pure-ground game never builds AA, and AA
+  is a wholly separate category that never counts toward or substitutes for ground
+  defense. The ground-defense `desired` no longer folds in `aa_ratio` (AA is its own
+  category now).
+- **Decisiveness re-verified (the load-bearing bar):** `ui_ai_vs_ai` stays green on
+  **both** scenarios at **all three** difficulties — scg05ea Hard 4997 t / Normal
+  16693 t / Easy 25274 t, scm01ea Hard 21977 t (all ≪ the 45-min cap), Hard reliably
+  beats Easy, symmetric building count bounded. An instrumented run confirmed air is
+  genuinely *in the mix* (scm01ea: first heli ~t10000, peak 6 aircraft; AA appeared
+  under the threat-gate). The M7.17-A stall did **not** return. Outcome ticks moved
+  (air changes game length — outcomes are behaviour-validated, not hash-pinned).
+- **Legacy A/B baseline untouched:** `next_structure_legacy` never builds a helipad,
+  so `unit_buildable`'s `hpad` prereq keeps Legacy air-free — the exclusion removal
+  is inert for the frozen baseline.
+
+**Determinism / re-pins.** Synthetic catalogs contain no aircraft/helipad/AA, so
+every AI/sim/determinism code path added here is dead for them — the full `ra-sim`
+suite (including the single-unit oracle and determinism goldens) is byte-green with
+**zero** re-pins; the entire `ra-client` suite (real + synthetic) is green with zero
+re-pins. Full matrix verified: fmt, clippy (default + `--no-default-features` +
+`--features window`), and `--no-fail-fast` tests across all five crates.
+
+**PNG evidence** (`ra-client/tests/aircraft_render_png.rs`, real assets):
+`aircraft_scene.png` (Longbow airborne — lifted body + ground shadow + rotor —
+firing at a tank while an AA gun fires up at it), `aircraft_crash.png` (the heli
+downed by the AA gun, fireball at flight altitude), `aircraft_cameos.png` (both
+strips scrolled to show HELIPAD/AA GUN/SAM SITE and LONGBOW/HIND cameos).
+
+**Still cut (unchanged from Q24):** Chinook/fixed-wing (MIG/YAK/AFLD), passenger
+unload, air-to-air, curley-shuffle reposition, power-scaled rearm.

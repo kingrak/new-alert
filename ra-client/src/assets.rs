@@ -1685,6 +1685,9 @@ fn install_cosmetic_art(
         .map(|b| load_shp_opt(conquer, &format!("{}MAKE.SHP", b.name.to_ascii_uppercase())))
         .collect();
     core.set_effect_art(explosion, buildups);
+    // Shared helicopter rotor blades (`RROTOR.SHP`, conquer.mix) — drawn spinning
+    // over an airborne heli (`AircraftClass::Draw_Rotors`, aircraft.cpp:521).
+    core.set_rotor_art(load_shp_opt(conquer, "RROTOR.SHP"));
     // Selection overlay art (`SELECT.SHP`, conquer.mix) — frame 2 is the wrench
     // drawn over a repairing building and used as the repair-mode cursor
     // (`object.cpp:2334`, `building.cpp:520`). Optional (synthetic fallback).
@@ -1934,6 +1937,12 @@ pub fn build_content(
         BuildItem::Building(B_GUN),
         BuildItem::Building(B_FTUR),
         BuildItem::Building(B_TSLA),
+        // Aircraft support (P0 aircraft arc): the helipad (dock/rearm) and the
+        // anti-air emplacements. HPAD is the prereq the helis need; AGUN/SAM
+        // shoot down enemy aircraft. Structures column.
+        BuildItem::Building(B_HPAD),
+        BuildItem::Building(B_AGUN),
+        BuildItem::Building(B_SAM),
         // Walls.
         BuildItem::Building(B_SBAG),
         BuildItem::Building(B_CYCL),
@@ -1949,6 +1958,11 @@ pub fn build_content(
         BuildItem::Unit(U_MNLY),
         BuildItem::Unit(U_TRUK),
         BuildItem::Unit(U_HARV),
+        // Aircraft (P0 aircraft arc): helicopters build on the vehicle (Unit)
+        // production lane but are gated on a live helipad (HPAD prereq +
+        // `need_helipad`). Units column, grouped with the vehicles.
+        BuildItem::Unit(U_HELI),
+        BuildItem::Unit(U_HIND),
         BuildItem::Unit(U_E1),
         BuildItem::Unit(U_E2),
         BuildItem::Unit(U_E3),
@@ -1957,16 +1971,14 @@ pub fn build_content(
         BuildItem::Unit(U_DOG),
         BuildItem::Unit(U_MEDI),
         BuildItem::Unit(U_E6),
-        // NOTE (P0 aircraft arc): HPAD/AGUN/SAM and HELI/HIND are registered in the
-        // catalog (buildable via `Command::StartProduction`) but intentionally kept
-        // OUT of the sidebar cameo strip for now — adding cameos moves the
-        // real-asset sidebar `compose_game` goldens, which is a deliberate ra-tester
-        // re-pin pass, not an incidental change in this landing. The flight/AA/rearm
-        // mechanics are proven headless in `ra-sim/tests/aircraft_suite.rs`.
+        // Aircraft + AA are now surfaced in both strips above (P0 aircraft arc):
+        // HPAD/AGUN/SAM in structures, HELI/HIND in units. Cameos load from
+        // <NAME>ICON.SHP in hires.mix (HPADICON/AGUNICON/SAMICON/HELIICON/
+        // HINDICON, all present); prereqs (helis need a helipad) are enforced by
+        // `describe_buildable`/`apply_start_production`. Adding these grows the
+        // cameo strips, moving the real-asset `compose_game` sidebar goldens
+        // (rendering-only re-pin); synthetic/no-asset goldens are unaffected.
     ];
-    // Keep the aircraft-support id constants referenced so a future sidebar pass
-    // (and the AI) can wire them without a dead-code warning churn.
-    let _ = (B_HPAD, B_AGUN, B_SAM, U_HELI, U_HIND);
     Ok(GameContent {
         catalog,
         unit_sprites,

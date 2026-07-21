@@ -22,8 +22,8 @@ use crate::compositor::{viewport_rgba, IndexedImage, Palette, RgbaImage};
 use crate::font;
 use crate::input::{InputEvent, Key, MouseButton, Rect};
 use crate::unit_render::{
-    draw_health_bar, draw_rect_outline, draw_sprite_centered, draw_sprite_topleft, fill_rect,
-    infantry_frame, InfAction, InfantryAnim, UnitSprite,
+    draw_health_bar, draw_rect_outline, draw_sprite_centered, draw_sprite_shadow,
+    draw_sprite_topleft, fill_rect, infantry_frame, InfAction, InfantryAnim, UnitSprite,
 };
 
 /// Sim commands the UI emits. Re-exported from the sim so the whole app speaks
@@ -189,6 +189,10 @@ struct Effect {
     /// World position (leptons). Explosions anchor centred here; buildups anchor
     /// their top-left here (matching how the building sprite is drawn).
     anchor: WorldCoord,
+    /// Extra upward pixel offset applied at draw time — non-zero only for an
+    /// airborne aircraft's crash explosion, so the fireball appears where the
+    /// heli was flying rather than on the ground beneath it.
+    lift_px: i32,
     /// The cosmetic-clock timestamp (ms) the effect began.
     start_ms: u64,
 }
@@ -364,6 +368,10 @@ pub struct AppCore {
     effects: Vec<Effect>,
     /// Death/impact explosion animation frames (e.g. FBALL1). Empty = no art.
     explosion_sprite: Vec<UnitSprite>,
+    /// Shared helicopter rotor-blade sprite (`RROTOR.SHP`, `aircraft.cpp:521`
+    /// `Draw_Rotors`). 12 frames: 0..4 spin fast (airborne), 4..12 idle slow
+    /// (landed). `None` = no rotor art (the aircraft body still draws).
+    rotor_sprite: Option<UnitSprite>,
     /// Construction buildup frames per building type id (`<NAME>MAKE.SHP`). A
     /// `None` entry means that building has no buildup art (skip the anim).
     buildup_sprites: Vec<Option<UnitSprite>>,
@@ -481,6 +489,7 @@ impl AppCore {
             anim_ms: 0,
             effects: Vec::new(),
             explosion_sprite: Vec::new(),
+            rotor_sprite: None,
             buildup_sprites: Vec::new(),
             ore_gold_sprites: Vec::new(),
             ore_gem_sprites: Vec::new(),
@@ -516,6 +525,13 @@ impl AppCore {
     ) {
         self.explosion_sprite = explosion;
         self.buildup_sprites = buildups;
+    }
+
+    /// Install the shared helicopter rotor-blade sprite (`RROTOR.SHP`). Optional —
+    /// without it, airborne helis still draw (lifted body + shadow) but with no
+    /// spinning blades.
+    pub fn set_rotor_art(&mut self, rotor: Option<UnitSprite>) {
+        self.rotor_sprite = rotor;
     }
 
     /// Install ore/gem overlay tile art (GOLD01..04 / GEM01..04). Frame index is
@@ -1062,10 +1078,17 @@ impl AppCore {
     /// world, so this never perturbs the sim or its RNG.
     fn step_tick(&mut self) {
         self.prev_coords.clear();
-        let mut prev_units: Vec<(Handle, WorldCoord)> = Vec::new();
+        // Handle + coord + airborne altitude-lift (pixels) so a crashing aircraft
+        // explodes at its flight height, not on the ground beneath it.
+        let mut prev_units: Vec<(Handle, WorldCoord, i32)> = Vec::new();
         for (h, u) in self.world.units.iter() {
             self.prev_coords.insert(h.index, u.coord);
-            prev_units.push((h, u.coord));
+            let lift = if u.is_airborne() {
+                leptons_to_pixel(u.altitude)
+            } else {
+                0
+            };
+            prev_units.push((h, u.coord, lift));
         }
         // Pre-tick building snapshot: handle + centre coord + top-left cell +
         // type/house/repair state (for the sell-back and repair feedback below).
@@ -1112,9 +1135,9 @@ impl AppCore {
 
         // Deaths → explosions (visual + audio).
         let mut any_death = false;
-        for (h, coord) in prev_units {
+        for (h, coord, lift) in prev_units {
             if !self.world.units.contains(h) {
-                self.spawn_effect(EffectKind::Explosion, coord);
+                self.spawn_effect_lifted(EffectKind::Explosion, coord, lift);
                 any_death = true;
             }
         }
@@ -1200,12 +1223,19 @@ impl AppCore {
     /// Queue a cosmetic effect if it has art to play (else no-op — an explosion
     /// with no SHP installed, or a buildup for a building with no MAKE art).
     fn spawn_effect(&mut self, kind: EffectKind, anchor: WorldCoord) {
+        self.spawn_effect_lifted(kind, anchor, 0);
+    }
+
+    /// Like [`Self::spawn_effect`] but lifts the animation up by `lift_px` pixels
+    /// (an airborne aircraft's crash fireball appears at its flight altitude).
+    fn spawn_effect_lifted(&mut self, kind: EffectKind, anchor: WorldCoord, lift_px: i32) {
         if self.effect_frame_count(kind) == 0 {
             return;
         }
         self.effects.push(Effect {
             kind,
             anchor,
+            lift_px,
             start_ms: self.anim_ms,
         });
     }
@@ -1505,6 +1535,28 @@ impl AppCore {
                 .unwrap_or_else(identity_remap);
 
             let is_inf = unit.is_infantry();
+            let is_air = unit.is_aircraft();
+            // Aircraft float above the ground by their sim `altitude` (leptons →
+            // pixels, `FLIGHT_LEVEL`=256=one cell=`CELL_PIXELS`px lift), casting a
+            // shadow on the cell below (`AircraftClass::Draw_It`, aircraft.cpp:408:
+            // body at `y - Lepton_To_Pixel(Height)`, shadow at ground `y`). Every
+            // sprite/marker for an aircraft is drawn at the lifted `sy_d`; the
+            // shadow silhouette stays at ground `sy`.
+            let lift = if is_air {
+                leptons_to_pixel(unit.altitude)
+            } else {
+                0
+            };
+            let sy_d = sy - lift;
+            // Ground shadow: the darkened body silhouette at the cell below, offset
+            // like the original's `x+1, y+2` SHAPE_FADING shadow. Only when lifted.
+            if is_air && lift > 1 {
+                if let Some(sprite) = self.sprites.get(unit.type_id as usize) {
+                    if let Some(sframe) = sprite.frame_for(unit.facing) {
+                        draw_sprite_shadow(frame, sx + 1, sy + 2, sframe);
+                    }
+                }
+            }
             if let Some(sprite) = self.sprites.get(unit.type_id as usize) {
                 if is_inf {
                     // Infantry: pick the Do-table band (idle / walk / fire) and the
@@ -1530,18 +1582,39 @@ impl AppCore {
                     let stage = (self.anim_ms / 120) as u32;
                     let fi = infantry_frame(&anim, unit.facing, action, stage);
                     if let Some(sframe) = sprite.frame_at(fi) {
-                        draw_sprite_centered(frame, sx, sy, sframe, &remap, &self.palette);
+                        draw_sprite_centered(frame, sx, sy_d, sframe, &remap, &self.palette);
                     }
                 } else {
-                    // Vehicle body sprite.
+                    // Vehicle / aircraft body sprite (drawn at the lifted `sy_d`;
+                    // for a ground vehicle `lift==0` so `sy_d == sy`).
                     if let Some(sframe) = sprite.frame_for(unit.facing) {
-                        draw_sprite_centered(frame, sx, sy, sframe, &remap, &self.palette);
+                        draw_sprite_centered(frame, sx, sy_d, sframe, &remap, &self.palette);
                     }
                     // Turret overlay (turreted vehicles whose SHP has turret frames).
                     if unit.has_turret {
                         if let Some(tframe) = sprite.turret_frame_for(unit.turret_facing) {
-                            draw_sprite_centered(frame, sx, sy, tframe, &remap, &self.palette);
+                            draw_sprite_centered(frame, sx, sy_d, tframe, &remap, &self.palette);
                         }
+                    }
+                }
+            }
+
+            // Helicopter rotor blades, drawn spinning over the lifted body
+            // (`AircraftClass::Draw_Rotors`, aircraft.cpp:521). The stage advances
+            // on the cosmetic clock (sim-inert): airborne blades spin fast through
+            // frames 0..4 (`Fetch_Stage()%4`); a landed heli (altitude 0) idles
+            // slowly through frames 4..12 (`(Fetch_Stage()%8)+4`). Single rotor,
+            // centred on the body, offset up 2px like the original.
+            if is_air {
+                if let Some(rotor) = &self.rotor_sprite {
+                    let stage = (self.anim_ms / 60) as usize;
+                    let ri = if unit.altitude > 0 {
+                        stage % 4
+                    } else {
+                        (stage % 8) + 4
+                    };
+                    if let Some(rframe) = rotor.frames.get(ri) {
+                        draw_sprite_centered(frame, sx, sy_d - 2, rframe, &remap, &self.palette);
                     }
                 }
             }
@@ -1556,7 +1629,7 @@ impl AppCore {
                     } else {
                         unit.facing
                     };
-                    let (fx, fy) = offset_pixels(sx, sy, aim, CELL_PIXELS / 2);
+                    let (fx, fy) = offset_pixels(sx, sy_d, aim, CELL_PIXELS / 2);
                     fill_rect(frame, fx - 1, fy - 1, fx + 1, fy + 1, [255, 230, 120]);
                 }
             }
@@ -1573,19 +1646,19 @@ impl AppCore {
                 draw_rect_outline(
                     frame,
                     sx - marker_half,
-                    sy - marker_half,
+                    sy_d - marker_half,
                     sx + marker_half,
-                    sy + marker_half,
+                    sy_d + marker_half,
                     SELECT_RGB,
                 );
             }
-            // Health bar on selected or damaged units.
+            // Health bar on selected or damaged units (over the lifted body).
             if selected || unit.health < unit.max_health {
                 let bar_w = if is_inf { CELL_PIXELS / 2 } else { CELL_PIXELS };
                 draw_health_bar(
                     frame,
                     sx,
-                    sy - marker_half - 4,
+                    sy_d - marker_half - 4,
                     bar_w,
                     unit.health_permille(),
                 );
@@ -1685,13 +1758,17 @@ impl AppCore {
 
     /// Screen-pixel position of a combat target (unit/building centre), if live.
     fn target_screen_pos(&self, target: Target, viewport: Rect) -> Option<(i32, i32)> {
+        // Airborne aircraft float above their cell — lift the aim point so an AA
+        // tracer/flash reaches the flying heli, not the ground under it.
+        let mut lift = 0;
         let coord = match target {
-            Target::Unit(t) => self
-                .world
-                .units
-                .get(t)
-                .filter(|u| u.is_alive())
-                .map(|u| u.coord)?,
+            Target::Unit(t) => {
+                let u = self.world.units.get(t).filter(|u| u.is_alive())?;
+                if u.is_airborne() {
+                    lift = leptons_to_pixel(u.altitude);
+                }
+                u.coord
+            }
             Target::Building(t) => self
                 .world
                 .buildings
@@ -1701,7 +1778,7 @@ impl AppCore {
             Target::Cell(c) => c.center(),
         };
         let x = (leptons_to_pixel(coord.x.0) as i64 - viewport.x) as i32;
-        let y = (leptons_to_pixel(coord.y.0) as i64 - viewport.y) as i32;
+        let y = (leptons_to_pixel(coord.y.0) as i64 - viewport.y) as i32 - lift;
         Some((x, y))
     }
 
@@ -2550,7 +2627,7 @@ impl AppCore {
                 continue;
             };
             let px = (leptons_to_pixel(e.anchor.x.0) as i64 - cam.x) as i32;
-            let py = (leptons_to_pixel(e.anchor.y.0) as i64 - cam.y) as i32;
+            let py = (leptons_to_pixel(e.anchor.y.0) as i64 - cam.y) as i32 - e.lift_px;
             if centered {
                 draw_sprite_centered(frame, px, py, sframe, &remap, &self.palette);
             } else {

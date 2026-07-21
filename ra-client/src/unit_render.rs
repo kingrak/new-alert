@@ -246,6 +246,38 @@ pub fn draw_sprite_topleft(
     }
 }
 
+/// Blit an indexed sprite frame as a flat **shadow silhouette** — every
+/// non-transparent pixel is darkened toward black rather than palette-expanded —
+/// its centre at (`cx`, `cy`). Used to cast an aircraft's ground shadow below its
+/// lifted body (the original's `SHAPE_FADING | SHAPE_PREDATOR` shadow draw,
+/// `AircraftClass::Draw_It`, aircraft.cpp:461). The existing pixel is dimmed to
+/// ~40% so the shadow reads over any terrain without a separate shadow SHP.
+pub fn draw_sprite_shadow(dst: &mut RgbaImage, cx: i32, cy: i32, frame: &SpriteFrame) {
+    let top = cx - (frame.width as i32) / 2;
+    let left = cy - (frame.height as i32) / 2;
+    for sy in 0..frame.height as i32 {
+        let py = left + sy;
+        if py < 0 || py >= dst.height as i32 {
+            continue;
+        }
+        for sx in 0..frame.width as i32 {
+            let px = top + sx;
+            if px < 0 || px >= dst.width as i32 {
+                continue;
+            }
+            if frame.pixels[(sy as u32 * frame.width + sx as u32) as usize] == 0 {
+                continue; // transparent — no shadow here
+            }
+            let di = ((py as u32 * dst.width + px as u32) * 4) as usize;
+            // Dim the existing background pixel toward black (multiply by ~0.4).
+            dst.pixels[di] = (dst.pixels[di] as u32 * 2 / 5) as u8;
+            dst.pixels[di + 1] = (dst.pixels[di + 1] as u32 * 2 / 5) as u8;
+            dst.pixels[di + 2] = (dst.pixels[di + 2] as u32 * 2 / 5) as u8;
+            dst.pixels[di + 3] = 255;
+        }
+    }
+}
+
 /// Draw a filled rectangle in `[r, g, b]`, clipped to the image. Used for
 /// health bars and muzzle flashes.
 pub fn fill_rect(dst: &mut RgbaImage, x0: i32, y0: i32, x1: i32, y1: i32, rgb: [u8; 3]) {

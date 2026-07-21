@@ -596,9 +596,11 @@ impl AiPlayer {
     /// shipped game uses the raw ratio (rule 3: reference is ground truth). This is
     /// what replaces the old fixed power→refinery→factory priority ladder.
     ///
-    /// **Taxonomy adaptation.** We fold AA/Tesla into the single "defense" category
-    /// (we model no aircraft, and pick the strongest buildable armed building), and
-    /// skip Helipad/Airstrip (no aircraft sim). Ratios/limits are 100% rules.ini.
+    /// **Taxonomy adaptation.** Ground defense folds Tesla into the "defense"
+    /// category (strongest buildable ground combat building) but **excludes AA**;
+    /// AA is a separate air-defense category (built only under a real air threat),
+    /// and the helipad is its own late-game choice (P2 aircraft arc). Ratios/limits
+    /// are 100% rules.ini.
     fn next_structure(&self, world: &World, hs: &House, cat: &Catalog) -> Option<u32> {
         // A/B baseline (M7.14 audit P0): the pre-M7.14 fixed-priority ladder.
         if self.profile == AiProfile::Legacy {
@@ -716,10 +718,86 @@ impl AiPlayer {
             }
         }
 
-        // Defense — `owned < Round_Up(DefenseRatio × cur) && < DefenseLimit`
-        // (house.cpp:5851). AA/Tesla ratios are folded in here (max of the three,
-        // since we pick one strongest buildable armed building). We prefer the
-        // strongest (reverse catalog order → tesla/gun before pillbox).
+        // Helipad (P2 aircraft arc) — `current < Round_Up(HelipadRatio × cur) &&
+        // < HelipadLimit` (house.cpp:5976 — part of `AI_Building`'s main structure
+        // list, declared **before** the base-defense maintenance so it is not
+        // starved by the perpetually-unsatisfied defense ratio; the original keeps
+        // base defense in the separate `AI_Base_Defense` pass, house.cpp:5613).
+        // Gated on the economy running *and* a war factory owned (helis share the
+        // vehicle lane), so air is a late-game addition, never preempting the
+        // economy/army core. Matched by catalog name.
+        let has_war = self
+            .role_building(cat, Role::WarFactory)
+            .map(|f| self.count_owned(world, f) > 0)
+            .unwrap_or(false);
+        if has_income && has_war {
+            if let Some(pad) = cat
+                .buildings
+                .iter()
+                .position(|p| p.name.eq_ignore_ascii_case("HPAD"))
+                .map(|i| i as u32)
+            {
+                let current = self.count_owned(world, pad);
+                // `HelipadRatio × cur`, but always want at least one once the
+                // economy runs so the AI reliably reaches air (on small maps
+                // `.12 × cur` rounds to 1 only past ~5 buildings). The FIRST helipad
+                // is Medium (matching the original's Medium urgency when not
+                // out-aircrafted, house.cpp:5988); additional pads are Low.
+                let desired = round_up_fixed(ai.helipad_ratio, cur).max(1);
+                if current < desired
+                    && current < ai.helipad_limit
+                    && (cost_of(pad) < money || has_income)
+                    && self.buildable(world, hs, pad)
+                {
+                    let urg = if current == 0 {
+                        Urgency::Medium
+                    } else {
+                        Urgency::Low
+                    };
+                    choices.push((urg, pad));
+                }
+            }
+        }
+
+        // Anti-air (P2 aircraft arc) — a SEPARATE air-defense category (AGUN/SAM),
+        // sized by AARatio and capped at AALimit, built **only when an enemy
+        // aircraft threat actually exists** (`AI_Base_Defense`'s aircraft/helipad
+        // scan, house.cpp:5659). This gate is the stall guard: a pure-ground game
+        // (no enemy air) never builds AA, and AA never counts toward or substitutes
+        // for ground defense — so AA answers the real air threat the task calls for
+        // without the M7.17-A regression. Declared before ground defense so it is
+        // not starved once a threat appears.
+        if self.enemy_air_threat(world) {
+            let mut owned_aa = 0i32;
+            let mut pick: Option<u32> = None;
+            for (id, p) in cat.buildings.iter().enumerate().rev() {
+                if is_air_only_defense(p) {
+                    owned_aa += self.count_owned(world, id as u32);
+                    if pick.is_none()
+                        && (p.cost < money || has_income)
+                        && self.buildable(world, hs, id as u32)
+                    {
+                        pick = Some(id as u32);
+                    }
+                }
+            }
+            let desired = round_up_fixed(ai.aa_ratio, cur).max(1);
+            if owned_aa < desired && owned_aa < ai.aa_limit {
+                if let Some(d) = pick {
+                    choices.push((Urgency::Medium, d));
+                }
+            }
+        }
+
+        // Ground defense — `owned < Round_Up(DefenseRatio × cur) && < DefenseLimit`
+        // (house.cpp:5851, the `AI_Base_Defense` maintenance pass — declared LAST so
+        // it fills passes the air tier does not claim). Ground-only combat buildings
+        // (pillbox/gun/tesla/flame), **excluding** air-only AA (AGUN/SAM) from both
+        // the owned count *and* the desired ratio — AA cannot hit a ground attacker,
+        // so counting it here is exactly the M7.17-A stall (AA picked as a
+        // substitute pillbox, defense never satisfied, production loops). We still
+        // fold in the Tesla ratio (tesla *is* a ground defense) and pick the
+        // strongest buildable (reverse catalog order → tesla/gun before pillbox).
         {
             let mut owned_def = 0i32;
             let mut strongest: Option<u32> = None;
@@ -734,9 +812,8 @@ impl AiPlayer {
                     }
                 }
             }
-            let desired = round_up_fixed(ai.defense_ratio, cur)
-                .max(round_up_fixed(ai.aa_ratio, cur))
-                .max(round_up_fixed(ai.tesla_ratio, cur));
+            let desired =
+                round_up_fixed(ai.defense_ratio, cur).max(round_up_fixed(ai.tesla_ratio, cur));
             if owned_def < desired && owned_def < ai.defense_limit {
                 if let Some(d) = strongest {
                     choices.push((Urgency::Medium, d));
@@ -932,11 +1009,14 @@ impl AiPlayer {
                         !p.is_harvester
                             && !p.is_infantry
                             && p.deploys_to.is_none()
-                            // Aircraft (P0 aircraft arc): the AI does not build/fly
-                            // air yet (AI-air is a documented cut), so exclude them
-                            // from the vehicle lane — otherwise it wastes production
-                            // slots on helis it has no helipad to build.
-                            && p.locomotor != crate::LOCO_AIR_INDEX
+                            // Aircraft (helis) build on the vehicle lane, gated on a
+                            // helipad by their `Prerequisite=hpad` (enforced in
+                            // `unit_buildable`), so they only enter the pool once the
+                            // AI owns a helipad. Legacy never builds a helipad, so
+                            // this is inert for the A/B baseline; only Expert
+                            // (`next_structure` builds a helipad per HelipadRatio)
+                            // actually fields air. Armed → weight 20, so helis join
+                            // the weighted-random army and the attack teams.
                             && self.unit_buildable(world, hs, *id as u32)
                     })
                     .map(|(id, p)| (id as u32, if p.weapon.is_some() { 20 } else { 1 }))
@@ -1792,6 +1872,18 @@ impl AiPlayer {
         p.prereq.iter().all(|&pre| hs.owns_building(pre))
     }
 
+    /// Whether any **enemy** house currently fields a live aircraft (airborne or
+    /// docked). The trigger for building anti-air: in a pure-ground game this is
+    /// always false, so the AI never builds AA (useless vs. ground attackers) and
+    /// the M7.17-A ground-defense stall cannot recur. Iterates the arena in slot
+    /// order (deterministic — no `HashMap`, §4.2).
+    fn enemy_air_threat(&self, world: &World) -> bool {
+        world
+            .units
+            .iter()
+            .any(|(_, u)| u.house != self.house && u.is_alive() && u.is_aircraft())
+    }
+
     /// The first building id in the catalog matching a role.
     fn role_building(&self, cat: &Catalog, role: Role) -> Option<u32> {
         cat.buildings
@@ -1806,11 +1898,12 @@ impl AiPlayer {
     }
 }
 
-/// Whether a building is an **anti-air-only** emplacement (AGUN/SAM) the AI must
-/// not pick as a *ground* defense — its projectile only hits aircraft, so against
-/// the ground-only AI-vs-AI game it is a useless "defense". Identified by catalog
-/// name (the §3.8 table-free role pattern), matching `world::building_is_aa`.
-/// (P0 aircraft arc: AI-air is a documented cut, so the AI ignores AA buildings.)
+/// Whether a building is an **anti-air-only** emplacement (AGUN/SAM). Its
+/// projectile only hits aircraft, so it must never be picked as a *ground*
+/// defense (that was the M7.17-A stall). It is instead built by the AI's separate
+/// air-defense category, gated on a real enemy air threat (P2 aircraft arc).
+/// Identified by catalog name (the §3.8 table-free role pattern), matching
+/// `world::building_is_aa`.
 fn is_air_only_defense(p: &BuildingProto) -> bool {
     matches!(p.name.as_str(), "AGUN" | "SAM")
 }
