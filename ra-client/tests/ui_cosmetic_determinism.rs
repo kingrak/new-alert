@@ -291,3 +291,179 @@ fn sell_repair_cosmetic_layer_on_vs_off_yields_identical_sim_hashes() {
         "sim never advanced — determinism check was vacuous"
     );
 }
+
+/// A fake multi-facing aircraft body sprite (32 frames) so the lifted body,
+/// ground shadow, and turret paths all resolve a real frame on the "on" core.
+fn fake_aircraft_sprite() -> UnitSprite {
+    UnitSprite {
+        frames: (0..32)
+            .map(|_| SpriteFrame {
+                width: 24,
+                height: 24,
+                pixels: vec![5u8; 24 * 24],
+            })
+            .collect(),
+    }
+}
+
+/// A fake RROTOR.SHP: 12 frames (0..4 fast/airborne, 4..12 slow/landed).
+fn fake_rotor_sprite() -> UnitSprite {
+    UnitSprite {
+        frames: (0..12)
+            .map(|_| SpriteFrame {
+                width: 24,
+                height: 24,
+                pixels: vec![3u8; 24 * 24],
+            })
+            .collect(),
+    }
+}
+
+/// M7.17 audit (ra-tester): aircraft rendering — altitude-lift, ground shadow,
+/// spinning/idle rotor, AA tracer aim-lift, and the LIFTED crash fireball — is
+/// entirely cosmetic and must not perturb the sim. The SAME input timeline run
+/// with the full aircraft cosmetic layer ON (aircraft/rotor art installed,
+/// `compose_game` composited and sounds drained every frame — so the lifted
+/// body, shadow, rotor stage, and crash-explosion effect are genuinely
+/// exercised) must yield a byte-identical sim-hash chain to the layer OFF.
+///
+/// Always runs (no assets): a synthetic world with two helicopters — one
+/// airborne (downed by an enemy AA gun → lifted crash fireball on the "on"
+/// side) and one docked/landed (idle-rotor branch) — plus the AA gun that
+/// tracers up at the flying craft.
+#[test]
+fn aircraft_render_cosmetic_layer_on_vs_off_yields_identical_sim_hashes() {
+    use ra_client::input::InputEvent;
+    use ra_sim::coords::{CellCoord, Facing};
+    use ra_sim::{
+        BuildingProto, Catalog, EconRules, MoveStats, Passability, WarheadProfile, WeaponProfile,
+        World,
+    };
+
+    fn weapon(damage: i32, rof: u16, range: i32) -> WeaponProfile {
+        WeaponProfile {
+            damage,
+            rof,
+            range,
+            proj_speed: 255,
+            proj_rot: 0,
+            invisible: false, // visible tracer → exercises the AA aim-lift render
+            instant: false,
+            warhead: WarheadProfile {
+                spread: 1000,
+                verses: [65536; 5],
+            },
+            warhead_ap: false,
+            arcing: false,
+            ballistic_scatter: 256,
+            homing_scatter: 512,
+            min_damage: 1,
+            max_damage: 1000,
+        }
+    }
+    fn bproto(name: &str, w: u8, h: u8, wpn: Option<WeaponProfile>) -> BuildingProto {
+        BuildingProto {
+            name: name.to_string(),
+            foot_w: w,
+            foot_h: h,
+            max_health: 400,
+            armor: 0,
+            power: 0,
+            cost: 400,
+            prereq: vec![],
+            is_refinery: false,
+            is_construction_yard: false,
+            is_war_factory: false,
+            is_barracks: false,
+            free_harvester_unit: None,
+            sight: 6,
+            sprite_id: 0,
+            weapon: wpn,
+            has_turret: false,
+            charges: false,
+            is_wall: false,
+            storage: 0,
+        }
+    }
+
+    let build = || {
+        let mut world = World::new(Passability::all_passable(), 0xA112_C0DE);
+        world.set_catalog(Catalog {
+            buildings: vec![
+                bproto("HPAD", 2, 2, None),
+                bproto("AGUN", 1, 2, Some(weapon(20, 12, 4096))),
+            ],
+            units: vec![],
+            econ: EconRules::default(),
+        });
+        world.init_houses(3, 1000);
+        let air_stats = MoveStats {
+            max_speed: 40,
+            rot: 18,
+        };
+        // Enemy AA gun that downs the airborne heli.
+        world.spawn_building(1, 2, CellCoord::new(20, 20)).unwrap();
+        // Airborne heli (house 1) hovering in range — gets shot down (crash lift).
+        let flyer = world.spawn_unit(0, 1, CellCoord::new(23, 20), Facing(0), 40, air_stats);
+        world.set_unit_combat(flyer, 0, Some(weapon(0, 200, 1)), false);
+        world.units.get_mut(flyer).unwrap().make_aircraft(6);
+        // Docked heli (house 1) parked on a pad far away (idle-rotor branch).
+        let pad = world.spawn_building(0, 1, CellCoord::new(40, 40)).unwrap();
+        let parked = world.spawn_unit(0, 1, CellCoord::new(40, 40), Facing(0), 200, air_stats);
+        world.set_unit_combat(parked, 0, Some(weapon(0, 200, 1)), false);
+        {
+            let u = world.units.get_mut(parked).unwrap();
+            u.make_aircraft(6);
+            u.altitude = 0;
+            u.home = Some(pad);
+        }
+        let (raster, palette) = support::synthetic_fixture();
+        let mut core = AppCore::with_sim(
+            raster.clone(),
+            *palette,
+            world,
+            vec![fake_aircraft_sprite()],
+            Vec::new(),
+        );
+        core.handle(InputEvent::Resize {
+            width: 640,
+            height: 400,
+        });
+        core.set_camera(0.0, 0.0);
+        core
+    };
+
+    let mut on = build();
+    let mut off = build();
+
+    // "on": full aircraft cosmetic layer — rotor art + crash-explosion art.
+    on.set_rotor_art(Some(fake_rotor_sprite()));
+    on.set_effect_art(vec![fake_explosion_sprite()], Vec::new());
+    // "off": strip every cosmetic input.
+    off.set_rotor_art(None);
+    off.set_effect_art(Vec::new(), Vec::new());
+    off.set_ore_art(Vec::new(), Vec::new());
+    off.set_cameo_art(Vec::new());
+
+    let mut h_on = Vec::new();
+    let mut h_off = Vec::new();
+    for _ in 0..400 {
+        on.update(67);
+        let _frame = on.compose_game(); // lifts body/shadow/rotor; spawns crash fireball
+        let _cues = on.drain_sounds();
+        h_on.push(on.sim_hash());
+
+        off.update(67);
+        h_off.push(off.sim_hash());
+    }
+
+    assert_eq!(
+        h_on, h_off,
+        "aircraft rendering (altitude lift + shadow + rotor + crash fireball + AA \
+         tracer aim-lift) perturbed the sim hash chain"
+    );
+    assert!(
+        h_on.windows(2).any(|w| w[0] != w[1]),
+        "sim never advanced — the aircraft cosmetic-determinism check was vacuous"
+    );
+}
