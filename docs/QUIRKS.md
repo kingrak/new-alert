@@ -2114,3 +2114,129 @@ survey for AI-vs-AI decisiveness (scm11ea is naval-trap-fragile); and — once w
 LST load/cross/unload and PT. Smoke proofs added: `ra-client/tests/naval_ai_vs_ai.rs`
 (coastal decisive + naval built; PNG) and `ra-client/tests/naval_campaign_probe.rs`
 (authored naval resolves + spawns; PNG).
+
+---
+
+## Q27 — Infiltration specialists: spy / thief / Tanya-C4, and the disguise divergence
+
+**Milestone:** Marquee content arc P0 (spy, thief, Tanya) — reuses the M7.7 Chunk C
+engineer-capture machinery (Q10).
+
+**Machinery.** All four building-infiltrators share the engineer's march path: an
+`Attack` order at an enemy building is accepted for an unarmed engineer *and* now
+for an **infiltrator** (spy/thief) or a **bomber** (Tanya); the unit marches to the
+footprint (`nearest_adjacent_passable` + `find_path`, `Foot`) and acts on arrival.
+`is_engineer` was narrowed to exclude infiltrators (spy/thief are *also* unarmed
+non-harvester infantry, so the old test would have mis-classified them). Capability
+is derived from the unit's rules.ini short-name — the §3.8 role table, exactly like
+`vessel_flags` — SPY/THF/E7/DOG → `(spy, thief, bomber, is_canine)`. New system
+`run_infiltrators` (tick order 4.26, after `run_engineers`).
+
+**Thief (THF).** Faithful port of `infantry.cpp:750-777`: on an enemy **storage**
+building (refinery/silo, `Class->Capacity` — we key on `is_refinery || storage>0`)
+it transfers **half** the victim house's `Available_Money` into its own house
+(`cash = bldg->House->Available_Money()/2; Spend_Money(cash); Refund_Money(cash)`)
+and is **consumed** (`delete this`, `infantry.cpp:783`).
+
+**Spy (SPY).** Faithful part: on entering an enemy building it reveals the
+building's surroundings to its house (`SpiedBy`, a 10-cell disc) and, for a **radar
+dome** (DOME/`STRUCT_RADAR`), the **whole map** (`RadarSpied`, `infantry.cpp:704`).
+**Consumed** on infiltration (`infantry.cpp:783`).
+- **Divergence (documented).** The marquee brief asks the spy to also "steal a % of
+  a refinery's credits". Vanilla-conquer routes the *money* steal through the
+  **thief**, not the spy — the spy's branch (`infantry.cpp:687-746`) grants only
+  recon + (sub-pen/airstrip) superweapons, never credits. To satisfy the brief we
+  additionally leak a **quarter** (`SPY_STEAL_NUM/DEN = 1/4`) of an enemy refinery's
+  credits to the spy's house, and flag this as a deliberate deviation from the
+  reference (which assigns the larger half-steal to the thief). The reveal is the
+  faithful part; the credit leak is brief-directed.
+
+**Spy disguise + dog detection.** RA1/vanilla-conquer models **no visual disguise**
+to cite (grep for `IsDisguised`/`Disguise` in `redalert/`/`common/` returns nothing —
+disguise is an RA2 feature). We implement a simplified stealth in the spirit of the
+brief and mirroring the submarine (Q25): a spy spawns `disguised`, and while
+disguised it is **hidden from enemy target acquisition** (`is_hidden_spy`, the exact
+shape of `is_hidden_submarine`) — an enemy guard never auto-acquires it, and it is
+not an explicit target. A live **enemy dog** (`is_canine`, `IsCanine=yes`) within
+`SPY_DETECT_RANGE = 3` cells **strips the disguise** (`run_spy_detection`, tick
+3.95), after which any unit can engage and the dog's `DogJaw` kills it through
+normal combat. The reference dog deals full-`Strength` instakill to its exact target
+(`infantry.cpp:332-344`); we model the detection/reveal and let the normal weapon
+path do the killing. `disguised` is hashed **only when true**, so no non-spy world
+moves.
+
+**Tanya / C4 (E7).** `C4=yes → IsBomber` (`idata.cpp:1468`). An armed bomber ordered
+onto an enemy building marches in and **plants C4** (`MISSION_SABOTAGE`,
+`infantry.cpp:916-925`): it sets the building's `c4_fuse = round(C4Delay ·
+TICKS_PER_MINUTE)` (`Rule.C4Delay = .03` min, `rules.cpp:262`) unless the building is
+**iron-curtained** (`!IronCurtainCountDown`, `infantry.cpp:919`), then clears its
+order and survives (**not** consumed; the original `Scatter`s her away). The fuse
+counts down in `tick_building_timers`; at zero the building is destroyed outright
+(`building.cpp:995-1013`, `Take_Damage(Strength)`), crediting the saboteur — again
+skipped if the building became iron-curtained meanwhile (`techno.cpp:4102`). Tanya's
+Colt45 anti-infantry fire is ordinary combat (`run_combat` fires it at *unit*
+targets; a *building* target routes to C4 instead). `c4_fuse` hashed only when armed.
+
+---
+
+## Q28 — Superweapons: the SuperClass charge/fire cycle, nuke / iron curtain / chronosphere
+
+**Milestone:** Marquee content arc P1 (superweapon framework + three effects + AI).
+
+**Framework (`SuperClass`, `super.cpp`).** Each house holds a `Vec<SuperWeapon>`
+(`world.superweapons`, hashed only when non-empty). A superweapon is **present**
+while its house owns the granting building — a per-tick function of building
+ownership (`ActiveBScan`), **not** a one-time grant: MSLO→Nuclear, IRON→IronCurtain,
+PDOX→Chronosphere (`house.cpp:1598/1667/1750`). `sync_and_charge_superweapons`
+rebuilds the list each tick, adds a newly-granted weapon (charging from
+`RechargeTime`), drops one whose building is gone, then charges each (`Control`
+countdown → `IsReady` at 0, `super.cpp:265`), **suspending** while the house lacks
+full power (`Suspend(Power_Fraction()<1)`, `house.cpp:1484`). Firing
+(`Command::FireSuperWeapon` → `apply_fire_super`) applies the effect and restarts the
+recharge (`Discharged`, `super.cpp:233`). Recharge times are the `[Recharge]`
+rules.ini minutes (Nuke 13 / IronCurtain 11 / Chrono 7) × `TICKS_PER_MINUTE`
+(`SuperKind::recharge_minutes`). **Byte-identity:** every world without a superweapon
+building has an empty list and appends no hash bytes, so all prior goldens are
+unchanged (verified: full ra-sim + client golden suites green, zero re-pins).
+
+**Nuclear strike (MSLO).** Fire at a cell → a `NukeStrike` falls for
+`NUKE_FALL_TICKS = 20` (the `BULLET_NUKE_DOWN` drop, `house.cpp:2818`), then
+`nuke_detonate` applies the `WARHEAD_NUKE` blast (`NUKE_DAMAGE = 200`,
+`house.cpp:2820`) to **every** unit/building within `NUKE_RADIUS_CELLS = 3` — area
+devastation. **Deviation:** the ordinary `Explosion_Damage` 3×3 per-cell falloff is
+flattened to a uniform full-strength hit across the radius so the superweapon is
+decisive (documented). Iron-curtained targets are spared (`techno.cpp:4102`).
+
+**Iron curtain (IRON).** Fire at a unit/building → `iron_curtain =
+IronCurtainDuration · TICKS_PER_MINUTE` (`Rule.IronCurtainDuration = 0.5` min,
+`rules.cpp:259` → `TICKS_PER_MINUTE/2`). Enforcement is a single chokepoint: every
+damage path (`explosion_damage` units + buildings, `nuke_detonate`, the C4 blast)
+**skips** a target whose `iron_curtain > 0` — the exact `if (IronCurtainCountDown ==
+0)` gate at `techno.cpp:4102` (the whole `Take_Damage` is skipped, not zeroed).
+Ticked down in `tick_building_timers`. Hashed only when active.
+
+**Chronosphere (PDOX).** Fire at a vehicle + destination cell → teleport it there
+(`u.coord = dest.center()`, clear path/target). An **infantry** target is killed by
+the warp (`Take_Damage(Strength)`, `house.cpp:3021`). **Deferral:** the
+`Rule.ChronoDuration` warp-**back** (`MoebiusCountDown`, the unit returning after 3
+min) is not modelled — this is a one-way teleport, which satisfies the combat-use
+case (move a vehicle across the map) and the acceptance (assert new position).
+
+**AI (`Super_Weapon_Handler` → `Special_Weapon_AI`, `house.cpp:1458/2722`).** Gated
+on `IQ >= IQSuperWeapons` (`house.cpp:1782`; a computer house runs at `MaxIQ ≥ 4`).
+The reference auto-fires **only the nuclear strike**, at the highest-`Value()` enemy
+building with a 90% chance (`Percent_Chance(90)`); we port that (max-`cost` live
+enemy non-wall building, one sync-RNG draw for the 90%). As a decisive extension the
+AI also drapes the **iron curtain** over its strongest armed unit when ready
+(iron/chrono are player-only in the reference; documented). The AI does **not** build
+superweapon structures in its base order yet — they are only present when placed
+(scripted/campaign), so AI-vs-AI without them is byte-identical and decisive; an AI
+that *owns* a superweapon fires it (smoke-proven). **RNG safety:** `fire_superweapons`
+early-returns (no draw) for any house with no ready superweapon, so no existing
+AI-vs-AI golden draws differently.
+
+**Player surface.** The sim `Command::FireSuperWeapon` + `World` accessors
+(`superweapon_ready`, `superweapon_charge_permille`, `nuke_strikes`) are the seam a
+sidebar readiness clock + click-target mode drive; the rich targeting UI + the
+sidebar special-weapon cameo/clock are a below-the-fold client follow-on (P2,
+deferred — same treatment as the aircraft/naval sidebar cameos).

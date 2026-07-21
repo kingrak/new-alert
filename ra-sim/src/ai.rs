@@ -42,6 +42,7 @@ use crate::coords::{CellCoord, Locomotor};
 use crate::hash::Fnv1a;
 use crate::house::{BuildItem, House};
 use crate::rng::RandomLcg;
+use crate::superweapon::SuperKind;
 use crate::world::{Command, World, LOCO_WATER_INDEX};
 use crate::Target;
 
@@ -473,6 +474,93 @@ impl AiPlayer {
         if self.decide_timer == DECIDE_PERIOD || self.decide_timer == 0 {
             self.command_navy(world, out);
         }
+
+        // 5) Superweapons (marquee arc): fire any ready superweapon this house owns
+        // at a good target, gated on IQ (`IQSuperWeapons`). On the decide cadence.
+        // Inert (no RNG, no commands) for any house with no superweapon building —
+        // every existing AI-vs-AI golden has none, so their sequences are unchanged.
+        if self.decide_timer == DECIDE_PERIOD || self.decide_timer == 0 {
+            self.fire_superweapons(world, rng, out);
+        }
+    }
+
+    /// Fire this house's ready superweapons (`HouseClass::Super_Weapon_Handler` →
+    /// `Special_Weapon_AI`, `house.cpp:1458/2722`). Gated on `IQ >= IQSuperWeapons`
+    /// (`house.cpp:1782`). The reference only auto-fires the **nuclear strike** at
+    /// the highest-value enemy building with a 90% chance (`Percent_Chance(90)`,
+    /// `house.cpp:2740`); iron curtain / chronosphere are player-only there, so we
+    /// leave those for the human (documented). As a decisive extension we also let
+    /// the AI drape the **iron curtain** over its strongest attacking unit when
+    /// ready — a faithful-spirited use that keeps AI-vs-AI lively.
+    fn fire_superweapons(&mut self, world: &World, rng: &mut RandomLcg, out: &mut Vec<Command>) {
+        let iq = world.house(self.house).map(|h| h.iq).unwrap_or(0);
+        if iq < world.catalog.econ.iq.super_weapons {
+            return;
+        }
+        for s in world.superweapons() {
+            if s.house != self.house || !s.ready {
+                continue;
+            }
+            match s.kind {
+                SuperKind::Nuclear => {
+                    if let Some(cell) = self.best_enemy_building_cell(world) {
+                        // Percent_Chance(90): a 1-in-10 chance to hold fire.
+                        if rng.range(1, 100) <= 90 {
+                            out.push(Command::FireSuperWeapon {
+                                house: self.house,
+                                kind: SuperKind::Nuclear,
+                                target: Target::Cell(cell),
+                                dest: None,
+                            });
+                        }
+                    }
+                }
+                SuperKind::IronCurtain => {
+                    if let Some(unit) = self.strongest_own_attacker(world) {
+                        out.push(Command::FireSuperWeapon {
+                            house: self.house,
+                            kind: SuperKind::IronCurtain,
+                            target: Target::Unit(unit),
+                            dest: None,
+                        });
+                    }
+                }
+                // Chronosphere is a micro-heavy player special — deferred for the AI.
+                SuperKind::Chronosphere => {}
+            }
+        }
+    }
+
+    /// The cell of the highest-value (max-cost) live enemy building — the nuclear
+    /// strike's aim point (`Special_Weapon_AI` best `Value()`, `house.cpp:2731`).
+    /// Walls are ignored; ties break by slot order (deterministic).
+    fn best_enemy_building_cell(&self, world: &World) -> Option<CellCoord> {
+        let mut best: Option<(i32, CellCoord)> = None;
+        for (_, b) in world.buildings.iter() {
+            if b.is_wall || !b.is_alive() || world.are_allies(self.house, b.house) {
+                continue;
+            }
+            let value = b.cost;
+            if best.map(|(v, _)| value > v).unwrap_or(true) {
+                best = Some((value, b.center_cell()));
+            }
+        }
+        best.map(|(_, c)| c)
+    }
+
+    /// The strongest (max-health) live armed unit this house owns — a good iron
+    /// curtain recipient (the tip of the spear).
+    fn strongest_own_attacker(&self, world: &World) -> Option<crate::Handle> {
+        let mut best: Option<(u16, crate::Handle)> = None;
+        for (h, u) in world.units.iter() {
+            if u.house != self.house || !u.is_alive() || u.weapon.is_none() || u.iron_curtain > 0 {
+                continue;
+            }
+            if best.map(|(hp, _)| u.health > hp).unwrap_or(true) {
+                best = Some((u.health, h));
+            }
+        }
+        best.map(|(_, h)| h)
     }
 
     // ---- Expert_AI: enemy selection + rubber-band caps (house.cpp:4877) -----

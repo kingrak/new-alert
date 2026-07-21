@@ -79,6 +79,23 @@ pub struct Building {
     /// only by the campaign loader; hashed **only when `Some`** so no
     /// non-campaign world perturbs an existing golden (M7.5).
     pub trigger: Option<u16>,
+
+    // --- Infiltration + superweapon effects (marquee content arc) ---
+    /// **C4 fuse** (`BuildingClass::CountDown` after Tanya plants C4,
+    /// `infantry.cpp:925`): ticks until the building blows itself up for full
+    /// `Strength` (`building.cpp:995-1013`). `0` = unarmed. An iron-curtained
+    /// building refuses C4 (`!IronCurtainCountDown`, `infantry.cpp:919`). Hashed
+    /// **only when non-zero**, so no un-sabotaged building perturbs a golden.
+    pub c4_fuse: u16,
+    /// The house to credit as the killer when the C4 fuse blows (the saboteur's
+    /// owner, `WhomToRepay`, `infantry.cpp:926`). Meaningful only when
+    /// `c4_fuse > 0`; hashed with the fuse.
+    pub c4_by: u8,
+    /// **Iron-curtain invulnerability** countdown (`TechnoClass::IronCurtainCountDown`,
+    /// `house.cpp:2943`): while non-zero, every `Take_Damage` call is skipped
+    /// entirely (`techno.cpp:4102`), so the building takes no damage and cannot be
+    /// C4'd/captured. Hashed **only when non-zero**.
+    pub iron_curtain: u16,
 }
 
 impl Building {
@@ -185,6 +202,18 @@ impl Building {
         if let Some(t) = self.trigger {
             h.write_u8(0x2A);
             h.write_u16(t);
+        }
+        // C4 fuse + iron-curtain timer (marquee content arc): folded ONLY when
+        // active, so every un-sabotaged / non-curtained building (all prior
+        // goldens) is byte-identical.
+        if self.c4_fuse != 0 {
+            h.write_u8(0xC4);
+            h.write_u16(self.c4_fuse);
+            h.write_u8(self.c4_by);
+        }
+        if self.iron_curtain != 0 {
+            h.write_u8(0x1C);
+            h.write_u16(self.iron_curtain);
         }
     }
 }

@@ -1006,6 +1006,16 @@ fn spawn_placed_unit(
     world.set_unit_secondary(h, proto.secondary);
     world.set_unit_harvester(h, proto.is_harvester);
     world.set_unit_capacity(h, proto.passengers);
+    // Infiltration-specialist capabilities (spy/thief/Tanya/dog), keyed by name
+    // (the same §3.8 role table the sim's production path uses).
+    let (spy, thief, bomber, canine) = match proto.name.to_ascii_uppercase().as_str() {
+        "SPY" => (true, false, false, false),
+        "THF" => (false, true, false, false),
+        "E7" => (false, false, true, false),
+        "DOG" => (false, false, false, true),
+        _ => (false, false, false, false),
+    };
+    world.set_unit_specialist(h, spy, thief, bomber, canine);
     if let Some(u) = world.units.get_mut(h) {
         if is_infantry {
             u.make_infantry(sub_cell);
@@ -1769,6 +1779,11 @@ pub fn build_content(
         // name (`building_is_shipyard`) and require a water-adjacent (shore) cell.
         ("SYRD", false, false, false, false), // naval yard (produces surface ships)
         ("SPEN", false, false, false, false), // sub pen (produces submarines)
+        // --- Marquee arc: superweapon structures + kennel (dog prereq) ---
+        ("KENN", false, false, false, false), // kennel (attack-dog prerequisite)
+        ("MSLO", false, false, false, false), // missile silo (nuclear strike)
+        ("IRON", false, false, false, false), // iron curtain device
+        ("PDOX", false, false, false, false), // chronosphere
     ];
     // Per-name defense/wall attributes: GUN has a rotating turret; TSLA charges;
     // SBAG/CYCL/BRIK are walls (1×1 buildable segments — QUIRKS Q9).
@@ -1836,7 +1851,7 @@ pub fn build_content(
     // (Track) except TRUK (no key → the SPEED_WHEEL default). Ids are *appended* so
     // the existing MCV..E3 ids stay stable (no golden churn from renumbering).
     // Aircraft use locomotor index 3 (`ra_sim::LOCO_AIR_INDEX` = `Locomotor::Air`).
-    let uspecs: [(&str, bool, Option<u32>, bool, u8); 24] = [
+    let uspecs: [(&str, bool, Option<u32>, bool, u8); 27] = [
         ("MCV", false, Some(B_FACT), false, LOCO_TRACK as u8),
         ("HARV", true, None, false, LOCO_TRACK as u8),
         ("1TNK", false, None, false, LOCO_TRACK as u8),
@@ -1865,6 +1880,11 @@ pub fn build_content(
         ("SS", false, None, false, ra_sim::LOCO_WATER_INDEX), // Soviet submarine (torpedoes)
         ("DD", false, None, false, ra_sim::LOCO_WATER_INDEX), // Allied destroyer (anti-sub)
         ("CA", false, None, false, ra_sim::LOCO_WATER_INDEX), // Allied cruiser (8-inch guns)
+        // --- Marquee arc: infiltration specialists (all Foot infantry; DOG is
+        // already in the roster above as the M7.7 canine). ---
+        ("SPY", false, None, true, LOCO_FOOT as u8), // Spy (reveal + disguise, Infiltrate)
+        ("THF", false, None, true, LOCO_FOOT as u8), // Thief (steals credits, Infiltrate)
+        ("E7", false, None, true, LOCO_FOOT as u8),  // Tanya (Colt45 + C4 demolition)
     ];
     let mut units = Vec::new();
     let mut unit_sprites = Vec::new();

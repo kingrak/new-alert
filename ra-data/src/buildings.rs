@@ -68,6 +68,10 @@ pub fn footprint(name: &str) -> Option<(u8, u8)> {
         "GUN" => (1, 1),  // gun turret,          BSIZE_11
         "FTUR" => (1, 1), // flame turret,        BSIZE_11
         "TSLA" => (1, 2), // tesla coil,          BSIZE_12
+        // --- Superweapon structures (marquee content arc) ---
+        "MSLO" => (2, 1), // missile silo,        BSIZE_21 (bdata.cpp:924)
+        "IRON" => (2, 2), // iron curtain,        BSIZE_22 (bdata.cpp:274)
+        "PDOX" => (2, 2), // chronosphere,        BSIZE_22 (bdata.cpp:364)
         // --- Aircraft support + AA defenses (P0 aircraft arc) ---
         "HPAD" => (2, 2), // helipad,             BSIZE_22 (bdata.cpp:785)
         "AGUN" => (1, 2), // AA gun,              BSIZE_12 (bdata.cpp:576)

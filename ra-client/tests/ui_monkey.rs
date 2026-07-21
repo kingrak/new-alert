@@ -228,7 +228,8 @@ fn apply_op_with_units(core: &mut AppCore, op: MonkeyOp, index: usize) {
             | Command::PlaceBuilding { .. }
             | Command::CancelProduction { .. }
             | Command::Sell { .. }
-            | Command::Repair { .. } => continue,
+            | Command::Repair { .. }
+            | Command::FireSuperWeapon { .. } => continue,
         };
         let owner = core.world().units.get(unit).unwrap_or_else(|| {
             panic!("drained {cmd:?} addresses a handle that isn't live in the world")
@@ -330,7 +331,8 @@ fn apply_op_with_armed_units(core: &mut AppCore, op: MonkeyOp, index: usize) {
             | Command::PlaceBuilding { .. }
             | Command::CancelProduction { .. }
             | Command::Sell { .. }
-            | Command::Repair { .. } => continue,
+            | Command::Repair { .. }
+            | Command::FireSuperWeapon { .. } => continue,
         };
         let owner = core.world().units.get(unit).unwrap_or_else(|| {
             panic!("drained {cmd:?} addresses a handle that isn't live in the world")
@@ -523,7 +525,8 @@ fn apply_op_with_econ(core: &mut AppCore, op: MonkeyOp, index: usize) {
             Command::StartProduction { house, .. }
             | Command::CancelProduction { house, .. }
             | Command::Sell { house, .. }
-            | Command::Repair { house, .. } => {
+            | Command::Repair { house, .. }
+            | Command::FireSuperWeapon { house, .. } => {
                 assert_eq!(
                     house, 1,
                     "drained {cmd:?} was not issued for the controlled house"
@@ -787,7 +790,8 @@ fn apply_sidebar_monkey_op(
             }
             Command::CancelProduction { house, .. }
             | Command::Sell { house, .. }
-            | Command::Repair { house, .. } => {
+            | Command::Repair { house, .. }
+            | Command::FireSuperWeapon { house, .. } => {
                 assert_eq!(
                     house, 1,
                     "drained {cmd:?} was not issued for the controlled house"

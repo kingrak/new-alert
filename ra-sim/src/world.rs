@@ -25,6 +25,7 @@ use crate::ore::OreField;
 use crate::path::{find_path, find_path_avoiding, Passability};
 use crate::rng::RandomLcg;
 use crate::shroud::Shroud;
+use crate::superweapon::{NukeStrike, SuperKind, SuperWeapon};
 use crate::unit::{AirState, HarvStatus, Mission, MoveStats, Passenger, Unit, FLIGHT_LEVEL};
 
 /// A player order. Every command carries the **issuing house** explicitly
@@ -146,6 +147,22 @@ pub enum Command {
         /// House issuing the order (must own `transport`).
         house: u8,
     },
+    /// Fire `house`'s ready **superweapon** at a target (`Place_Special_Blast`,
+    /// `house.cpp:2777`). Ignored unless the house owns the granting building and
+    /// the weapon is fully charged. `target` is a **cell** for the nuclear strike,
+    /// the **unit/building** to protect for the iron curtain, or the **unit** to
+    /// teleport for the chronosphere (with `dest` the destination cell). Firing
+    /// resets the recharge (`Discharged`).
+    FireSuperWeapon {
+        /// House issuing the order (must own the granting building, weapon ready).
+        house: u8,
+        /// Which superweapon.
+        kind: SuperKind,
+        /// The target (cell / unit / building, per `kind`).
+        target: Target,
+        /// Chronosphere destination cell (ignored for other kinds).
+        dest: Option<CellCoord>,
+    },
 }
 
 /// The complete simulation state. Fields are plain and serialisable; there are
@@ -195,6 +212,15 @@ pub struct World {
     /// campaigns that never touch it; hashed only when a house has actually been
     /// alerted or begun production (`run_enemy_activation`).
     enemy_activation: Option<crate::campaign::EnemyActivation>,
+    /// Per-house **superweapon** charge state (`SuperClass`, marquee arc). One entry
+    /// per (house, kind) the house currently has the granting building for; kept in
+    /// slot order, rebuilt each tick from building ownership. Hashed **only when
+    /// non-empty**, so every world without a superweapon building (all prior
+    /// goldens) is byte-identical.
+    superweapons: Vec<SuperWeapon>,
+    /// Nuclear strikes in flight (launched, awaiting detonation). Hashed only while
+    /// non-empty.
+    nuke_strikes: Vec<NukeStrike>,
 }
 
 /// Terminal outcome of a skirmish, from the player's point of view (M6, item 4).
@@ -260,6 +286,8 @@ impl World {
             campaign: None,
             alliances: None,
             enemy_activation: None,
+            superweapons: Vec::new(),
+            nuke_strikes: Vec::new(),
         }
     }
 
@@ -474,6 +502,55 @@ impl World {
         self.game_over
     }
 
+    /// Read-only view of every house's superweapon charge state (marquee arc) —
+    /// for the sidebar readiness indicator, the AI, and tests.
+    pub fn superweapons(&self) -> &[SuperWeapon] {
+        &self.superweapons
+    }
+
+    /// Whether `house`'s superweapon of `kind` is present and fully charged
+    /// (ready to fire).
+    pub fn superweapon_ready(&self, house: u8, kind: SuperKind) -> bool {
+        self.superweapons
+            .iter()
+            .any(|s| s.house == house && s.kind == kind && s.ready)
+    }
+
+    /// The charge fraction (0..=1000 permille) of `house`'s `kind` superweapon, or
+    /// `None` if the house has no such superweapon — for the sidebar clock.
+    pub fn superweapon_charge_permille(&self, house: u8, kind: SuperKind) -> Option<i32> {
+        self.superweapons
+            .iter()
+            .find(|s| s.house == house && s.kind == kind)
+            .map(|s| {
+                if s.ready {
+                    1000
+                } else {
+                    ((s.recharge - s.control) as i64 * 1000 / s.recharge.max(1) as i64) as i32
+                }
+            })
+    }
+
+    /// Nuclear strikes currently in flight (for the client's mushroom/warning
+    /// rendering and tests).
+    pub fn nuke_strikes(&self) -> &[NukeStrike] {
+        &self.nuke_strikes
+    }
+
+    /// Test/loader seam: force `house`'s `kind` superweapon to fully charged, so a
+    /// scripted drive can fire it without waiting out the recharge. Requires the
+    /// house to already own the granting building (the superweapon must be present).
+    pub fn force_charge_superweapon(&mut self, house: u8, kind: SuperKind) {
+        if let Some(s) = self
+            .superweapons
+            .iter_mut()
+            .find(|s| s.house == house && s.kind == kind)
+        {
+            s.ready = true;
+            s.control = 0;
+        }
+    }
+
     /// Whether `house` is still alive — it owns at least one live building **or**
     /// one live unit. Elimination is "all buildings AND all units destroyed"
     /// (the classic MP defeat check, `house.cpp:1290`).
@@ -593,6 +670,22 @@ impl World {
         }
     }
 
+    /// Attach infiltration-specialist capabilities (spy/thief/bomber/canine) to a
+    /// spawned unit. The client calls this from the unit's catalog proto right
+    /// after spawning, like [`World::set_unit_combat`].
+    pub fn set_unit_specialist(
+        &mut self,
+        unit: Handle,
+        spy: bool,
+        thief: bool,
+        bomber: bool,
+        is_canine: bool,
+    ) {
+        if let Some(u) = self.units.get_mut(unit) {
+            u.make_specialist(spy, thief, bomber, is_canine);
+        }
+    }
+
     /// Set a spawned unit's standing [`Mission`] (from its scenario INI order).
     /// Area-Guard units record their spawn cell as the guard post they leash to.
     pub fn set_unit_mission(&mut self, unit: Handle, mission: crate::unit::Mission) {
@@ -666,6 +759,9 @@ impl World {
             storage: proto.storage,
             is_repairing: false,
             trigger: None,
+            c4_fuse: 0,
+            c4_by: 0,
+            iron_curtain: 0,
         };
         let handle = self.buildings.insert(building);
         // Stamp occupancy.
@@ -787,6 +883,23 @@ impl World {
                 ea.hash_into(&mut h);
             }
         }
+        // Superweapon charge state + pending nuclear strikes (marquee arc) fold in
+        // ONLY when present, so every world without a superweapon building / live
+        // nuke (all prior goldens) is byte-identical.
+        if !self.superweapons.is_empty() {
+            h.write_u8(0x5B);
+            h.write_u32(self.superweapons.len() as u32);
+            for s in &self.superweapons {
+                s.hash_into(&mut h);
+            }
+        }
+        if !self.nuke_strikes.is_empty() {
+            h.write_u8(0x5C);
+            h.write_u32(self.nuke_strikes.len() as u32);
+            for n in &self.nuke_strikes {
+                n.hash_into(&mut h);
+            }
+        }
         h.finish()
     }
 }
@@ -839,11 +952,26 @@ pub fn apply(world: &mut World, tick: u32, commands: &[Command]) {
     // consistent this tick. Inert for any world with no submarines.
     run_submarines(world);
 
+    // System 3.95: dogs sniff out disguised spies (strip disguise), before combat
+    // acquisition so a revealed spy can be engaged this tick. Inert with no spies.
+    run_spy_detection(world);
+
     // System 4: combat (targeting + rotation + firing).
     run_combat(world);
 
     // System 4.25: engineers march to a targeted enemy building and capture it.
     run_engineers(world);
+
+    // System 4.26: infiltration specialists (spy reveal/steal, thief steal, Tanya
+    // C4). Reuses the engineer march machinery; inert for any world with no
+    // spy/thief/bomber unit.
+    run_infiltrators(world);
+
+    // System 4.27: superweapon charge/fire cycle + timed effects (C4 fuse,
+    // iron-curtain countdown, nuclear-strike fall) — the marquee superweapon
+    // framework. Inert (RNG-free, byte-identical) until a house owns a superweapon
+    // building or a C4/curtain/nuke effect is live.
+    run_superweapons(world);
 
     // System 4.5: defense-building combat (auto-acquire + turret + fire), after
     // unit combat so RNG (bullet scatter) is drawn in a fixed unit-then-building
@@ -2130,12 +2258,17 @@ fn apply_command(world: &mut World, cmd: Command) {
             // Reject the order up front for unowned/stale units and self-targeting.
             // Armed units accept any target (`run_combat` drives approach/aim/fire);
             // an **engineer** (unarmed infantry) accepts a *building* target so it
-            // can march in to capture it (`run_engineers`).
+            // can march in to capture it (`run_engineers`); an **infiltrator**
+            // (spy/thief) accepts an enemy building to march in and apply its
+            // effect (`run_infiltrators`). A **bomber** (Tanya) with a building
+            // target plants C4 instead of shooting — handled there too, so a
+            // building target is always accepted for her (`run_combat` skips it).
             let ok = match world.units.get(unit) {
                 Some(u) => {
                     u.house == house
                         && (u.weapon.is_some()
-                            || (is_engineer(u) && matches!(target, Target::Building(_))))
+                            || ((is_engineer(u) || u.is_infiltrator())
+                                && matches!(target, Target::Building(_))))
                 }
                 None => false,
             };
@@ -2151,11 +2284,9 @@ fn apply_command(world: &mut World, cmd: Command) {
             // whose house has no detector nearby (naval arc): the sub is invisible,
             // so the click resolves to nothing (matches auto-acquisition gating).
             if let Target::Unit(t) = target {
-                if world
-                    .units
-                    .get(t)
-                    .is_some_and(|tu| is_hidden_submarine(world, tu, house))
-                {
+                if world.units.get(t).is_some_and(|tu| {
+                    is_hidden_submarine(world, tu, house) || is_hidden_spy(world, tu, house)
+                }) {
                     return;
                 }
             }
@@ -2184,6 +2315,12 @@ fn apply_command(world: &mut World, cmd: Command) {
             house,
         } => apply_load(world, passenger, transport, house),
         Command::Unload { transport, house } => apply_unload(world, transport, house),
+        Command::FireSuperWeapon {
+            house,
+            kind,
+            target,
+            dest,
+        } => apply_fire_super(world, house, kind, target, dest),
     }
 }
 
@@ -3151,6 +3288,18 @@ fn run_combat(world: &mut World) {
             }
         }
 
+        // A **bomber** (Tanya) ordered onto an enemy building marches in to plant
+        // C4 rather than shooting it — that is owned by `run_infiltrators`, so the
+        // combat path leaves a bomber+building target alone (it still fires her
+        // Colt45 at unit targets like any armed infantry).
+        if world
+            .units
+            .get(handle)
+            .is_some_and(|u| u.bomber && matches!(u.target, Some(Target::Building(_))))
+        {
+            continue;
+        }
+
         // Medic (MEDI) auto-acquire: a healer (a weapon whose Damage is negative)
         // with no live wounded target picks the nearest wounded friendly infantry
         // in range. It then fires its `Heal` weapon at it through the normal path;
@@ -3985,7 +4134,7 @@ fn maybe_acquire_heal_target(world: &mut World, handle: Handle) {
 /// Derived rather than flagged — E6 is the only unarmed infantry in the roster,
 /// so "unarmed foot soldier" is a sufficient, table-free capability test (§3.8).
 fn is_engineer(u: &crate::unit::Unit) -> bool {
-    u.is_infantry() && u.weapon.is_none() && !u.is_harvester
+    u.is_infantry() && u.weapon.is_none() && !u.is_harvester && !u.is_infiltrator()
 }
 
 /// `Rule.EngineerCaptureLevel = ConditionRed = 1/4` (`rules.cpp:281`): a building
@@ -4151,6 +4300,528 @@ fn capture_building(world: &mut World, building: Handle, new_house: u8) {
     }
 }
 
+/// `Rule.C4Delay` (`rules.cpp:262`, default `.03` minutes) — the C4 fuse Tanya
+/// arms on a building (`CountDown = C4Delay · TICKS_PER_MINUTE`, `infantry.cpp:925`).
+/// At the stock 900 ticks/minute that is `round(0.03 · 900) = 27` ticks (~1.8 s).
+const C4_DELAY_NUM: i32 = 3;
+const C4_DELAY_DEN: i32 = 100;
+
+/// Fraction of an enemy refinery's credits a **spy** siphons on infiltration.
+/// Vanilla-conquer routes the *money* steal through the **thief** (half the
+/// victim's `Available_Money`, `infantry.cpp:773`) and gives the spy only recon
+/// (`SpiedBy`/`RadarSpied`); the marquee brief additionally asks the spy to
+/// "steal a % of credits" from a refinery, so we transfer a smaller quarter-cut
+/// here and document the divergence (QUIRKS). The reveal below is the faithful part.
+const SPY_STEAL_NUM: i32 = 1;
+const SPY_STEAL_DEN: i32 = 4;
+
+/// Whether a building's catalog type is a **radar dome** (DOME) — spying it grants
+/// the whole-map reveal (`STRUCT_RADAR → RadarSpied`, `infantry.cpp:703`).
+fn building_is_radar(world: &World, type_id: u32) -> bool {
+    world
+        .catalog
+        .building(type_id)
+        .is_some_and(|p| p.name.eq_ignore_ascii_case("DOME"))
+}
+
+/// System 4.26: **infiltration specialists** (spy/thief/Tanya). Ported from the
+/// `InfantryClass::Per_Cell_Process` `MISSION_CAPTURE`/`MISSION_SABOTAGE` branches
+/// (`infantry.cpp:625-784`, `:916-933`). A specialist ordered to attack an enemy
+/// building marches to its footprint (reusing the engineer march path) and, on
+/// arrival, applies its effect:
+///
+/// - **Spy** (`spy`): reveals the building's surroundings to its house and, for a
+///   radar dome, the whole map (`SpiedBy`/`RadarSpied`, `infantry.cpp:687-705`);
+///   an enemy refinery additionally leaks a credit cut (brief-directed, see
+///   [`SPY_STEAL_NUM`]). **Consumed** (`delete this`, `infantry.cpp:783`).
+/// - **Thief** (`thief`): on an enemy **storage** building (refinery/silo,
+///   `Storage>0`/`Class->Capacity`) steals **half** the victim's available money
+///   into its own house (`infantry.cpp:773-776`). **Consumed**.
+/// - **Tanya / bomber** (`bomber`): plants C4 — arms the building's `c4_fuse`
+///   unless it is iron-curtained (`!IronCurtainCountDown`, `infantry.cpp:919-925`)
+///   — then runs off (**not** consumed; `Scatter`, `infantry.cpp:931`).
+///
+/// Walls and friendly/own buildings are refused (target dropped, specialist
+/// untouched), matching the engineer's wall/ally gating.
+fn run_infiltrators(world: &mut World) {
+    for handle in world.units.handles() {
+        let (house, coord, target, is_spy, is_thief, is_bomber) = match world.units.get(handle) {
+            Some(u) if u.is_infiltrator() || u.bomber => match u.target {
+                Some(Target::Building(t)) => (u.house, u.coord, t, u.spy, u.thief, u.bomber),
+                _ => continue,
+            },
+            _ => continue,
+        };
+        let (bcell, bw, bh, bhouse, bwall, iron) = match world.buildings.get(target) {
+            Some(b) if b.is_alive() => (
+                b.cell,
+                b.foot_w as i32,
+                b.foot_h as i32,
+                b.house,
+                b.is_wall,
+                b.iron_curtain,
+            ),
+            _ => {
+                if let Some(u) = world.units.get_mut(handle) {
+                    u.target = None;
+                }
+                continue;
+            }
+        };
+        // Walls and allied/own buildings are never valid infiltration/sabotage
+        // targets — drop the order without consuming the specialist.
+        if bwall || world.are_allies(house, bhouse) {
+            if let Some(u) = world.units.get_mut(handle) {
+                u.target = None;
+            }
+            continue;
+        }
+        // March to the footprint if not yet adjacent (same path logic as engineers).
+        let c = coord.cell();
+        let adjacent =
+            c.x >= bcell.x - 1 && c.x <= bcell.x + bw && c.y >= bcell.y - 1 && c.y <= bcell.y + bh;
+        if !adjacent {
+            let need_path = world
+                .units
+                .get(handle)
+                .map(|u| u.path.is_empty())
+                .unwrap_or(false);
+            if need_path {
+                if let Some(b) = world.buildings.get(target) {
+                    if let Some(goal) = nearest_adjacent_passable(&world.passable, b, c) {
+                        if let Some(path) = find_path(&world.passable, c, goal, Locomotor::Foot) {
+                            if let Some(u) = world.units.get_mut(handle) {
+                                u.path = path;
+                                u.dest = Some(goal);
+                            }
+                        }
+                    }
+                }
+            }
+            continue;
+        }
+        // Arrived — apply the effect.
+        if is_bomber {
+            // Plant C4 (unless the building is iron-curtained). Tanya survives and
+            // clears her order (the original scatters her away).
+            if iron == 0 {
+                let fuse = ((world.catalog.econ.ticks_per_minute * C4_DELAY_NUM) / C4_DELAY_DEN)
+                    .max(1) as u16;
+                if let Some(b) = world.buildings.get_mut(target) {
+                    if b.c4_fuse == 0 {
+                        b.c4_fuse = fuse;
+                        b.c4_by = house;
+                    }
+                }
+            }
+            if let Some(u) = world.units.get_mut(handle) {
+                u.target = None;
+            }
+            continue;
+        }
+        // Spy / thief effects.
+        if is_spy {
+            spy_infiltrate(world, house, target);
+        } else if is_thief {
+            thief_steal(world, house, target);
+        }
+        // Spy and thief are consumed on infiltration (`delete this`, infantry.cpp:783).
+        world.units.remove(handle);
+    }
+}
+
+/// A spy's infiltration effect (`infantry.cpp:687-746`): reveal the building's
+/// surroundings to `house`, reveal the whole map if it is a radar dome, and leak a
+/// credit cut from an enemy refinery (brief-directed, see [`SPY_STEAL_NUM`]).
+fn spy_infiltrate(world: &mut World, house: u8, building: Handle) {
+    let (center, type_id, is_refinery, victim) = match world.buildings.get(building) {
+        Some(b) => (b.center_cell(), b.type_id, b.is_refinery, b.house),
+        None => return,
+    };
+    // Recon: reveal a generous disc around the spied building (SpiedBy), and the
+    // whole map for a radar dome (RadarSpied).
+    world.shroud.reveal(house, center, 10);
+    if building_is_radar(world, type_id) {
+        world.shroud.reveal_all(house);
+    }
+    // Refinery credit leak → transfer a quarter of the victim's available money.
+    if is_refinery {
+        let steal = (world.house_credits(victim) * SPY_STEAL_NUM / SPY_STEAL_DEN).max(0);
+        transfer_credits(world, victim, house, steal);
+    }
+}
+
+/// A thief's infiltration effect (`infantry.cpp:750-777`): steal **half** the
+/// victim house's available money into `house`, but only from a **storage**
+/// building (refinery/silo, `Class->Capacity`).
+fn thief_steal(world: &mut World, house: u8, building: Handle) {
+    let (has_storage, victim) = match world.buildings.get(building) {
+        Some(b) => (b.is_refinery || b.storage > 0, b.house),
+        None => return,
+    };
+    if !has_storage {
+        return;
+    }
+    let cash = (world.house_credits(victim) / 2).max(0);
+    transfer_credits(world, victim, house, cash);
+}
+
+/// Move `amount` credits from `from` to `to` (`Spend_Money` + `Refund_Money`).
+/// Refunds land in the given-credits pool (`House::credits`), like a sell refund.
+fn transfer_credits(world: &mut World, from: u8, to: u8, amount: i32) {
+    if amount <= 0 || from == to {
+        return;
+    }
+    if let Some(fh) = world.houses.get_mut(from as usize) {
+        fh.deduct(amount);
+    }
+    if let Some(th) = world.houses.get_mut(to as usize) {
+        th.credits += amount;
+    }
+}
+
+// ===========================================================================
+// Superweapon framework (marquee arc) — SuperClass charge/fire + timed effects.
+// ===========================================================================
+
+/// Ticks a nuclear missile takes to fall to its target after launch (the
+/// `BULLET_NUKE_DOWN` drop, `house.cpp:2818` / `bullet.cpp:443`). Approximated.
+const NUKE_FALL_TICKS: u16 = 20;
+/// Nuclear blast strength (`BULLET_NUKE_DOWN` strength `200`, `WARHEAD_NUKE`,
+/// `house.cpp:2820`).
+const NUKE_DAMAGE: i32 = 200;
+/// Nuclear blast radius in cells — every unit/building within takes the full
+/// `WARHEAD_NUKE` hit (area devastation; the per-cell falloff of the ordinary
+/// `Explosion_Damage` is deliberately flattened for the superweapon so the blast
+/// is decisive, documented in QUIRKS).
+const NUKE_RADIUS_CELLS: i32 = 3;
+/// `Rule.IronCurtainDuration` (`rules.cpp:259`, default `fixed(1,2)` = 0.5 min) —
+/// the invulnerability window; `TICKS_PER_MINUTE / 2` = 450 ticks at stock rate.
+fn iron_curtain_ticks(world: &World) -> u16 {
+    (world.catalog.econ.ticks_per_minute / 2).clamp(1, u16::MAX as i32) as u16
+}
+
+/// The `WARHEAD_NUKE` damage character (`warhead.cpp`): full effect against every
+/// armor class (the nuke ignores armor), so the blast is uniformly devastating.
+fn nuke_warhead() -> crate::combat::WarheadProfile {
+    crate::combat::WarheadProfile {
+        spread: 6,
+        verses: [65536; crate::combat::ARMOR_COUNT], // 100% vs every armor class
+    }
+}
+
+/// The ground cell a superweapon target resolves to.
+fn target_cell(world: &World, target: Target) -> CellCoord {
+    match target {
+        Target::Cell(c) => c,
+        Target::Unit(h) => world
+            .units
+            .get(h)
+            .map(|u| u.cell())
+            .unwrap_or(CellCoord::new(0, 0)),
+        Target::Building(h) => world
+            .buildings
+            .get(h)
+            .map(|b| b.center_cell())
+            .unwrap_or(CellCoord::new(0, 0)),
+    }
+}
+
+/// System 4.27: the superweapon charge/fire cycle plus the timed effects it and
+/// the infiltration specialists spawn (C4 fuses, iron-curtain countdowns, nuclear
+/// strikes in flight). Runs after combat/infiltration so this tick's plants/fires
+/// are visible. Entirely RNG-free and inert (no state) until a superweapon
+/// building exists or an effect is live, so every prior golden is byte-identical.
+fn run_superweapons(world: &mut World) {
+    tick_building_timers(world);
+    tick_nuke_strikes(world);
+    sync_and_charge_superweapons(world);
+}
+
+/// Decrement per-building C4 fuses and iron-curtain timers (and per-unit
+/// iron-curtain timers). A C4 fuse that expires blows the building up for its full
+/// strength (`building.cpp:995-1013`), crediting the saboteur — unless the building
+/// is iron-curtained, in which case the blast is nullified (`techno.cpp:4102`).
+fn tick_building_timers(world: &mut World) {
+    // Units: iron-curtain countdown only.
+    for handle in world.units.handles() {
+        if let Some(u) = world.units.get_mut(handle) {
+            if u.iron_curtain > 0 {
+                u.iron_curtain -= 1;
+            }
+        }
+    }
+    // Buildings: iron-curtain countdown + C4 fuse.
+    let mut blown: Vec<(Handle, u8)> = Vec::new();
+    for handle in world.buildings.handles() {
+        let Some(b) = world.buildings.get_mut(handle) else {
+            continue;
+        };
+        if b.iron_curtain > 0 {
+            b.iron_curtain -= 1;
+        }
+        if b.c4_fuse > 0 {
+            b.c4_fuse -= 1;
+            if b.c4_fuse == 0 {
+                if b.iron_curtain == 0 {
+                    blown.push((handle, b.c4_by));
+                }
+                // Fuse spent either way (a curtained building simply survives).
+                b.c4_by = 0;
+            }
+        }
+    }
+    for (handle, by) in blown {
+        let victim = world.buildings.get(handle).map(|b| b.house);
+        if let Some(vh) = victim {
+            if vh != by {
+                if let Some(th) = world.houses.get_mut(vh as usize) {
+                    th.record_building_killed_by(by);
+                }
+            }
+        }
+        remove_building(world, handle);
+    }
+}
+
+/// Advance nuclear strikes in flight; detonate any whose fall timer hits zero.
+fn tick_nuke_strikes(world: &mut World) {
+    if world.nuke_strikes.is_empty() {
+        return;
+    }
+    let mut detonate: Vec<(CellCoord, u8)> = Vec::new();
+    for n in &mut world.nuke_strikes {
+        if n.timer > 0 {
+            n.timer -= 1;
+        }
+        if n.timer == 0 {
+            detonate.push((n.cell, n.house));
+        }
+    }
+    world.nuke_strikes.retain(|n| n.timer > 0);
+    for (cell, house) in detonate {
+        nuke_detonate(world, cell, house);
+    }
+}
+
+/// Detonate a nuclear strike at `cell`: every unit and building within
+/// [`NUKE_RADIUS_CELLS`] takes the full [`nuke_warhead`] hit for [`NUKE_DAMAGE`]
+/// (iron-curtained targets are spared, `techno.cpp:4102`), crediting `house`.
+fn nuke_detonate(world: &mut World, cell: CellCoord, house: u8) {
+    let wh = nuke_warhead();
+    let r = NUKE_RADIUS_CELLS;
+    let mut dead_units: Vec<Handle> = Vec::new();
+    let mut dead_buildings: Vec<Handle> = Vec::new();
+    for h in world.units.handles() {
+        let (uc, armor, target_house) = match world.units.get(h) {
+            Some(u) if u.is_alive() && u.iron_curtain == 0 => (u.cell(), u.armor, u.house),
+            _ => continue,
+        };
+        if (uc.x - cell.x).abs() > r || (uc.y - cell.y).abs() > r {
+            continue;
+        }
+        let dmg = modify_damage(NUKE_DAMAGE, &wh, armor, 0, 1, NUKE_DAMAGE);
+        if let Some(u) = world.units.get_mut(h) {
+            u.health = u.health.saturating_sub(dmg as u16);
+            if u.health == 0 {
+                dead_units.push(h);
+                if target_house != house {
+                    if let Some(th) = world.houses.get_mut(target_house as usize) {
+                        th.record_unit_killed_by(house);
+                    }
+                }
+            }
+        }
+    }
+    for h in world.buildings.handles() {
+        let (bcenter, armor, target_house) = match world.buildings.get(h) {
+            Some(b) if b.is_alive() && b.iron_curtain == 0 => (b.center_cell(), b.armor, b.house),
+            _ => continue,
+        };
+        if (bcenter.x - cell.x).abs() > r || (bcenter.y - cell.y).abs() > r {
+            continue;
+        }
+        let dmg = modify_damage(NUKE_DAMAGE, &wh, armor, 0, 1, NUKE_DAMAGE);
+        if let Some(b) = world.buildings.get_mut(h) {
+            b.health = b.health.saturating_sub(dmg as u16);
+            if b.health == 0 {
+                dead_buildings.push(h);
+                if target_house != house {
+                    if let Some(th) = world.houses.get_mut(target_house as usize) {
+                        th.record_building_killed_by(house);
+                    }
+                }
+            }
+        }
+    }
+    for h in dead_units {
+        world.units.remove(h);
+    }
+    for h in dead_buildings {
+        remove_building(world, h);
+    }
+}
+
+/// Rebuild the per-house superweapon list from current building ownership and
+/// advance each one's charge (`SuperClass::AI`). A superweapon is present while its
+/// house owns the granting building (`ActiveBScan` gate); charging is suspended
+/// while the house lacks full power (`Suspend(Power_Fraction()<1)`, `house.cpp:1484`).
+fn sync_and_charge_superweapons(world: &mut World) {
+    // Which (house, kind) pairs are currently granted by a live building.
+    let mut granted: Vec<(u8, u8, SuperKind)> = Vec::new();
+    for (_, b) in world.buildings.iter() {
+        if !b.is_alive() {
+            continue;
+        }
+        if let Some(kind) = world
+            .catalog
+            .building(b.type_id)
+            .and_then(|p| SuperKind::for_building(&p.name))
+        {
+            granted.push((b.house, super_kind_tag(kind), kind));
+        }
+    }
+    granted.sort_by_key(|&(house, tag, _)| (house, tag));
+    granted.dedup_by_key(|&mut (house, tag, _)| (house, tag));
+
+    // Fast exit: nothing granted and nothing tracked → leave the (empty) list be.
+    if granted.is_empty() && world.superweapons.is_empty() {
+        return;
+    }
+
+    // Drop superweapons whose building is gone.
+    world
+        .superweapons
+        .retain(|s| granted.iter().any(|&(h, _, k)| h == s.house && k == s.kind));
+    // Add newly granted superweapons (begin charging).
+    let tpm = world.catalog.econ.ticks_per_minute;
+    for &(house, _, kind) in &granted {
+        if !world
+            .superweapons
+            .iter()
+            .any(|s| s.house == house && s.kind == kind)
+        {
+            let recharge = kind.recharge_minutes() * tpm;
+            world
+                .superweapons
+                .push(SuperWeapon::new(house, kind, recharge));
+        }
+    }
+    world
+        .superweapons
+        .sort_by_key(|s| (s.house, super_kind_tag(s.kind)));
+    // Charge each (suspended while the house is low on power).
+    for i in 0..world.superweapons.len() {
+        let house = world.superweapons[i].house;
+        let suspended = world
+            .houses
+            .get(house as usize)
+            .map(|h| h.low_power())
+            .unwrap_or(false);
+        world.superweapons[i].charge_tick(suspended);
+    }
+}
+
+/// Sort key for a [`SuperKind`] (deterministic superweapon ordering).
+fn super_kind_tag(kind: SuperKind) -> u8 {
+    match kind {
+        SuperKind::Nuclear => 0,
+        SuperKind::IronCurtain => 1,
+        SuperKind::Chronosphere => 2,
+    }
+}
+
+/// Apply a [`Command::FireSuperWeapon`]: if `house` has that superweapon ready,
+/// apply its effect and reset the recharge (`Place_Special_Blast` + `Discharged`,
+/// `house.cpp:2777`, `super.cpp:233`).
+fn apply_fire_super(
+    world: &mut World,
+    house: u8,
+    kind: SuperKind,
+    target: Target,
+    dest: Option<CellCoord>,
+) {
+    let Some(idx) = world
+        .superweapons
+        .iter()
+        .position(|s| s.house == house && s.kind == kind && s.ready)
+    else {
+        return;
+    };
+    let fired = match kind {
+        SuperKind::Nuclear => {
+            let cell = target_cell(world, target);
+            world.nuke_strikes.push(NukeStrike {
+                cell,
+                house,
+                timer: NUKE_FALL_TICKS,
+            });
+            true
+        }
+        SuperKind::IronCurtain => fire_iron_curtain(world, target),
+        SuperKind::Chronosphere => fire_chrono(world, target, dest),
+    };
+    if fired {
+        world.superweapons[idx].discharge();
+    }
+}
+
+/// Iron curtain effect (`house.cpp:2932-2965`): grant the targeted unit or
+/// building temporary invulnerability (`IronCurtainCountDown`).
+fn fire_iron_curtain(world: &mut World, target: Target) -> bool {
+    let dur = iron_curtain_ticks(world);
+    match target {
+        Target::Unit(h) => {
+            if let Some(u) = world.units.get_mut(h) {
+                if u.is_alive() {
+                    u.iron_curtain = dur;
+                    return true;
+                }
+            }
+            false
+        }
+        Target::Building(h) => {
+            if let Some(b) = world.buildings.get_mut(h) {
+                if b.is_alive() {
+                    b.iron_curtain = dur;
+                    return true;
+                }
+            }
+            false
+        }
+        Target::Cell(_) => false,
+    }
+}
+
+/// Chronosphere effect (`house.cpp:3010-3085`): teleport the targeted vehicle to
+/// `dest`. An infantry target is **killed** by the warp (`Take_Damage(Strength)`,
+/// `house.cpp:3021`). The `Rule.ChronoDuration` warp-**back** is deferred — this is
+/// a one-way teleport (documented in QUIRKS).
+fn fire_chrono(world: &mut World, target: Target, dest: Option<CellCoord>) -> bool {
+    let Target::Unit(h) = target else {
+        return false;
+    };
+    let Some(cell) = dest else {
+        return false;
+    };
+    let is_infantry = match world.units.get(h) {
+        Some(u) if u.is_alive() => u.is_infantry(),
+        _ => return false,
+    };
+    if is_infantry {
+        // Warping infantry are killed (they cannot survive the chronoshift).
+        world.units.remove(h);
+        return true;
+    }
+    if let Some(u) = world.units.get_mut(h) {
+        u.coord = cell.center();
+        u.path.clear();
+        u.dest = None;
+        u.target = None;
+    }
+    true
+}
+
 /// Ticks between repair steps at a service depot (`Rule.RepairRate = .016` min ≈
 /// 0.96 s ≈ 14 ticks; we use 15 ≈ 1 s). A global cadence (no per-building timer).
 ///
@@ -4302,6 +4973,20 @@ fn vessel_flags(name: &str) -> (bool, bool) {
     }
 }
 
+/// Infiltration-specialist capabilities `(spy, thief, bomber, is_canine)` derived
+/// from a unit's rules.ini short-name — the §3.8 table-free role pattern, exactly
+/// like [`vessel_flags`]. SPY reveals + disguises, THF steals credits, E7 (Tanya)
+/// plants C4, DOG is the canine (instakill bite + spy detection).
+fn specialist_flags(name: &str) -> (bool, bool, bool, bool) {
+    match name.to_ascii_uppercase().as_str() {
+        "SPY" => (true, false, false, false),
+        "THF" => (false, true, false, false),
+        "E7" => (false, false, true, false),
+        "DOG" => (false, false, false, true),
+        _ => (false, false, false, false),
+    }
+}
+
 /// Detection radius (leptons) within which a **detector** (destroyer) reveals a
 /// submerged enemy submarine to itself and its allies — a simplified stand-in for
 /// the reference's sight/cloak-detection radius (`Is_Cloaked`, techno.cpp). ~5
@@ -4329,6 +5014,61 @@ fn is_hidden_submarine(world: &World, target: &Unit, observer_house: u8) -> bool
             && leptons_distance(d.coord, target.coord) <= SUB_DETECT_RANGE
     });
     !revealed
+}
+
+/// Range (leptons) within which an **attack dog** sniffs out a disguised spy —
+/// three cells (a short leash, matching the dog's close-quarters role). A spy
+/// within this of a live enemy dog is revealed and can be engaged.
+const SPY_DETECT_RANGE: i32 = 3 * LEPTONS_PER_CELL;
+
+/// Whether `target` is a **disguised enemy spy** hidden from `observer_house` —
+/// it appears friendly and is not auto-acquirable / not a valid explicit target,
+/// unless a live dog allied to the observer is within [`SPY_DETECT_RANGE`]
+/// (the dog-detects-spy interaction). Mirrors [`is_hidden_submarine`] for the
+/// simplified spy stealth (RA1/vanilla-conquer models no visual disguise to cite —
+/// see QUIRKS). Allies never see each other's spies as hostile anyway.
+fn is_hidden_spy(world: &World, target: &Unit, observer_house: u8) -> bool {
+    if !(target.spy && target.disguised) {
+        return false;
+    }
+    if world.are_allies(observer_house, target.house) {
+        return false;
+    }
+    let revealed = world.units.iter().any(|(_, d)| {
+        d.is_canine
+            && d.is_alive()
+            && world.are_allies(observer_house, d.house)
+            && leptons_distance(d.coord, target.coord) <= SPY_DETECT_RANGE
+    });
+    !revealed
+}
+
+/// System 3.95: a live enemy **dog** within [`SPY_DETECT_RANGE`] strips a disguised
+/// spy's disguise permanently (the dog "sniffs it out"), so it becomes visible to
+/// everyone and can be engaged (`IsDog` detection, `infantry.cpp`). Inert (no work
+/// beyond a flag check) for any world with no disguised spy.
+fn run_spy_detection(world: &mut World) {
+    // Collect spies to reveal (avoid mutating while scanning for dogs).
+    let mut reveal: Vec<Handle> = Vec::new();
+    for (h, u) in world.units.iter() {
+        if !(u.spy && u.disguised && u.is_alive()) {
+            continue;
+        }
+        let sniffed = world.units.iter().any(|(_, d)| {
+            d.is_canine
+                && d.is_alive()
+                && !world.are_allies(u.house, d.house)
+                && leptons_distance(d.coord, u.coord) <= SPY_DETECT_RANGE
+        });
+        if sniffed {
+            reveal.push(h);
+        }
+    }
+    for h in reveal {
+        if let Some(u) = world.units.get_mut(h) {
+            u.disguised = false;
+        }
+    }
 }
 
 /// Keep the building's current target only if it is still a live **enemy** unit
@@ -4380,7 +5120,7 @@ fn acquire_nearest_enemy(
             continue;
         }
         // A submerged enemy submarine is hidden from a non-detector (naval arc).
-        if is_hidden_submarine(world, u, house) {
+        if is_hidden_submarine(world, u, house) || is_hidden_spy(world, u, house) {
             continue;
         }
         let d = leptons_distance(center, u.coord);
@@ -4456,7 +5196,7 @@ fn maybe_acquire_guard_target(world: &mut World, handle: Handle) {
             continue;
         }
         // A submerged enemy submarine is hidden from a non-detector (naval arc).
-        if is_hidden_submarine(world, u, house) {
+        if is_hidden_submarine(world, u, house) || is_hidden_spy(world, u, house) {
             continue;
         }
         let d = leptons_distance(center, u.coord);
@@ -4550,7 +5290,7 @@ fn maybe_acquire_hunt_target(world: &mut World, handle: Handle) {
             continue;
         }
         // A submerged enemy submarine is hidden from a non-detector (naval arc).
-        if is_hidden_submarine(world, u, house) {
+        if is_hidden_submarine(world, u, house) || is_hidden_spy(world, u, house) {
             continue;
         }
         let d = leptons_distance(coord, u.coord);
@@ -4806,7 +5546,11 @@ fn explosion_damage(
             continue;
         }
         let (coord, armor, target_house, airborne) = match world.units.get(h) {
-            Some(u) if u.is_alive() => (u.coord, u.armor, u.house, u.is_airborne()),
+            // An iron-curtained unit takes NO damage (`techno.cpp:4102`): the whole
+            // Take_Damage call is skipped while the countdown is active.
+            Some(u) if u.is_alive() && u.iron_curtain == 0 => {
+                (u.coord, u.armor, u.house, u.is_airborne())
+            }
             _ => continue,
         };
         let uc = coord.cell();
@@ -4875,7 +5619,8 @@ fn explosion_damage(
     // --- Buildings covering the 3×3 neighbourhood ---
     for h in world.buildings.handles() {
         let (covers_impact, near, center, armor, target_house) = match world.buildings.get(h) {
-            Some(b) if b.is_alive() => {
+            // Iron-curtained buildings take NO damage (`techno.cpp:4102`).
+            Some(b) if b.is_alive() && b.iron_curtain == 0 => {
                 let mut near = false;
                 'scan: for dy in -1..=1 {
                     for dx in -1..=1 {
@@ -5391,6 +6136,8 @@ fn spawn_produced_unit(world: &mut World, unit_id: u32, house: u8, cell: CellCoo
     world.set_unit_combat(handle, proto.armor, proto.weapon, proto.has_turret);
     world.set_unit_secondary(handle, proto.secondary);
     world.set_unit_harvester(handle, proto.is_harvester);
+    let (spy, thief, bomber, canine) = specialist_flags(&proto.name);
+    world.set_unit_specialist(handle, spy, thief, bomber, canine);
     if let Some(u) = world.units.get_mut(handle) {
         u.set_locomotor(loco_from_index(proto.locomotor));
     }

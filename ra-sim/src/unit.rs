@@ -374,6 +374,43 @@ pub struct Unit {
     /// target before re-submerging — the original's `PulseCountDown`). Hashed only
     /// for submarines.
     pub recloak: u16,
+
+    // --- Infiltration specialists (marquee content arc) ---
+    /// **Spy** (SPY): on entering an enemy building it reveals that building's
+    /// surroundings to its house (`SpiedBy`), and a radar dome reveals the whole
+    /// map (`RadarSpied`, `infantry.cpp:703-705`); a refinery additionally leaks a
+    /// cut of credits. Consumed on infiltration (`delete this`, `infantry.cpp:783`).
+    /// A spy is **disguised** (see [`Self::disguised`]). A type constant (like
+    /// `is_submarine`), **not** hashed; its infiltration effect flows through the
+    /// hashed shroud/credits it produces.
+    pub spy: bool,
+    /// **Thief** (THF): on entering an enemy **storage** building (refinery/silo)
+    /// it steals **half** the victim house's available money into its own house
+    /// (`infantry.cpp:773-776`), then is consumed. Type constant, not hashed.
+    pub thief: bool,
+    /// **Bomber** (`C4=yes` → `IsBomber`, `idata.cpp:1468`) — Tanya (E7). Ordered to
+    /// attack an enemy building she marches in, plants C4 (arms the building's
+    /// [`crate::building::Building::c4_fuse`]) and runs off; the building blows when
+    /// the fuse expires (`infantry.cpp:916-925`, `building.cpp:995-1013`). Type
+    /// constant, not hashed; its effect flows through the hashed building fuse.
+    pub bomber: bool,
+    /// **Attack dog** (`IsCanine=yes`, DOG): its bite instantly kills the single
+    /// infantryman it targets (`Take_Damage` full `Strength`, `infantry.cpp:332-344`)
+    /// and it can **detect** a disguised spy (targets/kills it). Type constant, not
+    /// hashed.
+    pub is_canine: bool,
+    /// Whether a **spy** is currently disguised — appears as an enemy infantryman
+    /// and is not auto-acquired by enemy units (a simplified stealth like the
+    /// submarine's [`Self::submerged`], since RA1/vanilla-conquer models no visual
+    /// disguise to cite — see QUIRKS). A spy spawns disguised; a nearby detecting
+    /// **dog** strips it. Hashed **only when `true`**, so every non-spy world (all
+    /// prior goldens) is byte-identical.
+    pub disguised: bool,
+    /// **Iron-curtain invulnerability** countdown (`TechnoClass::IronCurtainCountDown`,
+    /// `house.cpp:2943`): while non-zero the unit takes **no** damage
+    /// (`techno.cpp:4102`). Ticked down by the superweapon system. Hashed **only
+    /// when non-zero**, so no un-curtained unit perturbs a golden.
+    pub iron_curtain: u16,
 }
 
 /// `FLIGHT_LEVEL` — full flight altitude in leptons (`ObjectClass` enum,
@@ -475,7 +512,30 @@ impl Unit {
             is_detector: false,
             submerged: false,
             recloak: 0,
+            spy: false,
+            thief: false,
+            bomber: false,
+            is_canine: false,
+            disguised: false,
+            iron_curtain: 0,
         }
+    }
+
+    /// Whether this unit can **infiltrate** an enemy building (spy or thief) — it
+    /// accepts a building target and marches in to apply its special effect
+    /// (`Infiltrate=yes`, `infantry.cpp` `MISSION_CAPTURE` spy/thief branches).
+    pub fn is_infiltrator(&self) -> bool {
+        self.spy || self.thief
+    }
+
+    /// Attach infiltration-specialist capabilities to a freshly-spawned unit
+    /// (from its [`crate::catalog::UnitProto`]). A spy spawns **disguised**.
+    pub fn make_specialist(&mut self, spy: bool, thief: bool, bomber: bool, is_canine: bool) {
+        self.spy = spy;
+        self.thief = thief;
+        self.bomber = bomber;
+        self.is_canine = is_canine;
+        self.disguised = spy;
     }
 
     /// Turn this unit into a **naval vessel**: the `Water` locomotor and its
@@ -757,6 +817,19 @@ impl Unit {
             h.write_u8(0x34);
             h.write_u8(self.submerged as u8);
             h.write_u16(self.recloak);
+        }
+
+        // Spy disguise state (infiltration arc). Folded ONLY while disguised, so
+        // every non-spy world (all prior goldens) is byte-identical. The
+        // capability flags (`spy`/`thief`/`bomber`/`is_canine`) are type constants
+        // (like `is_submarine`) captured through the shroud/credits/fuse they
+        // produce, so they are not hashed.
+        if self.disguised {
+            h.write_u8(0x35);
+        }
+        if self.iron_curtain != 0 {
+            h.write_u8(0x1C);
+            h.write_u16(self.iron_curtain);
         }
     }
 }

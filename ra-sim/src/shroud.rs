@@ -118,6 +118,21 @@ impl Shroud {
         }
     }
 
+    /// Reveal the **entire** map for `house` (sticky). Used when a spy infiltrates
+    /// an enemy radar dome (`RadarSpied`, `infantry.cpp:704`) — the map/radar
+    /// reveal that outruns a normal sight disc. No-op if the shroud is disabled or
+    /// the house is out of range.
+    pub fn reveal_all(&mut self, house: u8) {
+        if !self.enabled || (house as usize) >= NUM_HOUSES {
+            return;
+        }
+        let plane = (self.width * self.height) as usize;
+        let base = house as usize * plane;
+        for e in &mut self.explored[base..base + plane] {
+            *e = true;
+        }
+    }
+
     /// Count of explored cells for a house (for reporting / tests).
     pub fn explored_count(&self, house: u8) -> u32 {
         if (house as usize) >= NUM_HOUSES {
