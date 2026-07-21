@@ -59,6 +59,11 @@ pub struct Passability {
     track: Vec<bool>,
     /// Static terrain passability for wheeled vehicles (`Wheel`).
     wheel: Vec<bool>,
+    /// Static terrain passability for naval vessels (`Water`): the **inverse** of
+    /// the ground masks — `true` only where the cell's land type is open water. A
+    /// synthetic grid (no water) leaves this all-`false`, so a ship cannot move on
+    /// a land-only test grid unless it is built with an explicit water mask.
+    water: Vec<bool>,
     /// Dynamic occupancy (`true` = a building footprint blocks this cell).
     blocked: Vec<bool>,
 }
@@ -71,17 +76,21 @@ impl Passability {
     /// unchanged). The per-locomotor land-type build uses [`Passability::per_locomotor`].
     pub fn new(width: i32, height: i32, cells: Vec<bool>) -> Passability {
         assert_eq!(cells.len(), (width * height) as usize);
+        let n = (width * height) as usize;
         Passability {
             width,
             height,
             foot: cells.clone(),
             track: cells.clone(),
             wheel: cells,
-            blocked: vec![false; (width * height) as usize],
+            water: vec![false; n],
+            blocked: vec![false; n],
         }
     }
 
-    /// Build a grid from three per-locomotor static masks (from land types).
+    /// Build a grid from three per-locomotor static masks (from land types). The
+    /// water (naval) mask is left empty (no ships can move) — the naval-aware
+    /// build uses [`Passability::per_locomotor_water`].
     pub fn per_locomotor(
         width: i32,
         height: i32,
@@ -90,15 +99,31 @@ impl Passability {
         wheel: Vec<bool>,
     ) -> Passability {
         let n = (width * height) as usize;
+        Passability::per_locomotor_water(width, height, foot, track, wheel, vec![false; n])
+    }
+
+    /// Build a grid from four per-locomotor static masks including the naval
+    /// `water` mask (`true` only on open-water cells) — the naval-arc constructor.
+    pub fn per_locomotor_water(
+        width: i32,
+        height: i32,
+        foot: Vec<bool>,
+        track: Vec<bool>,
+        wheel: Vec<bool>,
+        water: Vec<bool>,
+    ) -> Passability {
+        let n = (width * height) as usize;
         assert_eq!(foot.len(), n);
         assert_eq!(track.len(), n);
         assert_eq!(wheel.len(), n);
+        assert_eq!(water.len(), n);
         Passability {
             width,
             height,
             foot,
             track,
             wheel,
+            water,
             blocked: vec![false; n],
         }
     }
@@ -135,9 +160,18 @@ impl Passability {
             Locomotor::Foot => &self.foot,
             Locomotor::Track => &self.track,
             Locomotor::Wheel => &self.wheel,
+            // Naval vessels use the water mask (the inverse of the ground masks).
+            Locomotor::Water => &self.water,
             // Aircraft ignore ground terrain; short-circuited before this call.
             Locomotor::Air => &self.track,
         }
+    }
+
+    /// Whether `cell` is an open-water cell (a naval vessel may float here,
+    /// ignoring building occupancy). Used by the naval-yard shore-adjacency
+    /// placement rule and by ship-spawn siting.
+    pub fn is_water(&self, cell: CellCoord) -> bool {
+        self.in_bounds(cell) && self.water[(cell.y * self.width + cell.x) as usize]
     }
 
     /// Whether `cell` is on-grid and drivable **right now** by the generic

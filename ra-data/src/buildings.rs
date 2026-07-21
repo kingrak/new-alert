@@ -72,6 +72,9 @@ pub fn footprint(name: &str) -> Option<(u8, u8)> {
         "HPAD" => (2, 2), // helipad,             BSIZE_22 (bdata.cpp:785)
         "AGUN" => (1, 2), // AA gun,              BSIZE_12 (bdata.cpp:576)
         "SAM" => (2, 1),  // SAM site,            BSIZE_21 (bdata.cpp:873)
+        // --- Naval yards (naval arc P0) — shore-placed vessel producers ---
+        "SYRD" => (3, 3), // naval yard,          BSIZE_33 (bdata.cpp:405)
+        "SPEN" => (3, 3), // sub pen,             BSIZE_33 (bdata.cpp ListSPen 3×3)
         // --- Walls (M7.7 Chunk B) — 1×1 buildable segments ---
         "SBAG" | "CYCL" | "BRIK" => (1, 1),
         // --- Campaign scenery / neutral structures (M7.5) ---

@@ -92,6 +92,20 @@ pub fn build_passability_masks(
     tiles: &TileSet,
     rules: &Ini,
 ) -> (Vec<bool>, Vec<bool>, Vec<bool>) {
+    let (foot, track, wheel, _water) = build_passability_masks_water(scenario, tiles, rules);
+    (foot, track, wheel)
+}
+
+/// Like [`build_passability_masks`] but also returns the naval `water` mask
+/// (`true` only on open-water cells) — the **inverse** of the ground masks — so
+/// vessels path over water and never onto land (naval arc). River/beach are land
+/// to a ship, so only `LandType::Water` cells float.
+pub fn build_passability_masks_water(
+    scenario: &Scenario,
+    tiles: &TileSet,
+    rules: &Ini,
+) -> (Vec<bool>, Vec<bool>, Vec<bool>, Vec<bool>) {
+    use ra_data::landtype::LandType;
     let costs = LandCosts::from_rules(rules);
     let w = MAP_CELL_W;
     let h = MAP_CELL_H;
@@ -99,6 +113,7 @@ pub fn build_passability_masks(
     let mut foot = vec![true; n];
     let mut track = vec![true; n];
     let mut wheel = vec![true; n];
+    let mut water = vec![false; n];
     for cy in 0..h {
         for cx in 0..w {
             let cell = scenario.cell(cx, cy);
@@ -107,9 +122,10 @@ pub fn build_passability_masks(
             foot[i] = costs.passable(land, LOCO_FOOT);
             track[i] = costs.passable(land, LOCO_TRACK);
             wheel[i] = costs.passable(land, LOCO_WHEEL);
+            water[i] = land == LandType::Water;
         }
     }
-    (foot, track, wheel)
+    (foot, track, wheel, water)
 }
 
 /// Is this template id a "clear" cell (rendered from CLEAR1 with a scrambled

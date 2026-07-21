@@ -834,6 +834,11 @@ pub fn apply(world: &mut World, tick: u32, commands: &[Command]) {
     // System 3.6: building self-repair (player/AI repair toggle).
     run_building_repair(world);
 
+    // System 3.9: submarine surfacing FSM (naval arc) — sets each sub's submerged
+    // (cloak) state before combat/targeting so the stealth-acquisition gate is
+    // consistent this tick. Inert for any world with no submarines.
+    run_submarines(world);
+
     // System 4: combat (targeting + rotation + firing).
     run_combat(world);
 
@@ -2142,6 +2147,18 @@ fn apply_command(world: &mut World, cmd: Command) {
                 Target::Building(t) if !world.buildings.contains(t) => return,
                 _ => {}
             }
+            // A submerged enemy submarine cannot be explicitly targeted by a unit
+            // whose house has no detector nearby (naval arc): the sub is invisible,
+            // so the click resolves to nothing (matches auto-acquisition gating).
+            if let Target::Unit(t) = target {
+                if world
+                    .units
+                    .get(t)
+                    .is_some_and(|tu| is_hidden_submarine(world, tu, house))
+                {
+                    return;
+                }
+            }
             if let Some(u) = world.units.get_mut(unit) {
                 u.target = Some(target);
                 u.guard_target = false; // explicit player order — chase, never leash
@@ -2454,52 +2471,69 @@ fn apply_start_production(world: &mut World, house: u8, item: BuildItem) {
     // Resolve cost + prerequisites + the required factory for this item.
     // Infantry (a unit proto with `is_infantry`) build on their own barracks
     // strip, independent of the war factory's vehicle lane (M7.6).
-    let (cost, prereq, need_yard, need_factory, need_barracks, need_helipad, kind) = match item {
-        BuildItem::Building(id) => match world.catalog.building(id) {
-            Some(p) => (
-                p.cost,
-                p.prereq.clone(),
-                true,
-                false,
-                false,
-                false,
-                ProdKind::Building,
-            ),
-            None => return,
-        },
-        BuildItem::Unit(id) => match world.catalog.unit(id) {
-            Some(p) if p.is_infantry => (
-                p.cost,
-                p.prereq.clone(),
-                false,
-                false,
-                true,
-                false,
-                ProdKind::Infantry,
-            ),
-            // Aircraft build from a **helipad** (not the war factory), on the
-            // vehicle (Unit) lane. `SPEED_WINGED` protos need a helipad present.
-            Some(p) if loco_from_index(p.locomotor) == Locomotor::Air => (
-                p.cost,
-                p.prereq.clone(),
-                false,
-                false,
-                false,
-                true,
-                ProdKind::Unit,
-            ),
-            Some(p) => (
-                p.cost,
-                p.prereq.clone(),
-                false,
-                true,
-                false,
-                false,
-                ProdKind::Unit,
-            ),
-            None => return,
-        },
-    };
+    let (cost, prereq, need_yard, need_factory, need_barracks, need_helipad, need_shipyard, kind) =
+        match item {
+            BuildItem::Building(id) => match world.catalog.building(id) {
+                Some(p) => (
+                    p.cost,
+                    p.prereq.clone(),
+                    true,
+                    false,
+                    false,
+                    false,
+                    false,
+                    ProdKind::Building,
+                ),
+                None => return,
+            },
+            BuildItem::Unit(id) => match world.catalog.unit(id) {
+                Some(p) if p.is_infantry => (
+                    p.cost,
+                    p.prereq.clone(),
+                    false,
+                    false,
+                    true,
+                    false,
+                    false,
+                    ProdKind::Infantry,
+                ),
+                // Aircraft build from a **helipad** (not the war factory), on the
+                // vehicle (Unit) lane. `SPEED_WINGED` protos need a helipad present.
+                Some(p) if loco_from_index(p.locomotor) == Locomotor::Air => (
+                    p.cost,
+                    p.prereq.clone(),
+                    false,
+                    false,
+                    false,
+                    true,
+                    false,
+                    ProdKind::Unit,
+                ),
+                // Vessels build from a **naval yard** (SYRD/SPEN), on the vehicle
+                // (Unit) lane, and spawn into an adjacent water cell (naval arc).
+                Some(p) if loco_from_index(p.locomotor) == Locomotor::Water => (
+                    p.cost,
+                    p.prereq.clone(),
+                    false,
+                    false,
+                    false,
+                    false,
+                    true,
+                    ProdKind::Unit,
+                ),
+                Some(p) => (
+                    p.cost,
+                    p.prereq.clone(),
+                    false,
+                    true,
+                    false,
+                    false,
+                    false,
+                    ProdKind::Unit,
+                ),
+                None => return,
+            },
+        };
 
     // Slot must be free.
     let slot_busy = match kind {
@@ -2532,10 +2566,15 @@ fn apply_start_production(world: &mut World, house: u8, item: BuildItem) {
         .buildings
         .iter()
         .any(|(_, b)| b.house == house && b.is_alive() && building_is_helipad(world, b.type_id));
+    let has_shipyard = world
+        .buildings
+        .iter()
+        .any(|(_, b)| b.house == house && b.is_alive() && building_is_shipyard(world, b.type_id));
     if (need_yard && !has_yard)
         || (need_factory && !has_factory)
         || (need_barracks && !has_barracks)
         || (need_helipad && !has_helipad)
+        || (need_shipyard && !has_shipyard)
     {
         return;
     }
@@ -2913,6 +2952,26 @@ fn footprint_placeable(world: &World, building_id: u32, cell: CellCoord) -> bool
             }
         }
     }
+    // Naval yards (SYRD/SPEN) must be built on a shore: the footprint sits on land
+    // (checked above) but at least one cell of its 8-neighbour adjacency ring must
+    // be open water, so produced vessels have water to spawn into. Simplified port
+    // of the water-adjacency requirement in `BuildingTypeClass` legal-placement
+    // (`display.cpp`/`building.cpp` `Passes_Proximity_Check` naval bib).
+    if building_is_shipyard(world, building_id) {
+        let (x0, y0) = (cell.x - 1, cell.y - 1);
+        let (x1, y1) = (cell.x + proto.foot_w as i32, cell.y + proto.foot_h as i32);
+        let mut adjacent_water = false;
+        for y in y0..=y1 {
+            for x in x0..=x1 {
+                if world.passable.is_water(CellCoord::new(x, y)) {
+                    adjacent_water = true;
+                }
+            }
+        }
+        if !adjacent_water {
+            return false;
+        }
+    }
     true
 }
 
@@ -3042,6 +3101,41 @@ pub fn select_weapon(
 /// when aimed and rearmed. Ported from `UnitClass::Rotation_AI` +
 /// `Firing_AI` + `Can_Fire` (`unit.cpp`). Iterating in slot order keeps the
 /// sim-RNG draw sequence (bullet scatter) deterministic.
+/// Ticks a surfaced submarine stays visible after losing its target before it
+/// re-submerges — the reference's `PulseCountDown` recloak grace
+/// (`Is_Allowed_To_Recloak`, vessel.cpp:2044). ~3s at 15 fps.
+const SUB_RECLOAK_TICKS: u16 = 45;
+
+/// Naval submarine surfacing FSM (naval arc P0): keep each submarine **submerged**
+/// (cloaked, hidden from non-detector enemies) while idle, **surface** it while it
+/// has a target, and hold it surfaced for a recloak grace window after it loses
+/// the target (`VesselClass::Is_Allowed_To_Recloak`, vessel.cpp:2044). Runs before
+/// `run_combat` so the `submerged` flag the stealth-acquisition gate reads this
+/// tick reflects the prior tick's decision — deterministic, float-free. Inert (no
+/// iteration cost beyond the `is_submarine` short-circuit) for any world with no
+/// submarines, so every non-naval golden is byte-identical.
+fn run_submarines(world: &mut World) {
+    for handle in world.units.handles() {
+        let Some(u) = world.units.get(handle) else {
+            continue;
+        };
+        if !u.is_submarine || !u.is_alive() {
+            continue;
+        }
+        let (submerged, recloak) = if u.target.is_some() {
+            (false, SUB_RECLOAK_TICKS)
+        } else if u.recloak > 0 {
+            (false, u.recloak - 1)
+        } else {
+            (true, 0)
+        };
+        if let Some(u) = world.units.get_mut(handle) {
+            u.submerged = submerged;
+            u.recloak = recloak;
+        }
+    }
+}
+
 fn run_combat(world: &mut World) {
     for handle in world.units.handles() {
         // Aircraft run their own flight+combat FSM (`run_aircraft`); the ground
@@ -4164,6 +4258,60 @@ fn building_is_aa(world: &World, type_id: u32) -> bool {
         .unwrap_or(false)
 }
 
+/// Whether `type_id` is a **naval yard** (SYRD shipyard / SPEN sub pen): the
+/// factory that produces vessels, which must be placed adjacent to water and
+/// spawns its vessels into an adjacent water cell (the naval equivalent of the
+/// helipad, identified by catalog name — the table-free role pattern, §3.8).
+fn building_is_shipyard(world: &World, type_id: u32) -> bool {
+    world
+        .catalog
+        .building(type_id)
+        .map(|b| matches!(b.name.as_str(), "SYRD" | "SPEN"))
+        .unwrap_or(false)
+}
+
+/// The submarine/detector capability of a vessel, derived from its rules.ini
+/// name (the §3.8 table-free role pattern, like AA/helipad): SS/MSUB are
+/// submarines, DD is a detector (destroyer). Returns `(is_submarine, is_detector)`.
+fn vessel_flags(name: &str) -> (bool, bool) {
+    match name.to_ascii_uppercase().as_str() {
+        // Submarines (`Cloakable=yes`): SS, missile sub.
+        "SS" | "MSUB" => (true, false),
+        // Detectors (`Sensors=Yes`): destroyer + cruiser reveal nearby subs.
+        "DD" | "CA" => (false, true),
+        _ => (false, false),
+    }
+}
+
+/// Detection radius (leptons) within which a **detector** (destroyer) reveals a
+/// submerged enemy submarine to itself and its allies — a simplified stand-in for
+/// the reference's sight/cloak-detection radius (`Is_Cloaked`, techno.cpp). ~5
+/// cells (`0x0500`).
+const SUB_DETECT_RANGE: i32 = 0x0500;
+
+/// Whether `target` is an enemy **submarine that is hidden** from `observer_house`
+/// — i.e. it is submerged and no detector allied to the observer is within
+/// [`SUB_DETECT_RANGE`] of it. A hidden sub is not auto-acquirable / not a valid
+/// explicit target (`VesselClass` cloak: a cloaked object is `MOVE_CLOAK`/
+/// untargetable to non-detectors, vessel.cpp:296). Surface vessels and allied subs
+/// are never hidden; a surfaced sub (firing / recloak grace) is visible to all.
+fn is_hidden_submarine(world: &World, target: &Unit, observer_house: u8) -> bool {
+    if !(target.is_submarine && target.submerged) {
+        return false;
+    }
+    if world.are_allies(observer_house, target.house) {
+        return false;
+    }
+    // Revealed if any live detector allied to the observer is within range.
+    let revealed = world.units.iter().any(|(_, d)| {
+        d.is_detector
+            && d.is_alive()
+            && world.are_allies(observer_house, d.house)
+            && leptons_distance(d.coord, target.coord) <= SUB_DETECT_RANGE
+    });
+    !revealed
+}
+
 /// Keep the building's current target only if it is still a live **enemy** unit
 /// within `range` leptons of `center` **and** of the right air/ground class for
 /// this weapon (`aa` = anti-air emplacement → target must be airborne; otherwise
@@ -4210,6 +4358,10 @@ fn acquire_nearest_enemy(
     let mut best: Option<(i32, Handle)> = None;
     for (h, u) in world.units.iter() {
         if u.house == house || !u.is_alive() || u.is_airborne() != aa {
+            continue;
+        }
+        // A submerged enemy submarine is hidden from a non-detector (naval arc).
+        if is_hidden_submarine(world, u, house) {
             continue;
         }
         let d = leptons_distance(center, u.coord);
@@ -4282,6 +4434,10 @@ fn maybe_acquire_guard_target(world: &mut World, handle: Handle) {
         // A ground defender's weapon is not anti-air (no unit-mounted AA in P0), so
         // it cannot acquire an airborne aircraft (`Can_Fire`, `techno.cpp:2895`).
         if !u.is_alive() || world.are_allies(house, u.house) || u.is_airborne() {
+            continue;
+        }
+        // A submerged enemy submarine is hidden from a non-detector (naval arc).
+        if is_hidden_submarine(world, u, house) {
             continue;
         }
         let d = leptons_distance(center, u.coord);
@@ -4372,6 +4528,10 @@ fn maybe_acquire_hunt_target(world: &mut World, handle: Handle) {
     let mut best_u: Option<(i32, Handle)> = None;
     for (h, u) in world.units.iter() {
         if !u.is_alive() || world.are_allies(house, u.house) || u.is_airborne() {
+            continue;
+        }
+        // A submerged enemy submarine is hidden from a non-detector (naval arc).
+        if is_hidden_submarine(world, u, house) {
             continue;
         }
         let d = leptons_distance(coord, u.coord);
@@ -4933,6 +5093,9 @@ fn finish_or_retry(world: &mut World, house_idx: usize, kind: ProdKind, prod: Op
                 _ if loco == Locomotor::Air => find_helipad(world, house)
                     .and_then(|h| world.buildings.get(h))
                     .map(|b| b.center_cell()),
+                // Vessels exit the naval yard into an adjacent **water** cell
+                // (the exit ring searched with the Water locomotor, naval arc).
+                _ if loco == Locomotor::Water => find_shipyard_exit(world, house),
                 _ => find_factory_exit(world, house, loco),
             };
             match exit {
@@ -4968,6 +5131,20 @@ fn find_factory_exit(world: &World, house: u8, loco: Locomotor) -> Option<CellCo
 /// spot, not just be empty of vehicles).
 fn find_barracks_exit(world: &World, house: u8) -> Option<CellCoord> {
     factory_exit_ring(world, house, |b| b.is_barracks, Locomotor::Foot)
+}
+
+/// A free adjacent **water** cell for a completed vessel to spawn onto — the naval
+/// yard's exit ring, searched with the [`Locomotor::Water`] mask so the exit cell
+/// is guaranteed floatable (and unoccupied by another vessel). `None` if the yard
+/// has no free adjacent water (production retries next tick, like a blocked
+/// factory exit).
+fn find_shipyard_exit(world: &World, house: u8) -> Option<CellCoord> {
+    factory_exit_ring(
+        world,
+        house,
+        |b| building_is_shipyard(world, b.type_id),
+        Locomotor::Water,
+    )
 }
 
 /// Shared factory-exit search: a passable, unoccupied cell in the producing
@@ -5128,6 +5305,7 @@ fn loco_from_index(i: u8) -> Locomotor {
         0 => Locomotor::Foot,
         2 => Locomotor::Wheel,
         3 => Locomotor::Air,
+        4 => Locomotor::Water,
         _ => Locomotor::Track,
     }
 }
@@ -5135,6 +5313,10 @@ fn loco_from_index(i: u8) -> Locomotor {
 /// Locomotor index for the [`Locomotor::Air`] aircraft class (matches
 /// [`loco_from_index`]). Used by the loader when wiring an aircraft proto.
 pub const LOCO_AIR_INDEX: u8 = 3;
+
+/// Locomotor index for the [`Locomotor::Water`] naval class (matches
+/// [`loco_from_index`]). Used by the loader when wiring a vessel proto.
+pub const LOCO_WATER_INDEX: u8 = 4;
 
 /// Spawn a produced unit at `cell`, wiring its stats from the catalog proto. A
 /// unit whose proto is infantry is placed into a free sub-cell spot of the exit
@@ -5166,6 +5348,17 @@ fn spawn_produced_unit(world: &mut World, unit_id: u32, house: u8, cell: CellCoo
         }
     }
     world.set_unit_sight(handle, proto.sight);
+
+    // Vessels (Water locomotor): wire the submarine/detector capability (a sub
+    // spawns submerged). They reuse the ground vehicle movement/combat systems
+    // over water, keeping the default Guard mission (auto-acquire in weapon range).
+    if loco_from_index(proto.locomotor) == Locomotor::Water {
+        let (is_sub, is_det) = vessel_flags(&proto.name);
+        if let Some(u) = world.units.get_mut(handle) {
+            u.make_vessel(is_sub, is_det);
+        }
+        return;
+    }
 
     // Aircraft (Air locomotor): spawn airborne with a full magazine, homed to the
     // house's helipad (`AircraftClass` ctor, `aircraft.cpp:254`). They run the

@@ -36,7 +36,7 @@ use crate::appcore::AppCore;
 use crate::appcore::SoundEvent;
 use crate::compositor::{IndexedImage, Palette, RgbaImage};
 use crate::menu::{GameFactory, MapEntry, MapSource, ResolvedSkirmish};
-use crate::terrain::{build_passability_masks, rasterize, TileSet};
+use crate::terrain::{rasterize, TileSet};
 use crate::unit_render::{InfantryAnim, UnitSprite};
 
 use ra_data::landtype::{LOCO_FOOT, LOCO_TRACK, LOCO_WHEEL};
@@ -45,8 +45,9 @@ use ra_data::landtype::{LOCO_FOOT, LOCO_TRACK, LOCO_WHEEL};
 /// the rules.ini land-cost sections (M7.6 real land-type passability). Replaces
 /// the M3 water-only `passability::build` at every game/scenario boot.
 fn make_passability(scenario: &Scenario, tiles: &TileSet, rules: &Ini) -> Passability {
-    let (foot, track, wheel) = build_passability_masks(scenario, tiles, rules);
-    Passability::per_locomotor(128, 128, foot, track, wheel)
+    let (foot, track, wheel, water) =
+        crate::terrain::build_passability_masks_water(scenario, tiles, rules);
+    Passability::per_locomotor_water(128, 128, foot, track, wheel, water)
 }
 
 /// Everything needed to render a scenario's terrain.
@@ -1505,6 +1506,9 @@ const B_STEK: u32 = 18;
 const B_HPAD: u32 = 19;
 const B_AGUN: u32 = 20;
 const B_SAM: u32 = 21;
+// Naval arc P0: naval yard (Allied shipyard) + sub pen (Soviet). ids appended.
+const B_SYRD: u32 = 22;
+const B_SPEN: u32 = 23;
 /// Fixed unit-proto ids.
 const U_MCV: u32 = 0;
 const U_HARV: u32 = 1;
@@ -1530,6 +1534,10 @@ const U_E6: u32 = 18;
 // P0 aircraft arc: helicopters (ids appended).
 const U_HELI: u32 = 19; // Longbow (Allied, Hellfire missiles)
 const U_HIND: u32 = 20; // Hind (Soviet, chaingun)
+                        // Naval arc P0: core combat ships (ids appended, Water locomotor).
+const U_SS: u32 = 21; // Soviet submarine (submerged, torpedoes)
+const U_DD: u32 = 22; // Allied destroyer (detector, anti-sub)
+const U_CA: u32 = 23; // Allied cruiser (long-range 8-inch guns, detector)
 
 /// Map a prerequisite short-name to its building type id (only the starter set
 /// is modelled; unknown prereqs — e.g. `fix` for the MCV — are dropped, which is
@@ -1544,6 +1552,9 @@ fn prereq_ids(names: &[String]) -> Vec<u32> {
             "weap" => Some(B_WEAP),
             "tent" | "barr" => Some(B_TENT),
             "hpad" => Some(B_HPAD),
+            "atek" => Some(B_ATEK),
+            "syrd" => Some(B_SYRD),
+            "spen" => Some(B_SPEN),
             _ => None,
         })
         .collect()
@@ -1746,6 +1757,11 @@ pub fn build_content(
         ("HPAD", false, false, false, false), // helipad
         ("AGUN", false, false, false, false), // AA gun (anti-air only)
         ("SAM", false, false, false, false),  // SAM site (anti-air only)
+        // Naval arc P0: naval yard (SYRD, Allied) + sub pen (SPEN, Soviet). Neither
+        // is a war factory/barracks — they are identified as vessel producers by
+        // name (`building_is_shipyard`) and require a water-adjacent (shore) cell.
+        ("SYRD", false, false, false, false), // naval yard (produces surface ships)
+        ("SPEN", false, false, false, false), // sub pen (produces submarines)
     ];
     // Per-name defense/wall attributes: GUN has a rotating turret; TSLA charges;
     // SBAG/CYCL/BRIK are walls (1×1 buildable segments — QUIRKS Q9).
@@ -1813,7 +1829,7 @@ pub fn build_content(
     // (Track) except TRUK (no key → the SPEED_WHEEL default). Ids are *appended* so
     // the existing MCV..E3 ids stay stable (no golden churn from renumbering).
     // Aircraft use locomotor index 3 (`ra_sim::LOCO_AIR_INDEX` = `Locomotor::Air`).
-    let uspecs: [(&str, bool, Option<u32>, bool, u8); 21] = [
+    let uspecs: [(&str, bool, Option<u32>, bool, u8); 24] = [
         ("MCV", false, Some(B_FACT), false, LOCO_TRACK as u8),
         ("HARV", true, None, false, LOCO_TRACK as u8),
         ("1TNK", false, None, false, LOCO_TRACK as u8),
@@ -1838,6 +1854,10 @@ pub fn build_content(
         // --- P0 aircraft arc: helicopters (locomotor Air = 3) ---
         ("HELI", false, None, false, ra_sim::LOCO_AIR_INDEX), // Longbow (Hellfire missiles)
         ("HIND", false, None, false, ra_sim::LOCO_AIR_INDEX), // Hind (chaingun)
+        // --- Naval arc P0: combat ships (Water locomotor = 4) ---
+        ("SS", false, None, false, ra_sim::LOCO_WATER_INDEX), // Soviet submarine (torpedoes)
+        ("DD", false, None, false, ra_sim::LOCO_WATER_INDEX), // Allied destroyer (anti-sub)
+        ("CA", false, None, false, ra_sim::LOCO_WATER_INDEX), // Allied cruiser (8-inch guns)
     ];
     let mut units = Vec::new();
     let mut unit_sprites = Vec::new();
@@ -1851,6 +1871,7 @@ pub fn build_content(
         let ustats = unit_stats(rules, name).ok_or_else(|| format!("no unit stats for {name}"))?;
         let combat = resolve_unit_combat(rules, name);
         let is_air = *loco == ra_sim::LOCO_AIR_INDEX;
+        let is_vessel = *loco == ra_sim::LOCO_WATER_INDEX;
         unit_sprites.push(if *is_inf {
             // Infantry art (lores.mix) is optional: if it is absent the infantry
             // still exist in the catalog (buildable, simulated) with no sprite —
@@ -1858,8 +1879,9 @@ pub fn build_content(
             // degrades elsewhere. Keeps headless/AI harnesses (no lores) working.
             load_unit_sprite_from(&inf_archives, name)
                 .unwrap_or_else(|_| UnitSprite { frames: Vec::new() })
-        } else if is_air {
-            // Aircraft art degrades to a frameless sprite too (headless harnesses).
+        } else if is_air || is_vessel {
+            // Aircraft/vessel art degrades to a frameless sprite too (headless
+            // harnesses; vessel body SHPs live in conquer.mix — ss/dd/ca.shp).
             load_unit_sprite(conquer, name).unwrap_or_else(|_| UnitSprite { frames: Vec::new() })
         } else {
             load_unit_sprite(conquer, name)?
@@ -1943,6 +1965,13 @@ pub fn build_content(
         BuildItem::Building(B_HPAD),
         BuildItem::Building(B_AGUN),
         BuildItem::Building(B_SAM),
+        // Naval arc P0: naval yard + sub pen (structures column, below the
+        // default-visible sidebar window — appended after the aircraft/AA rows so
+        // no pinned `compose_game` frame moves, same discipline as the aircraft
+        // cameos, QUIRKS Q24.1). Cameos degrade to text when <NAME>ICON.SHP is
+        // absent; SYRD/SPEN building art is theater-side and degrades to frameless.
+        BuildItem::Building(B_SYRD),
+        BuildItem::Building(B_SPEN),
         // Walls.
         BuildItem::Building(B_SBAG),
         BuildItem::Building(B_CYCL),
@@ -1963,6 +1992,12 @@ pub fn build_content(
         // `need_helipad`). Units column, grouped with the vehicles.
         BuildItem::Unit(U_HELI),
         BuildItem::Unit(U_HIND),
+        // Naval arc P0: combat ships (units column, below the fold). Gated on a
+        // naval yard / sub pen by their rules.ini prereqs (SS→spen, DD→syrd,
+        // CA→syrd,atek), enforced by `apply_start_production`'s shipyard gate.
+        BuildItem::Unit(U_SS),
+        BuildItem::Unit(U_DD),
+        BuildItem::Unit(U_CA),
         BuildItem::Unit(U_E1),
         BuildItem::Unit(U_E2),
         BuildItem::Unit(U_E3),

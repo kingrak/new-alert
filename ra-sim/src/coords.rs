@@ -309,6 +309,14 @@ pub enum Locomotor {
     /// [`crate::world`]'s `run_aircraft`); this variant exists so the passability
     /// query and the loader's locomotor index round-trip an aircraft cleanly.
     Air,
+    /// Naval vessel (`SPEED_FLOAT`, `defines.h`): the **inverse** of the ground
+    /// locomotors — a ship may enter a cell only if its land type is water
+    /// (`Ground[LAND_WATER].Cost[SPEED_FLOAT] != 0`, `unit.cpp`/`vessel.cpp`), and
+    /// never land/beach/rock. Vessels path over water with the same grid A* and
+    /// one-per-cell occupancy that vehicles use, so they run through the shared
+    /// [`crate::world`] `move_units`/`run_combat` systems with this locomotor
+    /// selecting the water passability mask (`crate::path::Passability`).
+    Water,
 }
 
 /// Number of infantry sub-cell spots per cell (`center + 4 quadrants`).

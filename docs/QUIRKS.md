@@ -1882,3 +1882,116 @@ strips scrolled to show HELIPAD/AA GUN/SAM SITE and LONGBOW/HIND cameos).
 
 **Still cut (unchanged from Q24):** Chinook/fixed-wing (MIG/YAK/AFLD), passenger
 unload, air-to-air, curley-shuffle reposition, power-scaled rearm.
+
+---
+
+## Q25 — Naval arc P0: the water locomotor, shipyards, combat ships, and submarine stealth
+
+**Milestone:** Naval arc P0 (the skirmish-buildable naval core — new
+`Locomotor::Water` + naval yards + DD/CA/SS, over water). The same shape as the
+aircraft arc (Q24): a new locomotor + new buildings + new units, but — unlike
+aircraft — vessels reuse the **ground** movement/combat systems rather than a
+bespoke FSM, because a ship is cell-based (one-per-cell, A* pathing, normal
+combat) and differs from a vehicle only in *which* cells it may enter.
+
+**What we implemented (with reference cites).**
+
+- **Water movement (`Locomotor::Water`, `SPEED_FLOAT`).** A fourth locomotor whose
+  passability is the **inverse** of the ground masks: a ship may enter a cell only
+  where its land type is open water (`Passability::water` mask, `true` only on
+  `LandType::Water`), never land/beach/rock/river. Vessels are ordinary
+  `UnitKind::Vehicle` units carrying `locomotor == Water`, so they flow through the
+  **existing** `move_units` (grid A*, one-vessel-per-cell occupancy via the shared
+  `UnitGrid`, scatter/re-route) and `run_combat` (target/rotate/fire) with **no new
+  movement or combat code** — the locomotor alone selects the water mask in
+  `Passability::is_passable_loco`. A ground unit can never path to a water cell and
+  a ship can never path to a land cell, so the two never contend for a cell despite
+  sharing the occupancy grid. Deterministic, float-free. Verified
+  (`naval_suite::ship_paths_over_water_only_never_onto_land`): a ship routes around
+  a land wall to a water goal, never occupying a non-water cell, and refuses a Move
+  ordered onto land (`find_path` returns `None`).
+
+- **Naval yard (SYRD) + sub pen (SPEN) — shore placement + water spawn.** Identified
+  by catalog **name** (`building_is_shipyard`, the §3.8 table-free role pattern, like
+  helipad/AA). They are placed on **land** (footprint `is_static_passable`) but the
+  footprint's 8-neighbour ring must include **≥1 open-water cell** — the reference's
+  `WaterBound=yes` shore requirement (`bdata.cpp` SYRD/SPEN; simplified from the full
+  `Passes_Proximity_Check` naval bib), enforced in `footprint_placeable` so both the
+  client placement preview (`can_place_building`) and the sim reject an inland yard.
+  A produced vessel **spawns into an adjacent water cell**: `finish_or_retry` routes
+  a Water-locomotor unit to `find_shipyard_exit`, which searches the yard's exit ring
+  with the Water locomotor (so the exit cell is guaranteed floatable and unoccupied);
+  a blocked ring retries next tick like a blocked factory exit. Verified
+  (`naval_suite::shipyard_requires_adjacent_water`).
+
+- **Combat ships (DD/CA/SS).** Stats/prereqs from rules.ini: **DD** (destroyer,
+  `Primary=Stinger`+`Secondary=DepthCharge`, `Sensors=Yes`, `Prerequisite=syrd`),
+  **CA** (cruiser, `Primary=8Inch`, `Sensors=Yes`, `Prerequisite=syrd,atek`), **SS**
+  (submarine, `Primary=TorpTube`, `Cloakable=yes`, `Prerequisite=spen`). They fight
+  through the ordinary unit combat path (dual-weapon selection, ROF, warhead Verses)
+  — a DD sinks a ship, a cruiser bombards at long range — with no per-ship code.
+  Buildable on the vehicle (Unit) production lane gated on a **naval yard**
+  (`need_shipyard` in `apply_start_production`, mirroring the helipad gate for air).
+
+- **Submarine stealth (the signature mechanic).** A submarine (`is_submarine`,
+  from `Cloakable=yes`) cruises **submerged** (`Unit::submerged`, cloaked). The
+  `run_submarines` FSM (tick order 3.9, before combat) keeps it submerged while
+  idle, **surfaces** it while it has a target, and holds it surfaced for a recloak
+  grace window after (`SUB_RECLOAK_TICKS`, the reference's `PulseCountDown` /
+  `VesselClass::Is_Allowed_To_Recloak`, `vessel.cpp:2044`). A submerged enemy sub is
+  **hidden** (`is_hidden_submarine`): every target-acquisition path
+  (`acquire_nearest_enemy` for buildings, `maybe_acquire_guard_target`,
+  `maybe_acquire_hunt_target`) and the explicit `Command::Attack` skip it — a
+  cloaked object is `MOVE_CLOAK`/untargetable to non-detectors (`vessel.cpp:296`) —
+  **unless** a **detector** (`is_detector`, from `Sensors=Yes` — DD/CA) allied to the
+  observer is within `SUB_DETECT_RANGE` (~5 cells) of the sub, which reveals it to
+  the observer and its allies. So a destroyer hunts subs that a pillbox or a plain
+  ship cannot even see. Verified both directions
+  (`naval_suite::submarine_stealth_hidden_from_non_detector_visible_to_destroyer`).
+
+**Client surfacing (skirmish).** `build_content` (`ra-client/src/assets.rs`) adds
+SYRD/SPEN to the structures strip and SS/DD/CA to the units strip (appended **below
+the default-visible sidebar window**, so — like the aircraft cameos, Q24.1 — no
+pinned `compose_game` frame moves). Vessel body art (`ss/dd/ca.shp`) is in
+conquer.mix, so ships **render through the existing vehicle draw path** (facing →
+frame) with no new rendering code; they float on the water passability the client
+now computes (`build_passability_masks_water`). Prereqs are enforced exactly like
+every other buildable (SS→spen, DD→syrd, CA→syrd,atek).
+
+**Determinism / golden discipline.** All new `Unit` fields are gated:
+`submerged`/`recloak` are hashed **only for submarines**; `is_submarine`/`is_detector`
+are type constants (like `locomotor`), unhashed. `run_submarines` and the stealth
+gate short-circuit on non-submarines, so **every non-naval world is byte-identical**
+(the full `ra-sim --no-fail-fast` matrix stayed green with **zero** re-pins). The AI
+never builds a naval yard, and vessels carry real rules.ini prereqs (spen/syrd) the
+AI never owns, so `unit_buildable` excludes them from the AI army pool — the
+weighted-random RNG draws are unchanged, keeping AI-vs-AI hash chains intact.
+
+**Cuts (reported, from the bottom of the priority stack).**
+- **P1 — LST naval transport + rendering polish.** The landing craft (load a vehicle
+  at shore → cross water → unload far shore) is **not** implemented; LST is in
+  rules.ini (`Passengers=5`) and the transport cargo/load-unload machinery already
+  exists (Q18), but wiring the shore load/unload is deferred. SYRD/SPEN **building**
+  art is theater-side (not in conquer.mix) so the yards currently render frameless
+  (placeholder); vessel cameos degrade to text (no `<NAME>ICON.SHP` found in
+  hires.mix). Submarine submerged **visual** (semi-transparent/periscope/hidden) is
+  not drawn — the sim hides the sub from targeting, but the client still draws its
+  body; a proper stealth render is deferred.
+- **P2 — AI naval + campaign LST reinforcements.** The AI does not build naval yards
+  or ships (no coastal-base detection, no naval attack missions), and the campaign
+  loader still **drops** naval placements (`is_naval_or_air`), so scg03ea's `aqua`
+  LST team is not yet surfaced. Coastal-map AI-vs-AI is therefore land-only; **most
+  current skirmish/test maps are land-locked**, so naval is exercised via the
+  synthetic `naval_suite` (real-coastal-scenario acceptance is handed off — a coastal
+  map must be selected/verified by ra-tester).
+- **P3 — PT gunboat, depth-charge-vs-sub anim, unload-at-shore polish.** Not started.
+
+**Handoff to ra-tester.** Exhaustive adversarial coverage owed: shipyard production
+end-to-end on a real coastal scenario (place SYRD at a shore, build+spawn a DD in
+water), naval combat outcomes (DD sinks a ship, CA bombards), multi-sub retarget and
+recloak-grace timing, a determinism proptest with vessels+subs, and — once wired —
+LST load/cross/unload and any AI-naval goldens. The P0 smoke proof is
+`ra-sim/tests/naval_suite.rs` (4 tests: water-only pathing, sub stealth both
+directions, determinism, shore placement). A **coastal scenario must be identified**
+for the real-asset acceptance (ship-on-water, sub-stealth, shipyard-spawns-in-water
+PNG evidence) — the current land-locked maps cannot exercise it.

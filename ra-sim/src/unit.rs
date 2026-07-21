@@ -354,6 +354,26 @@ pub struct Unit {
     /// pad reloads one round each time this reaches 0 (`Rule.ReloadRate`,
     /// `building.cpp:4438`). Hashed only for aircraft.
     pub rearm_timer: u16,
+
+    // --- Naval / submarine (naval arc P0) ---
+    /// This vessel is a **submarine** (SS/MSUB) — it cruises submerged
+    /// (`IsCloakable`, `vessel.cpp:113`), invisible to non-detector enemies, and
+    /// surfaces to fire. A type constant (like `locomotor`), **not** hashed; its
+    /// effect flows through the hashed [`Self::submerged`] state.
+    pub is_submarine: bool,
+    /// This unit can **detect** submerged submarines (a destroyer, DD) — a nearby
+    /// enemy sub is revealed to it and its allies. A type constant, **not** hashed.
+    pub is_detector: bool,
+    /// Whether a submarine is currently **submerged** (cloaked). `true` = hidden
+    /// from non-detector enemies; a sub surfaces (`false`) while it has a target
+    /// and for a recloak grace period after (`Is_Allowed_To_Recloak`,
+    /// `vessel.cpp:2044`). Hashed **only for submarines**, so every non-naval world
+    /// is byte-identical.
+    pub submerged: bool,
+    /// Recloak grace countdown (ticks a surfaced sub stays visible after losing its
+    /// target before re-submerging — the original's `PulseCountDown`). Hashed only
+    /// for submarines.
+    pub recloak: u16,
 }
 
 /// `FLIGHT_LEVEL` — full flight altitude in leptons (`ObjectClass` enum,
@@ -451,7 +471,28 @@ impl Unit {
             air_state: AirState::Idle,
             home: None,
             rearm_timer: 0,
+            is_submarine: false,
+            is_detector: false,
+            submerged: false,
+            recloak: 0,
         }
+    }
+
+    /// Turn this unit into a **naval vessel**: the `Water` locomotor and its
+    /// submarine/detector capability flags. A submarine spawns already submerged
+    /// (`VesselClass` ctor + `IsCloaked`, `vessel.cpp:113`). Called by the
+    /// loader/production right after spawning a DD/CA/SS. Vessels otherwise reuse
+    /// the ground vehicle systems (movement/combat) over water.
+    pub fn make_vessel(&mut self, is_submarine: bool, is_detector: bool) {
+        self.locomotor = Locomotor::Water;
+        self.is_submarine = is_submarine;
+        self.is_detector = is_detector;
+        self.submerged = is_submarine;
+    }
+
+    /// Whether this unit is a naval vessel (floats, paths over water).
+    pub fn is_vessel(&self) -> bool {
+        self.locomotor == Locomotor::Water
     }
 
     /// Turn this unit into an **aircraft** (helicopter/fixed-wing): the `Air`
@@ -706,6 +747,16 @@ impl Unit {
                 }
                 None => h.write_u8(0),
             }
+        }
+
+        // Submarine stealth state (naval arc). Folded ONLY for submarines, so every
+        // non-submarine world (all prior goldens, and surface vessels) is
+        // byte-identical. `is_submarine`/`is_detector` are type constants (like
+        // `locomotor`) captured through this gated `submerged`/`recloak`.
+        if self.is_submarine {
+            h.write_u8(0x34);
+            h.write_u8(self.submerged as u8);
+            h.write_u16(self.recloak);
         }
     }
 }

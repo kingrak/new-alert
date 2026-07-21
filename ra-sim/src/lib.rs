@@ -65,4 +65,4 @@ pub use shroud::Shroud;
 pub use unit::{
     AirState, HarvStatus, HarvestState, Mission, MoveStats, Passenger, Unit, UnitKind, FLIGHT_LEVEL,
 };
-pub use world::{apply, Command, GameOver, World, LOCO_AIR_INDEX};
+pub use world::{apply, Command, GameOver, World, LOCO_AIR_INDEX, LOCO_WATER_INDEX};
