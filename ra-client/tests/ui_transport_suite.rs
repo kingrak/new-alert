@@ -353,6 +353,7 @@ fn apply_op_with_transports(core: &mut AppCore, op: MonkeyOp, index: usize) {
             Command::StartProduction { .. }
             | Command::PlaceBuilding { .. }
             | Command::CancelProduction { .. }
+            | Command::HoldProduction { .. }
             | Command::Sell { .. }
             | Command::Repair { .. }
             | Command::FireSuperWeapon { .. } => continue,

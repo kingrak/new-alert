@@ -1640,7 +1640,7 @@ pub fn load_sound_bank(dir: &Path) -> Vec<(SoundEvent, Vec<u8>)> {
     // (event, source mix, AUD name). Weapon/UI SFX live in sounds.mix; EVA voice
     // lines in speech.mix. Names verified present in the shipped archives; any
     // that are absent (e.g. a mission-failed line) are skipped.
-    let spec: [(SoundEvent, Option<&MixArchive>, &str); 14] = [
+    let spec: [(SoundEvent, Option<&MixArchive>, &str); 19] = [
         (SoundEvent::Fire, sounds.as_ref(), "CANNON1.AUD"),
         (SoundEvent::Explosion, sounds.as_ref(), "KABOOM1.AUD"),
         (SoundEvent::Select, sounds.as_ref(), "RABEEP1.AUD"),
@@ -1667,6 +1667,18 @@ pub fn load_sound_bank(dir: &Path) -> Vec<(SoundEvent, Vec<u8>)> {
         (SoundEvent::NukeImpact, sounds.as_ref(), "KABOOM25.AUD"),
         (SoundEvent::IronCurtain, sounds.as_ref(), "IRONCUR9.AUD"),
         (SoundEvent::Chronosphere, sounds.as_ref(), "CHRONO2.AUD"),
+        // Sidebar production feedback (M7.21). The cameo handler's EVA lines
+        // (AUDIO.CPP speech table): "canceled" (CANCLD1, VOX_CANCELED), "on
+        // hold" (ONHOLD1, VOX_SUSPENDED), "building" (ABLDGIN1, VOX_BUILDING),
+        // "training" (TRAIN1, VOX_TRAINING), and the busy-lane scold "unable to
+        // comply, building in progress" (PROGRES1, VOX_NO_FACTORY). The
+        // original plays no separate VOC click for cameo clicks — the speech
+        // *is* the feedback (`SelectClass::Action` only ever calls `Speak`).
+        (SoundEvent::Canceled, speech.as_ref(), "CANCLD1.AUD"),
+        (SoundEvent::OnHold, speech.as_ref(), "ONHOLD1.AUD"),
+        (SoundEvent::BuildingStarted, speech.as_ref(), "ABLDGIN1.AUD"),
+        (SoundEvent::Training, speech.as_ref(), "TRAIN1.AUD"),
+        (SoundEvent::NoFactory, speech.as_ref(), "PROGRES1.AUD"),
     ];
     let mut out = Vec::new();
     for (ev, mix, name) in spec {

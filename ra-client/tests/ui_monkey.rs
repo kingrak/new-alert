@@ -227,6 +227,7 @@ fn apply_op_with_units(core: &mut AppCore, op: MonkeyOp, index: usize) {
             Command::StartProduction { .. }
             | Command::PlaceBuilding { .. }
             | Command::CancelProduction { .. }
+            | Command::HoldProduction { .. }
             | Command::Sell { .. }
             | Command::Repair { .. }
             | Command::FireSuperWeapon { .. } => continue,
@@ -330,6 +331,7 @@ fn apply_op_with_armed_units(core: &mut AppCore, op: MonkeyOp, index: usize) {
             Command::StartProduction { .. }
             | Command::PlaceBuilding { .. }
             | Command::CancelProduction { .. }
+            | Command::HoldProduction { .. }
             | Command::Sell { .. }
             | Command::Repair { .. }
             | Command::FireSuperWeapon { .. } => continue,
@@ -450,6 +452,14 @@ fn econ_event_strategy() -> impl Strategy<Value = InputEvent> {
             .prop_map(|(button, x, y)| InputEvent::MouseDown { button, x, y }),
         3 => (mouse_button_strategy(), 400i32..=900, -20i32..=200)
             .prop_map(|(button, x, y)| InputEvent::MouseUp { button, x, y }),
+        // M7.21: dedicated sidebar **right**-clicks spanning the full cameo-row
+        // band (the radar+cameo fixture pushes rows well below y=200, which the
+        // band above rarely reaches). Right-clicks on a cameo now route to the
+        // hold/cancel handler (`sidebar_right_click`), so this op makes the
+        // fuzz genuinely interleave hold/cancel with starts, scrolls, resizes,
+        // and placement — the "no lane wedge / no negative credits" surface.
+        3 => (400i32..=900, -20i32..=420)
+            .prop_map(|(x, y)| InputEvent::MouseDown { button: MouseButton::Right, x, y }),
         // Deliberately bounded small, exactly like `event_strategy`'s Resize
         // op above (this suite fuzzes sequencing, not allocation size/compose
         // cost -- an early, much wider range here made this suite ~200x
@@ -524,6 +534,7 @@ fn apply_op_with_econ(core: &mut AppCore, op: MonkeyOp, index: usize) {
             }
             Command::StartProduction { house, .. }
             | Command::CancelProduction { house, .. }
+            | Command::HoldProduction { house, .. }
             | Command::Sell { house, .. }
             | Command::Repair { house, .. }
             | Command::FireSuperWeapon { house, .. } => {
@@ -555,6 +566,15 @@ fn apply_op_with_econ(core: &mut AppCore, op: MonkeyOp, index: usize) {
         assert_eq!(frame.width, vw);
         assert_eq!(frame.height, vh);
     }
+
+    // M7.21: sidebar right-clicks now reach the cameo hold/cancel handler,
+    // which refunds credits — under no fuzzed interleaving may the treasury
+    // go negative (a double-refund or refund-of-nothing bug would).
+    let credits = core.world().house_credits(1);
+    assert!(
+        credits >= 0,
+        "house 1 credits went negative ({credits}) after op {index}: {op:?}"
+    );
 }
 
 /// Deterministic prefix: select + deploy the starter MCV, then start POWR
@@ -596,6 +616,68 @@ fn apply_ops_with_econ(core: &mut AppCore, ops: &[MonkeyOp]) {
     for (i, &op) in ops.iter().enumerate() {
         apply_op_with_econ(core, op, i);
     }
+    no_wedge_epilogue(core);
+}
+
+/// M7.21 "no lane wedge" invariant: whatever state the fuzzed sequence left
+/// production in (running, held, ready-but-unplaced, done-but-blocked), a
+/// player armed only with cameo right-clicks must always be able to free
+/// every lane — the exact guarantee the stuck-naval-yard report was missing.
+/// Sweeps right-clicks down both sidebar columns (with a sim tick after each
+/// so hold→cancel two-staging takes effect) and asserts every production
+/// lane of the controlled house ends empty, with a non-negative treasury.
+fn no_wedge_epilogue(core: &mut AppCore) {
+    // Known geometry + scroll reset so every cameo row is on-screen.
+    core.handle(InputEvent::Resize {
+        width: 640,
+        height: 400,
+    });
+    for column in 0..2u8 {
+        for _ in 0..8 {
+            core.handle(InputEvent::SidebarScroll { column, up: true });
+        }
+    }
+    core.drain_commands();
+
+    // Right-click a dense vertical sweep of both columns: every visible row
+    // gets hit several times regardless of radar/cameo row geometry. Step 10
+    // vs. a 60px cameo row height -> >= 2 hits per row, so an actively
+    // building lane goes hold -> cancel within one sweep.
+    let tw = core.tactical_width() as i32;
+    for &x in &[tw + 10, tw + 10 + 64] {
+        for y in (0..400).step_by(10) {
+            core.handle(InputEvent::MouseDown {
+                button: MouseButton::Right,
+                x,
+                y,
+            });
+            core.update(67);
+        }
+    }
+    core.drain_commands();
+
+    let hs = core.world().house(1).expect("house 1 exists");
+    assert!(
+        hs.building_prod.is_none() && hs.ready_building.is_none(),
+        "building lane wedged: {:?} / ready {:?}",
+        hs.building_prod,
+        hs.ready_building
+    );
+    assert!(
+        hs.unit_prod.is_none(),
+        "unit lane wedged: {:?}",
+        hs.unit_prod
+    );
+    assert!(
+        hs.infantry_prod.is_none(),
+        "infantry lane wedged: {:?}",
+        hs.infantry_prod
+    );
+    let credits = core.world().house_credits(1);
+    assert!(
+        credits >= 0,
+        "credits negative after cancel sweep: {credits}"
+    );
 }
 
 proptest! {
@@ -789,6 +871,7 @@ fn apply_sidebar_monkey_op(
                 );
             }
             Command::CancelProduction { house, .. }
+            | Command::HoldProduction { house, .. }
             | Command::Sell { house, .. }
             | Command::Repair { house, .. }
             | Command::FireSuperWeapon { house, .. } => {

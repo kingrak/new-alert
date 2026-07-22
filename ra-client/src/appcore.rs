@@ -121,6 +121,10 @@ pub struct SidebarItem {
     pub progress: Option<i32>,
     /// Whether this (structure) is finished and awaiting placement.
     pub ready: bool,
+    /// Whether this in-production item is on hold (suspended by a cameo
+    /// right-click; `FactoryClass::IsSuspended`). Always `false` when
+    /// `progress` is `None`. (M7.21)
+    pub paused: bool,
 }
 
 /// The composed output of a frame — an RGBA image ready to upload as a texture.
@@ -280,6 +284,25 @@ pub enum SoundEvent {
     /// The chronosphere warped a unit — the teleport SFX (`VOC_CHRONO` =
     /// `CHRONO2.AUD`, `house.cpp:3053`).
     Chronosphere,
+    /// EVA "Canceled" — a sidebar-cameo right-click abandoned a suspended or
+    /// completed production (`VOX_CANCELED` = `CANCLD1.AUD`, spoken at click
+    /// time by the cameo handler, `SIDEBAR.CPP:2185`). (M7.21)
+    Canceled,
+    /// EVA "On hold" — a sidebar-cameo right-click suspended an actively
+    /// building production (`VOX_SUSPENDED` = `ONHOLD1.AUD`,
+    /// `SIDEBAR.CPP:2188`). (M7.21)
+    OnHold,
+    /// EVA "Building" — production started or resumed for a structure or
+    /// vehicle (`VOX_BUILDING` = `ABLDGIN1.AUD`, `SIDEBAR.CPP:2231/2251`).
+    /// (M7.21)
+    BuildingStarted,
+    /// EVA "Training" — production started or resumed for infantry
+    /// (`VOX_TRAINING` = `TRAIN1.AUD`, `SIDEBAR.CPP:2229/2249`). (M7.21)
+    Training,
+    /// EVA "Unable to comply, building in progress" — the scold for
+    /// left-clicking a cameo whose factory lane is already busy
+    /// (`VOX_NO_FACTORY` = `PROGRES1.AUD`, `SIDEBAR.CPP:2204/2216`). (M7.21)
+    NoFactory,
 }
 
 /// The logical mouse-cursor the UI wants shown, derived from the armed action
@@ -862,14 +885,12 @@ impl AppCore {
         };
 
         // In production?
-        let (progress, ready) = match (item, hs) {
+        let (progress, ready, paused) = match (item, hs) {
             (BuildItem::Building(id), Some(h)) => {
                 let ready = h.ready_building == Some(id);
-                let prog = h
-                    .building_prod
-                    .filter(|p| p.item == item)
-                    .map(|p| p.progress_permille());
-                (prog, ready)
+                let lane = h.building_prod.filter(|p| p.item == item);
+                let prog = lane.map(|p| p.progress_permille());
+                (prog, ready, lane.map(|p| p.paused).unwrap_or(false))
             }
             (BuildItem::Unit(id), Some(h)) => {
                 // Infantry build on their own barracks strip (infantry_prod);
@@ -879,12 +900,11 @@ impl AppCore {
                 } else {
                     &h.unit_prod
                 };
-                let prog = lane
-                    .filter(|p| p.item == item)
-                    .map(|p| p.progress_permille());
-                (prog, false)
+                let lane = lane.filter(|p| p.item == item);
+                let prog = lane.map(|p| p.progress_permille());
+                (prog, false, lane.map(|p| p.paused).unwrap_or(false))
             }
-            _ => (None, false),
+            _ => (None, false, false),
         };
 
         // Buildable now? Prereqs owned + the producing factory present + funds +
@@ -935,6 +955,7 @@ impl AppCore {
             buildable,
             progress,
             ready,
+            paused,
         })
     }
 
@@ -1061,7 +1082,14 @@ impl AppCore {
                     }
                 }
                 MouseButton::Right => {
-                    if self.sell_mode || self.repair_mode || self.sw_fire_mode.is_some() {
+                    if self.sidebar_enabled && x >= self.tactical_width() as i32 {
+                        // Sidebar right-click: the cameo hold/cancel handler
+                        // (`StripClass::SelectClass::Action` RIGHTPRESS,
+                        // SIDEBAR.CPP:2160-2192) — routed before the tactical
+                        // right-click paths, exactly as the original's sidebar
+                        // gadgets capture input over the strip. (M7.21 P0)
+                        self.sidebar_right_click(x, y);
+                    } else if self.sell_mode || self.repair_mode || self.sw_fire_mode.is_some() {
                         // Right-click cancels an armed sell/repair/superweapon mode
                         // (like the original's cursor-mode cancel).
                         self.cancel_action_modes();
@@ -2547,6 +2575,36 @@ impl AppCore {
         }
     }
 
+    /// Put the controlled house's production of `kind` on hold
+    /// (`EventClass::SUSPEND`; resumed by re-starting the same item). (M7.21)
+    pub fn hold_production(&mut self, kind: ProdKind) {
+        if let Some(house) = self.player_house {
+            self.emit(Command::HoldProduction { house, kind });
+        }
+    }
+
+    /// The production lane `item` builds on, mirroring the sim's lane routing
+    /// (`apply_start_production`): structures → Building, infantry protos →
+    /// Infantry, every other unit proto (vehicles/aircraft/vessels) → Unit.
+    fn prod_kind_of(&self, item: BuildItem) -> ProdKind {
+        match item {
+            BuildItem::Building(_) => ProdKind::Building,
+            BuildItem::Unit(id) => {
+                if self
+                    .world
+                    .catalog
+                    .unit(id)
+                    .map(|p| p.is_infantry)
+                    .unwrap_or(false)
+                {
+                    ProdKind::Infantry
+                } else {
+                    ProdKind::Unit
+                }
+            }
+        }
+    }
+
     /// Enter placement mode for a ready building type id (green/red preview
     /// follows the cursor until a map click).
     pub fn begin_placement(&mut self, building_id: u32) {
@@ -2927,13 +2985,107 @@ impl AppCore {
         };
         let items = self.sidebar_items();
         let item = &items[idx];
+        let it = item.item;
+        let kind = self.prod_kind_of(it);
         if item.ready {
-            if let BuildItem::Building(id) = item.item {
+            // Completed structure: left-click (re-)enters placement mode
+            // (`Manual_Place`, SIDEBAR.CPP:2207).
+            if let BuildItem::Building(id) = it {
                 self.begin_placement(id);
             }
+        } else if item.progress.is_some() {
+            if item.paused {
+                // Suspended lane: left-click resumes construction — the
+                // original queues PRODUCE for the same item and speaks
+                // "Building"/"Training" (SIDEBAR.CPP:2222-2234); the sim's
+                // resume path unpauses the existing lane.
+                self.push_start_speech(kind);
+                self.start_production(it);
+            } else {
+                // Actively building: the "unable to comply, building in
+                // progress" scold (SIDEBAR.CPP:2214-2217).
+                self.push_sound(SoundEvent::NoFactory);
+            }
         } else if item.buildable {
-            let it = item.item;
+            // Start production, with the "Building"/"Training" acknowledgement
+            // (SIDEBAR.CPP:2245-2253).
+            self.push_start_speech(kind);
             self.start_production(it);
+        } else if self.lane_busy(kind) {
+            // Clicked a different icon while this lane's factory is busy:
+            // scold and ignore (`fnumber == -1 && factory != NULL`,
+            // SIDEBAR.CPP:2199-2205).
+            self.push_sound(SoundEvent::NoFactory);
+        }
+    }
+
+    /// Right-click on the sidebar strip: the cameo hold/cancel handler
+    /// (`StripClass::SelectClass::Action` RIGHTPRESS, SIDEBAR.CPP:2160-2192).
+    /// Actively-building → hold ("On hold"); on-hold or completed → abandon
+    /// with refund ("Canceled", `FactoryClass::Abandon`, FACTORY.CPP:481-521).
+    /// A right-click that lands on no cameo falls back to the armed-mode
+    /// cancel, like the tactical right-click.
+    fn sidebar_right_click(&mut self, x: i32, y: i32) {
+        if !self.accepting_orders() {
+            return;
+        }
+        let Some(idx) = self.sidebar_row_at(x, y) else {
+            self.cancel_action_modes();
+            return;
+        };
+        let items = self.sidebar_items();
+        let item = &items[idx];
+        let it = item.item;
+        let kind = self.prod_kind_of(it);
+        if item.ready {
+            // Completed-but-unplaced structure: abandon, full refund. Leaves
+            // placement mode first if this very building was being placed
+            // (`Map.PendingObjectPtr` cleared, SIDEBAR.CPP:2166-2176).
+            if let BuildItem::Building(id) = it {
+                if self.placing == Some(id) {
+                    self.placing = None;
+                }
+            }
+            self.push_sound(SoundEvent::Canceled);
+            self.cancel_production(kind);
+        } else if item.progress.is_some() {
+            // `Is_Building()` is `rate != 0` (FACTORY.H:68): an actively
+            // building lane suspends; a suspended lane — or a completed unit
+            // build waiting for a clear factory exit (rate 0 both) — abandons.
+            let done = item.progress == Some(1000);
+            if item.paused || done {
+                self.push_sound(SoundEvent::Canceled);
+                self.cancel_production(kind);
+            } else {
+                self.push_sound(SoundEvent::OnHold);
+                self.hold_production(kind);
+            }
+        }
+        // No factory attached to this cameo: no-op — the original ignores
+        // RIGHTPRESS when `factory == NULL` (SIDEBAR.CPP:2165).
+    }
+
+    /// EVA acknowledgement for starting/resuming production on `kind`:
+    /// "Training" for the infantry lane, "Building" otherwise
+    /// (SIDEBAR.CPP:2229-2232).
+    fn push_start_speech(&mut self, kind: ProdKind) {
+        self.push_sound(if kind == ProdKind::Infantry {
+            SoundEvent::Training
+        } else {
+            SoundEvent::BuildingStarted
+        });
+    }
+
+    /// Whether the controlled house's production lane for `kind` is occupied
+    /// (in progress, or — for structures — completed and awaiting placement).
+    fn lane_busy(&self, kind: ProdKind) -> bool {
+        let Some(h) = self.player_house.and_then(|hh| self.world.house(hh)) else {
+            return false;
+        };
+        match kind {
+            ProdKind::Building => h.building_prod.is_some() || h.ready_building.is_some(),
+            ProdKind::Unit => h.unit_prod.is_some(),
+            ProdKind::Infantry => h.infantry_prod.is_some(),
         }
     }
 

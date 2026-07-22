@@ -2460,3 +2460,83 @@ revert-sensitive by disabling its mechanism), `path::tests::no_corner_cutting`
 (split corner rule, both halves), `ai_retune_depth_suite::
 hard_goes_all_out_after_exactly_two_dissolves` (P3 knob), and the re-derived
 `scatter_boundary_suite` cadence pins.
+
+## Q31 — Production cancel + hold: the sidebar cameo right-click (M7.21)
+
+**Milestone:** M7.21. Trigger: player report — a naval yard built on a
+landlocked base completed, could never be placed, and wedged both the money
+and the building lane forever (`AppCore::cancel_production` existed with zero
+callers; no input path reached it). All citations verified against the EA GPL
+checkout (`~/dev/game/reference/CnC_Remastered_Collection/REDALERT/`).
+
+**The original's cameo click table** (`StripClass::SelectClass::Action`,
+SIDEBAR.CPP:2037-2264; `Is_Building()` = `Fetch_Rate() != 0`, FACTORY.H:68):
+
+| Click | Factory state | Original behavior |
+|---|---|---|
+| right | actively building | `Speak(VOX_SUSPENDED)` + SUSPEND event (SIDEBAR.CPP:2186-2189) → `FactoryClass::Suspend` (FACTORY.CPP:410: `IsSuspended=true`, `Set_Rate(0)`) |
+| right | suspended **or** completed | `Speak(VOX_CANCELED)` + ABANDON event (SIDEBAR.CPP:2183-2185) → `FactoryClass::Abandon` (FACTORY.CPP:481: `Refund_Money(money - Balance)`, object deleted) |
+| right | any factory attached | placement mode cancelled first (`Map.PendingObjectPtr` cleared, SIDEBAR.CPP:2166-2176) |
+| right | no factory | ignored |
+| left | actively building | `Speak(VOX_NO_FACTORY)` scold (SIDEBAR.CPP:2214-2217) |
+| left | different icon, lane busy | `Speak(VOX_NO_FACTORY)` + ignore (SIDEBAR.CPP:2199-2205) |
+| left | completed structure | `Manual_Place` → placement mode (SIDEBAR.CPP:2207) |
+| left | completed unit | PLACE event → factory exit (SIDEBAR.CPP:2211-2216) |
+| left | suspended | `Speak(VOX_BUILDING/VOX_TRAINING)` + PRODUCE re-issue → `FactoryClass::Start` resume (SIDEBAR.CPP:2222-2234) |
+| left | idle, buildable | `Speak(VOX_BUILDING/VOX_TRAINING)` + PRODUCE (SIDEBAR.CPP:2240-2253) |
+
+So RA's cancel is **two-stage**: the first right-click on an in-progress item
+holds it; the second abandons with refund. A completed item abandons on the
+first right-click. Ported as-is: `AppCore::sidebar_right_click` +
+`Command::HoldProduction` (suspend-only, like the SUSPEND event — resume is a
+re-issued `StartProduction` for the same item, which unpauses instead of
+rejecting "lane busy", per `HouseClass::Begin_Production` finding the existing
+factory).
+
+**Feedback fidelity.** The cameo handler plays EVA speech only — there is no
+`Sound_Effect` call anywhere in `SelectClass::Action`, so no separate VOC
+click is played (the strip up/down buttons have their own sounds; not this).
+Speech is spoken at click time, before the event executes — optimistic,
+reproduced the same way (`push_sound` in the click handlers, not derived from
+sim state). AUD mapping (AUDIO.CPP speech table): VOX_CANCELED=CANCLD1,
+VOX_SUSPENDED=ONHOLD1, VOX_BUILDING=ABLDGIN1, VOX_TRAINING=TRAIN1,
+VOX_NO_FACTORY=PROGRES1. A held lane has **no** visual marker beyond the
+frozen sidebar clock — same as the original (the remaster's "ON HOLD" caption
+is remaster-only).
+
+**Divergences (deliberate, small):**
+- **Placement-mode cancel scope.** The original clears placement mode on a
+  right-click over *any* cameo with a factory attached (SIDEBAR.CPP:2166) —
+  even canceling an unrelated unit build drops the structure you were placing.
+  Ours clears `placing` only when the canceled item **is** the building being
+  placed; a right-click on another lane's cameo leaves your placement alone.
+- **Completed unit blocked at the factory exit.** The original requires a
+  left-click to attempt the exit (PLACE event); our sim auto-retries the exit
+  every tick, so a left-click on a done unit cameo plays the busy scold
+  instead. Right-click on that state cancels with full refund in both
+  (rate 0 ⇒ ABANDON; ours keys on `progress == 1000‰`).
+- **`Who_Can_Build_Me` re-check on placement click.** The original
+  auto-abandons a completed item whose only factory died (SIDEBAR.CPP:2206
+  ABANDON + VOX_NO_FACTORY); ours already abandons the *in-progress* lane when
+  the last factory dies (`abandon_production_lane`, Q-M7 item 4) but keeps a
+  `ready_building` — the player cancels it by right-click (refund identical).
+- **Hold on a done lane is ignored** (`apply_hold_production` checks `!done`)
+  so a mistimed hold can never wedge a lane the UI thinks is cancellable.
+
+### Determinism / goldens (re-pin inventory: **ZERO**)
+
+`Production.paused` is folded into the hash **only while true** (one byte,
+`0x50`) — a lane that is never held hashes byte-identically to the pre-M7.21
+layout, and nothing but the player's sidebar right-click can set it (the AI
+never emits `HoldProduction`). Confirmed by the full workspace run: all
+pre-existing golden/determinism/lockstep suites green untouched (870 tests).
+
+**Pins:** `ra-sim/tests/production_cancel_hold_suite.rs` (drain-schedule
+refund exactness, hold freeze + exact-cost resume, hold→cancel refund,
+full refund of a completed-unplaced structure + lane restart, held-lane
+hijack rejection), `ra-client/tests/ui_cancel_hold_suite.rs` (the user's
+landlocked-naval-yard scenario end-to-end and the hold/resume/cancel table,
+both through real `InputEvent`s at cameo pixels — proven revert-sensitive by
+unwiring the `MouseButton::Right` sidebar route), and `ui_monkey.rs`'s econ
+variant (sidebar right-click op in the alphabet, credits-never-negative after
+every op, and a right-click-only "no lane wedge" epilogue).

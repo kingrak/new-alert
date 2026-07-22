@@ -53,6 +53,12 @@ pub struct Production {
     pub spent: i32,
     /// Completed and awaiting placement (buildings) / spawn (units).
     pub done: bool,
+    /// On hold: the player suspended this build with a sidebar-cameo
+    /// right-click (`FactoryClass::Suspend`, factory.cpp:410 — `IsSuspended`
+    /// set, `Set_Rate(0)`). A paused lane makes no progress and pays no
+    /// installments until resumed (`FactoryClass::Start`, factory.cpp:439)
+    /// or abandoned. Defaults to `false` (M7.21).
+    pub paused: bool,
 }
 
 impl Production {
@@ -80,6 +86,12 @@ impl Production {
         h.write_i32(self.progress);
         h.write_i32(self.spent);
         h.write_u8(self.done as u8);
+        // Hold flag (M7.21 P1): folded in ONLY while paused, appending no
+        // bytes for a lane that has never been put on hold — so every prior
+        // golden (nothing ever pauses) hashes byte-identically.
+        if self.paused {
+            h.write_u8(0x50);
+        }
     }
 }
 

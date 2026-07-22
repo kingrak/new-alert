@@ -107,6 +107,20 @@ pub enum Command {
         /// Which lane to cancel.
         kind: ProdKind,
     },
+    /// Put `house`'s in-progress production of the given kind on hold
+    /// (`EventClass::SUSPEND` → `HouseClass::Suspend_Production` →
+    /// `FactoryClass::Suspend`, factory.cpp:410: `IsSuspended = true`,
+    /// `Set_Rate(0)`). Suspend-only, exactly like the original event — the
+    /// resume path is re-issuing [`Command::StartProduction`] for the same
+    /// item (the original's PRODUCE event finds the suspended factory and
+    /// calls `FactoryClass::Start`). Ignored for an empty or already-completed
+    /// lane. (M7.21 P1)
+    HoldProduction {
+        /// House issuing the order.
+        house: u8,
+        /// Which lane to hold.
+        kind: ProdKind,
+    },
     /// Sell one of `house`'s own buildings, refunding `Rule.RefundPercent` of its
     /// cost (default 50%, `techno.cpp:6417`) and clearing its footprint. Ignored
     /// if the issuing house does not own the building or it is already gone.
@@ -2311,6 +2325,7 @@ fn apply_command(world: &mut World, cmd: Command) {
             cell,
         } => apply_place_building(world, house, building, cell),
         Command::CancelProduction { house, kind } => apply_cancel_production(world, house, kind),
+        Command::HoldProduction { house, kind } => apply_hold_production(world, house, kind),
         Command::Sell { house, building } => apply_sell(world, house, building),
         Command::Repair { house, building } => apply_repair(world, house, building),
         Command::Load {
@@ -2676,6 +2691,34 @@ fn apply_start_production(world: &mut World, house: u8, item: BuildItem) {
             },
         };
 
+    // Resume path (M7.21 P1): if the lane already holds this exact item on
+    // hold, a PRODUCE for it resumes the suspended build instead of being
+    // rejected as "lane busy" — the original's `HouseClass::Begin_Production`
+    // finds the existing factory for the type and calls `FactoryClass::Start`
+    // (factory.cpp:439), continuing from the frozen stage. (A human resumes
+    // regardless of funds — `Start` only gates on money for AI houses; our
+    // per-tick installment already stalls on an empty treasury.)
+    let lane = match kind {
+        ProdKind::Building => &hs.building_prod,
+        ProdKind::Unit => &hs.unit_prod,
+        ProdKind::Infantry => &hs.infantry_prod,
+    };
+    if let Some(p) = lane {
+        if p.paused && p.item == item {
+            if let Some(hs) = world.houses.get_mut(house as usize) {
+                let lane = match kind {
+                    ProdKind::Building => &mut hs.building_prod,
+                    ProdKind::Unit => &mut hs.unit_prod,
+                    ProdKind::Infantry => &mut hs.infantry_prod,
+                };
+                if let Some(p) = lane {
+                    p.paused = false;
+                }
+            }
+            return;
+        }
+    }
+
     // Slot must be free.
     let slot_busy = match kind {
         ProdKind::Building => hs.building_prod.is_some() || hs.ready_building.is_some(),
@@ -2765,6 +2808,7 @@ fn apply_start_production(world: &mut World, house: u8, item: BuildItem) {
         progress: 0,
         spent: 0,
         done: false,
+        paused: false,
     };
     if let Some(hs) = world.houses.get_mut(house as usize) {
         match kind {
@@ -2828,6 +2872,26 @@ fn place_building_inner(
         if let Some(unit_id) = free {
             let dock = CellCoord::new(center.x, center.y + 1);
             spawn_free_harvester(world, unit_id, house, dock, cell);
+        }
+    }
+}
+
+/// Put a house's production of the given kind on hold (`FactoryClass::Suspend`,
+/// factory.cpp:410). A completed lane cannot be held — the original's cameo
+/// handler only ever sends SUSPEND while `Is_Building()` (rate != 0), and a
+/// completed factory has rate 0; right-click on a completed item is ABANDON.
+fn apply_hold_production(world: &mut World, house: u8, kind: ProdKind) {
+    let Some(hs) = world.houses.get_mut(house as usize) else {
+        return;
+    };
+    let lane = match kind {
+        ProdKind::Building => &mut hs.building_prod,
+        ProdKind::Unit => &mut hs.unit_prod,
+        ProdKind::Infantry => &mut hs.infantry_prod,
+    };
+    if let Some(p) = lane {
+        if !p.done {
+            p.paused = true;
         }
     }
 }
@@ -5859,6 +5923,12 @@ fn advance_production(world: &mut World, house_idx: usize, kind: ProdKind) {
         // the tick they finish), so a lingering done building lane shouldn't
         // occur — but guard anyway.
         finish_or_retry(world, house_idx, kind, prod);
+        return;
+    }
+    // On hold (M7.21 P1): a suspended factory has rate 0 — no stage step, no
+    // installment (`FactoryClass::Suspend`, factory.cpp:410).
+    if p.paused {
+        store_production(world, house_idx, kind, prod);
         return;
     }
 
