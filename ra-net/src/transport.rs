@@ -48,6 +48,120 @@ impl TickBundle {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ra_sim::{ProdKind, RandomLcg};
+
+    fn cmd(tag: u8) -> Command {
+        Command::CancelProduction {
+            house: tag,
+            kind: ProdKind::Building,
+        }
+    }
+
+    /// `flatten()` on a bundle already in canonical (seat-ascending) order
+    /// concatenates each seat's commands in that order, preserving each
+    /// seat's own issue order — the literal contract this type exists to
+    /// guarantee (queue.cpp:3281-3290 house-array order + queue.cpp:3312-3321
+    /// per-house issue order).
+    #[test]
+    fn flatten_concatenates_in_seat_ascending_then_issue_order() {
+        let bundle = TickBundle {
+            tick: 0,
+            seats: vec![
+                (1, vec![cmd(11), cmd(12)]),
+                (3, vec![cmd(31)]),
+                (7, vec![]),
+                (9, vec![cmd(91), cmd(92), cmd(93)]),
+            ],
+        };
+        assert_eq!(
+            bundle.flatten(),
+            vec![cmd(11), cmd(12), cmd(31), cmd(91), cmd(92), cmd(93)]
+        );
+        assert_eq!(bundle.command_count(), 6);
+    }
+
+    /// Property, swept over many seeded random seat-command layouts: for a
+    /// bundle whose `seats` are sorted ascending by `SeatId` (the contract
+    /// every [`CommandTransport`] impl must uphold — see `PairTransport`'s
+    /// `seats.sort_by_key` at the end of `poll`), `flatten()` must equal a
+    /// reference built by manually walking the seats in ascending id order.
+    /// This is deliberately proven *independently* of `TickBundle::flatten`'s
+    /// own implementation (the reference walks `seats` with a hand-rolled
+    /// loop over a `BTreeMap`, not by calling `flatten` on a re-sorted copy),
+    /// so a bug in `flatten` itself cannot cancel out against the same bug in
+    /// the reference.
+    #[test]
+    fn flatten_ordering_property_holds_across_many_random_layouts() {
+        let mut rng = RandomLcg::new(0x5EA7_0001);
+        for case in 0..200u32 {
+            // Random distinct seat ids (0..16), random command counts (0..4).
+            let num_seats = 1 + (rng.range(0, 7) as usize);
+            let mut seat_ids: Vec<u8> = Vec::new();
+            while seat_ids.len() < num_seats {
+                let candidate = rng.range(0, 15) as u8;
+                if !seat_ids.contains(&candidate) {
+                    seat_ids.push(candidate);
+                }
+            }
+            let mut seats: Vec<(SeatId, Vec<Command>)> = seat_ids
+                .iter()
+                .map(|&s| {
+                    let n = rng.range(0, 3) as usize;
+                    let cmds = (0..n).map(|i| cmd(s.wrapping_add(i as u8))).collect();
+                    (s, cmds)
+                })
+                .collect();
+            // Canonical order per the contract: ascending by seat id.
+            seats.sort_by_key(|&(s, _)| s);
+
+            // Independent reference: a BTreeMap walk (ascending key order by
+            // construction), not a call to `flatten`.
+            let mut reference_map: std::collections::BTreeMap<SeatId, Vec<Command>> =
+                std::collections::BTreeMap::new();
+            for (s, cmds) in &seats {
+                reference_map.insert(*s, cmds.clone());
+            }
+            let mut reference = Vec::new();
+            for cmds in reference_map.values() {
+                reference.extend_from_slice(cmds);
+            }
+
+            let bundle = TickBundle { tick: case, seats };
+            assert_eq!(
+                bundle.flatten(),
+                reference,
+                "case {case}: flatten() diverged from the independent seat-ascending reference"
+            );
+            assert_eq!(bundle.command_count(), reference.len());
+        }
+    }
+
+    /// Revert-sensitivity anchor for the property above: if `seats` is
+    /// *not* sorted ascending (a hypothetical broken `CommandTransport` impl
+    /// that forgot to sort), `flatten()` faithfully reproduces that
+    /// (non-canonical) order rather than silently re-sorting — proving the
+    /// ordering guarantee lives in the *producer* contract, not inside
+    /// `flatten` itself, exactly as the doc comment states ("Applying
+    /// `flatten()` on every peer therefore executes the same commands in the
+    /// same order" — same order as `seats`, not a re-derived canonical one).
+    #[test]
+    fn flatten_does_not_itself_enforce_canonical_order() {
+        let bundle = TickBundle {
+            tick: 0,
+            // Deliberately descending — flatten must not silently fix this.
+            seats: vec![(9, vec![cmd(9)]), (1, vec![cmd(1)])],
+        };
+        assert_eq!(
+            bundle.flatten(),
+            vec![cmd(9), cmd(1)],
+            "flatten must reproduce seats' actual order, not re-sort it"
+        );
+    }
+}
+
 /// A detected lockstep divergence: two peers reported different state hashes
 /// for the same tick. This is a *state* the session enters (the M8-B/C resync
 /// hook), not a panic — unlike the original, where a FRAMEINFO CRC mismatch

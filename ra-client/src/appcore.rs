@@ -3003,7 +3003,7 @@ impl AppCore {
                 self.start_production(it);
             } else {
                 // Actively building: the "unable to comply, building in
-                // progress" scold (SIDEBAR.CPP:2214-2217).
+                // progress" scold (SIDEBAR.CPP:2180-2182).
                 self.push_sound(SoundEvent::NoFactory);
             }
         } else if item.buildable {
@@ -3014,7 +3014,7 @@ impl AppCore {
         } else if self.lane_busy(kind) {
             // Clicked a different icon while this lane's factory is busy:
             // scold and ignore (`fnumber == -1 && factory != NULL`,
-            // SIDEBAR.CPP:2199-2205).
+            // SIDEBAR.CPP:2168-2172).
             self.push_sound(SoundEvent::NoFactory);
         }
     }
@@ -3040,7 +3040,7 @@ impl AppCore {
         if item.ready {
             // Completed-but-unplaced structure: abandon, full refund. Leaves
             // placement mode first if this very building was being placed
-            // (`Map.PendingObjectPtr` cleared, SIDEBAR.CPP:2166-2176).
+            // (`Map.PendingObjectPtr` cleared, SIDEBAR.CPP:2142-2147).
             if let BuildItem::Building(id) = it {
                 if self.placing == Some(id) {
                     self.placing = None;

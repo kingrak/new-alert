@@ -433,6 +433,123 @@ fn corrupted_world_latches_desync_at_the_right_tick() {
     }
 }
 
+/// Jitter-seed sweep: proof test (b) pinned one seed; a scheduler bug that
+/// only misbehaves for specific delivery orderings could hide behind a
+/// single lucky seed. Sweep several independent seeds (still deterministic —
+/// no wall clock, no thread nondeterminism) and require every one to stay
+/// hash-identical to the clean run AND to produce at least one genuine stall
+/// (proving the barrier was actually exercised, not just present).
+#[test]
+fn jittered_lockstep_identical_across_many_seeds() {
+    let (clean, _, _, _) = scripted_run(DEFAULT_INPUT_DELAY, None, TICKS);
+    let Outcome::Completed {
+        chain_a: clean_chain,
+        ..
+    } = clean
+    else {
+        panic!("clean run desynced");
+    };
+
+    for seed in [
+        0x0000_0001u32,
+        0xDEAD_BEEF,
+        0x1234_5678,
+        0xFFFF_FFFF,
+        0x5EA7_C0DE,
+        0x0BAD_F00D,
+    ] {
+        for max_delay_steps in [1u32, 4, 9] {
+            let jitter = JitterConfig {
+                seed,
+                max_delay_steps,
+            };
+            let (out, a, b, f) = scripted_run(DEFAULT_INPUT_DELAY, Some(jitter), TICKS);
+            let Outcome::Completed {
+                chain_a, chain_b, ..
+            } = out
+            else {
+                panic!("jittered run desynced (seed={seed:#x}, max_delay={max_delay_steps})");
+            };
+            assert_eq!(
+                chain_a, chain_b,
+                "endpoints diverged (seed={seed:#x}, max_delay={max_delay_steps})"
+            );
+            assert_eq!(
+                chain_a, clean_chain,
+                "arrival timing leaked into the sim state (seed={seed:#x}, max_delay={max_delay_steps})"
+            );
+            assert!(a.tp.desync().is_none() && b.tp.desync().is_none());
+            assert_non_vacuous(&chain_a, &a, &b, &f);
+        }
+    }
+}
+
+/// Negative drill: corrupt BOTH worlds *identically* mid-run — the same
+/// out-of-band mutation applied to both instances at the same tick. This must
+/// NOT trip the desync detector: hash equality is the only oracle the hash
+/// exchange has, and if it fired here it would mean the detector is
+/// trigger-happy (comparing something other than genuine state divergence,
+/// e.g. an unstable field like a wall-clock timestamp or an address). A
+/// detector that can't tell "identical corruption" from "divergence" would
+/// false-positive constantly on legitimate, income-neutral non-determinism
+/// sources that happen to be symmetric.
+#[test]
+fn identically_corrupting_both_worlds_does_not_desync() {
+    const CORRUPT_AT: u32 = 150;
+    let (mut a, mut b, f) = make_pair(DEFAULT_INPUT_DELAY, None);
+    let out = drive(
+        &mut a,
+        &mut b,
+        300,
+        |t, ia, ib| {
+            for c in script_a(&f, t) {
+                ia.tp.submit(c);
+            }
+            for c in script_b(&f, t) {
+                ib.tp.submit(c);
+            }
+        },
+        |t, ia, ib| {
+            if t == CORRUPT_AT {
+                // Identical out-of-band mutation on both sides.
+                ia.world
+                    .spawn_unit(0, 2, CellCoord::new(20, 20), Facing(0), 100, stats(10, 5));
+                ib.world
+                    .spawn_unit(0, 2, CellCoord::new(20, 20), Facing(0), 100, stats(10, 5));
+            }
+        },
+    );
+    let Outcome::Completed {
+        chain_a, chain_b, ..
+    } = out
+    else {
+        panic!(
+            "identical corruption on both sides was flagged as a desync — the detector is \
+             comparing something other than genuine divergence"
+        );
+    };
+    assert_eq!(
+        chain_a, chain_b,
+        "identically-corrupted worlds must still produce identical hash chains"
+    );
+    assert!(a.tp.desync().is_none() && b.tp.desync().is_none());
+    // Non-vacuity: the corruption must have actually landed (both worlds
+    // gained the extra unit), and the run must have covered the corrupt
+    // tick and kept going well past it.
+    assert_eq!(chain_a.len(), 300);
+    for (name, w) in [("A", &a.world), ("B", &b.world)] {
+        let extra = w
+            .units
+            .iter()
+            .filter(|(_, u)| u.cell() == CellCoord::new(20, 20))
+            .count();
+        assert_eq!(
+            extra, 1,
+            "instance {name}: corruption did not land as expected"
+        );
+    }
+}
+
 /// Proof test (e): revert-sensitivity — the input-delay scheduler is
 /// load-bearing. Simulate the classic naive-lockstep bug: instance A applies
 /// its own input immediately at the submit tick (skipping the T+delay stamp)

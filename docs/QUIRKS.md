@@ -2474,12 +2474,12 @@ SIDEBAR.CPP:2037-2264; `Is_Building()` = `Fetch_Rate() != 0`, FACTORY.H:68):
 
 | Click | Factory state | Original behavior |
 |---|---|---|
-| right | actively building | `Speak(VOX_SUSPENDED)` + SUSPEND event (SIDEBAR.CPP:2186-2189) → `FactoryClass::Suspend` (FACTORY.CPP:410: `IsSuspended=true`, `Set_Rate(0)`) |
-| right | suspended **or** completed | `Speak(VOX_CANCELED)` + ABANDON event (SIDEBAR.CPP:2183-2185) → `FactoryClass::Abandon` (FACTORY.CPP:481: `Refund_Money(money - Balance)`, object deleted) |
-| right | any factory attached | placement mode cancelled first (`Map.PendingObjectPtr` cleared, SIDEBAR.CPP:2166-2176) |
+| right | actively building | `Speak(VOX_SUSPENDED)` + SUSPEND event (SIDEBAR.CPP:2152-2157) → `FactoryClass::Suspend` (FACTORY.CPP:410: `IsSuspended=true`, `Set_Rate(0)`) |
+| right | suspended **or** completed | `Speak(VOX_CANCELED)` + ABANDON event (SIDEBAR.CPP:2149-2151) → `FactoryClass::Abandon` (FACTORY.CPP:481: `Refund_Money(money - Balance)`, object deleted) |
+| right | any factory attached | placement mode cancelled first (`Map.PendingObjectPtr` cleared, SIDEBAR.CPP:2142-2147) |
 | right | no factory | ignored |
-| left | actively building | `Speak(VOX_NO_FACTORY)` scold (SIDEBAR.CPP:2214-2217) |
-| left | different icon, lane busy | `Speak(VOX_NO_FACTORY)` + ignore (SIDEBAR.CPP:2199-2205) |
+| left | actively building | `Speak(VOX_NO_FACTORY)` scold (SIDEBAR.CPP:2180-2182) |
+| left | different icon, lane busy | `Speak(VOX_NO_FACTORY)` + ignore (SIDEBAR.CPP:2168-2172) |
 | left | completed structure | `Manual_Place` → placement mode (SIDEBAR.CPP:2207) |
 | left | completed unit | PLACE event → factory exit (SIDEBAR.CPP:2211-2216) |
 | left | suspended | `Speak(VOX_BUILDING/VOX_TRAINING)` + PRODUCE re-issue → `FactoryClass::Start` resume (SIDEBAR.CPP:2222-2234) |
