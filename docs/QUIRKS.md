@@ -2540,3 +2540,124 @@ both through real `InputEvent`s at cameo pixels — proven revert-sensitive by
 unwiring the `MouseButton::Right` sidebar route), and `ui_monkey.rs`'s econ
 variant (sidebar right-click op in the alphabet, credits-never-negative after
 every op, and a right-click-only "no lane wedge" epilogue).
+
+## Q32 — M7.22 player-reported fixes: colours, diagonal blocker, weapon sounds, last-unit defeat
+
+Four player reports fixed this cycle. Two carry a documented divergence; the
+other two are faithful corrections with no divergence.
+
+### Q32a — Player/house colours: the real eight `PlayerColorType` rows (Fix 1)
+
+**Fixed, faithful.** `Init_Color_Remaps` (`INIT.CPP:2639-2650`) builds
+`ColorRemaps[pcolor]` by iterating `PlayerColorType` in enum order and remapping
+`PALETTE.CPS` row 0 (the "unity" band) to row `pcolor` — so **the CPS row index
+IS the `PlayerColorType`**: GOLD=0, LTBLUE=1, RED=2, GREEN=3, ORANGE=4, BLUE=5,
+GREY=6, BROWN=7 (`DEFINES.H:1226-1235`). The old menu `COLORS` table mislabelled
+every row (e.g. `"BLUE"→3`, which is GREEN's row — the exact reported "I selected
+blue, I got green"), and offered PURPLE/TEAL (no such schemes) while omitting
+LTBLUE/BROWN. Corrected to the real eight, value == row.
+
+House default colours come from each `HouseTypeClass`'s `RemapColor`
+(`HDATA.CPP:46-124`): Spain=Gold(0), Greece=LtBlue(1), USSR=Red(2),
+England=Green(3), Ukraine=Orange(4), **Germany=Grey(6)**, **France=Blue(5)**,
+Turkey=Brown(7). The house index equals the colour row for six of eight but NOT
+for Germany/France (the `PlayerColorType` enum orders BLUE before GREY, the house
+enum orders Germany before France). `build_house_remaps` used `row == house
+index`, so Germany rendered blue and France grey — a sibling of the reported bug.
+Now keyed through `HOUSE_PCOLOR = [0,1,2,3,4,6,5,7]`.
+
+**On the "dialog blue" note** (`DEFINES.H:1233`: `PCOLOR_BLUE // This is actually
+the red scheme used in the dialogs`): that comment is about the *dialog text*
+`FontRemap`, not the in-game unit band. Empirically decoding the shipped
+`PALETTE.CPS`, row 5's unit band remaps the unity indices 80..95 to indices
+112..123 — a **distinct** scheme from row 2 (RED → 229..239). So for units, the
+"blue" player wears row 5's own colour, distinct from red. The 2019 Remastered
+`Init_Color_Remaps` swaps `ColorRemaps[PCOLOR_BLUE]`/`[PCOLOR_GREY]`
+(`INIT.CPP:2673`, dated 12/9/2019) — a post-1996 patch we do **not** reproduce
+(we target the 1996 DOS build), so our row 5 = blue, row 6 = grey, unswapped.
+No divergence from 1996 behaviour. Pin: `ra-client/tests/ui_player_color_suite.rs`
+(renders each colour + each house's default and asserts distinct/expected
+remapped pixels, not enum labels).
+
+### Q32b — Diagonal corner-graze past a static blocker (Fix 2a)
+
+**Fixed, faithful.** A mover ordered past an immediate blocker used to hang when
+the natural detour was a pure-diagonal step whose center-to-center line grazes
+the *exact* corner shared by four cells. Our lepton-interpolated movement
+floor-rounds that corner point into the perpendicular neighbour; when that
+neighbour is a building/wall, `is_blocked` reported a terrain block and the mover
+held forever — even though the step's true destination cell was clear. The
+original checks only each step's destination cell (`Can_Enter_Cell(destcell)`,
+`DRIVE.CPP:1082`) and every `Can_Enter_Cell` ignores its facing argument
+(`UNIT.CPP:3208`), so it permits diagonal squeezes between corner-touching STATIC
+blockers (this is *why* walls must be orthogonally continuous to seal a base).
+`nudge_corner_graze` re-attributes an off-path diagonal-corner landing to the
+on-path waypoint (nudging the coord just past the corner), gated so a **vehicle**
+in the grazed cell still blocks (one-vehicle-per-cell, Q30) and every non-grazing
+step is byte-identical. Zero re-pins across the full ra-sim suite. Pin:
+`ra-sim/tests/m722_blocker_matrix.rs` (8 directions × 4 blocker types × open
+field/corridor).
+
+### Q32c — We do NOT auto-attack a destroyable blocker (Fix 2b, **DIVERGENCE**)
+
+**Deliberate divergence.** When a mover's immediate step is `MOVE_DESTROYABLE`
+(a non-ally destroyable object blocks and there is no detour), the original
+`Override_Mission(MISSION_ATTACK, blocker->As_Target())` — the mover abandons the
+move and shoots through the obstacle (`DRIVE.CPP:1116-1131`, mirrored at
+1226-1240; `MOVE_DESTROYABLE` is produced for a non-ally armed-vs-target cell at
+`UNIT.CPP:3378`). We keep `Command::Move` semantics pure: a Move never
+auto-converts into an attack. An **unarmed** mover matches the original exactly
+(`MOVE_NO` when `PrimaryWeapon == NULL`, `UNIT.CPP:3354` → no path → order
+abandoned via the M7.20 `PATH_RETRY` bound, Q30). An **armed** mover walled by an
+enemy with no detour holds/abandons instead of blasting through — the divergence.
+Rationale: auto-attack-on-move would let any Move order (player or AI retreat,
+regroup, harvester routing) silently start a firefight, entangling movement with
+combat/AI targeting for a rare case (an enemy fully walling a 1-wide lane with no
+route around). Biased to the contained, faithful Fix 2a instead. Pin:
+`m722_blocker_matrix.rs::armed_mover_does_not_auto_attack_a_walling_enemy_quirk`.
+
+### Q32d — Per-weapon fire sounds, incl. hitscan (Fix 3)
+
+**Fixed, faithful.** The fire cue fired only on a *new projectile*, so hitscan
+weapons (rifle/MG/tesla/pillbox — `Inviso=yes` + light speed, no persistent
+bullet) were silent, and every weapon shared `CANNON1`. The original plays each
+weapon's own `Report=` on **every** shot at the fire chokepoint
+(`TechnoClass::Fire_At` → `Sound_Effect(weapon->Sound)`, `TECHNO.CPP:3290`;
+`Report=` parsed at `WEAPON.CPP:210`). We now detect a shot by the rearm-timer
+jump (`arm` reset up to ROF, `TECHNO.CPP:3268`) — projectile and hitscan alike —
+and play the firing type's `Report=` AUD. Cosmetic-only: the report is resolved
+by `ra_data::combat::report_aud` and carried through the client's per-type
+fire-sound tables (`fire_reports_from_catalog`), never on the sim's
+`WeaponProfile`, so **zero** sim-hash / snapshot impact. Minor divergence: a
+dual-weapon unit's cue uses its **primary** `Report=` (we map by unit type, not
+by which of primary/secondary `select_weapon` chose). Unmapped/absent reports
+degrade to the generic `Fire` cue. Pin:
+`ra-client/tests/ui_weapon_sound_suite.rs` (a hitscan shot cues its own report,
+not CANNON1; and cues at all — the revert-drill on the arm-diff path).
+
+### Q32e — Dead units no longer keep a house "alive" (Fix 4)
+
+**Fixed, faithful.** `house_alive`'s unit arm was `units.any(|u| u.house ==
+house)` with no liveness check, so a health-0 corpse awaiting reap kept the house
+alive and blocked game-over ("I killed all units but the game isn't over"). The
+original defeat scan requires no *active* objects — `!ActiveBScan && !ActiveAScan
+&& !UScan && !ActiveIScan && !ActiveVScan` (`HouseClass::AI`, `HOUSE.CPP:1225-
+1226`), and the `Active*Scan` masks include only live, un-limboed objects. Fixed
+to `u.is_alive()`. The lead repro is the airborne case (the user's stuck game:
+enemy base with no water, a submerged sub excluded, but aircraft that were shot
+down): our sim has **no** lingering crash entity, matching the original — on
+`RESULT_DESTROYED` `AircraftClass::Take_Damage` spawns a separate
+`AnimClass(ANIM_FBALL1)` fireball and `delete this` in the same frame
+(`AIRCRAFT.CPP:1623-1644`); we model that fireball as a client-only cosmetic and
+reap the aircraft the tick it dies, so no dead-but-present aircraft ever keeps
+`is_alive()` true (there is no crash-fall period to delay game-over). Boarded
+passengers are removed from the arena (stowed as `cargo` snapshots on the
+transport), so a house whose last infantry ride a destroyed transport is
+correctly defeated — no orphan units. A house with a live building but no units
+is still alive (the original's `!ActiveBScan` is part of the AND — we do not
+overshoot). The multiplayer "Short Game" option (defeat when
+all *structures* fall, no last-unit hunt) is **deferred**: its option semantics
+are not in this GPL checkout to cite faithfully, and it needs a lobby/skirmish
+setting plumbed through net + menu. Pins: `ra-sim/tests/winlose_suite.rs`
+(corpse-does-not-count + revert-drill, bounded-ticks game-over after a real
+combat kill, buildings-only house stays alive).

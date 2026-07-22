@@ -48,17 +48,22 @@ pub const HOUSES: [(&str, u8); 8] = [
     ("SPAIN", 0),
 ];
 
-/// Player colour options (label + the house index whose remap gives that colour,
-/// per the radar palette). Lets colour be chosen independently of house.
+/// Player colour options (label + `PlayerColorType` / `PALETTE.CPS` row that
+/// paints it). These are the original's real eight schemes in enum order
+/// (`DEFINES.H:1226-1235`: GOLD=0, LTBLUE=1, RED=2, GREEN=3, ORANGE=4, BLUE=5,
+/// GREY=6, BROWN=7); the value is fed straight to `build_color_remaps` so the
+/// rendered colour matches the label. (The old table mislabelled every row —
+/// "BLUE"→3 actually selected GREEN's row, the reported bug — and offered
+/// PURPLE/TEAL, which RA has no schemes for, while omitting LTBLUE and BROWN.)
 pub const COLORS: [(&str, u8); 8] = [
-    ("GOLD", 1),
+    ("GOLD", 0),
+    ("LTBLUE", 1),
     ("RED", 2),
-    ("BLUE", 3),
-    ("GREEN", 4),
-    ("ORANGE", 5),
-    ("PURPLE", 6),
-    ("TEAL", 7),
-    ("GREY", 0),
+    ("GREEN", 3),
+    ("ORANGE", 4),
+    ("BLUE", 5),
+    ("GREY", 6),
+    ("BROWN", 7),
 ];
 
 /// Starting-credit steps.
@@ -99,7 +104,8 @@ pub struct ResolvedSkirmish {
     pub map_filename: String,
     /// Player house index.
     pub player_house: u8,
-    /// House index whose colour-remap paints the player's units.
+    /// Chosen player colour as a `PlayerColorType` / `PALETTE.CPS` row (0..8,
+    /// from [`COLORS`]); `build_color_remaps[color_house]` paints the units.
     pub color_house: u8,
     /// Starting credits.
     pub credits: i32,

@@ -8,8 +8,9 @@
 
 use ra_sim::coords::{CellCoord, Facing};
 use ra_sim::{
-    AirState, BuildingProto, Catalog, Command, EconRules, Handle, Locomotor, MoveStats,
-    Passability, Target, UnitKind, WarheadProfile, WeaponProfile, World, FLIGHT_LEVEL,
+    AiPlayer, AirState, BuildingProto, Catalog, Command, Difficulty, EconRules, GameOver, Handle,
+    Locomotor, MoveStats, Passability, Target, UnitKind, WarheadProfile, WeaponProfile, World,
+    FLIGHT_LEVEL,
 };
 
 // Building type ids in the fixture catalog.
@@ -263,6 +264,84 @@ fn aa_gun_downs_an_airborne_heli_but_a_pillbox_cannot() {
     // The AGUN was the shooter: it had acquired the heli at some point.
     let _ = agun;
     eprintln!("AA KILL: airborne heli crashed at tick {downed}");
+}
+
+/// M7.22 Fix 4 LEAD REPRO — "I killed all units but the game isn't over", the
+/// airborne case (the user's stuck game: enemy base had no water, a submerged sub
+/// was excluded, but the enemy still had aircraft that were shot down).
+///
+/// The enemy's ONLY remaining object is a single airborne aircraft. A player AA
+/// gun downs it. Assert the three layers the coordinator called out:
+///   (a) the shot-down aircraft **reaps** (leaves the arena) — our sim has no
+///       lingering "crash" entity, matching the original: on `RESULT_DESTROYED`,
+///       `AircraftClass::Take_Damage` spawns a separate `AnimClass(ANIM_FBALL1)`
+///       fireball and `delete this` in the same frame (AIRCRAFT.CPP:1623-1644).
+///       We model that fireball as a client-only cosmetic, so the sim removes the
+///       unit the tick it dies (same as every combat death). No dead-but-present
+///       aircraft ever keeps `is_alive()` true — there is no crash-fall period.
+///   (b) `house_alive(enemy)` flips false the instant it reaps.
+///   (c) `game_over` resolves Victory within a bounded window of the crash.
+#[test]
+fn shot_down_aircraft_reaps_and_resolves_victory() {
+    let mut w = world(0xA1C_0004);
+    // Player house 1: an AA gun. No other player units needed for the win check.
+    w.spawn_building(B_AGUN, 1, CellCoord::new(20, 20)).unwrap();
+    // Enemy house 2: its ONLY object is one airborne heli — no buildings.
+    let heli = spawn_heli(
+        &mut w,
+        2,
+        CellCoord::new(24, 22),
+        6,
+        None,
+        weapon(10, 20, 512),
+    );
+    w.set_player_house(1);
+    w.set_ai(vec![AiPlayer::new(2, Difficulty::Normal)]);
+
+    assert!(w.units.get(heli).unwrap().is_airborne());
+    // A live airborne aircraft keeps its house alive (it IS a live unit).
+    w.tick(&[]);
+    assert!(
+        w.house_alive(2),
+        "a live airborne aircraft keeps house 2 alive"
+    );
+    assert_eq!(w.game_over(), GameOver::Ongoing);
+
+    let mut crashed_at = None;
+    let mut victory_at = None;
+    for t in 0..800u32 {
+        w.tick(&[]);
+        if crashed_at.is_none() && !w.units.contains(heli) {
+            crashed_at = Some(t);
+            // (a) reaped, and (b) house_alive flips false in the SAME tick — no
+            // lingering corpse (the missing-`is_alive()` bug would keep it alive).
+            assert!(
+                !w.house_alive(2),
+                "the enemy's last unit reaped but house_alive(2) is still true \
+                 (dead-but-present unit — Fix 4)"
+            );
+        }
+        if w.game_over() != GameOver::Ongoing {
+            victory_at = Some(t);
+            break;
+        }
+    }
+    let crashed = crashed_at.expect("the AA gun must down the enemy's only aircraft");
+    let victory = victory_at.expect("game must resolve once the last enemy unit is gone");
+    assert_eq!(
+        w.game_over(),
+        GameOver::Victory,
+        "downing the enemy's last unit (an aircraft) must resolve Victory"
+    );
+    assert!(
+        victory - crashed <= 2,
+        "Victory must fire within a couple ticks of the crash (crash {crashed}, victory {victory})"
+    );
+    // (a) confirmed: the aircraft is gone, not lingering as a corpse.
+    assert!(
+        !w.units.contains(heli),
+        "the crashed aircraft must not linger"
+    );
 }
 
 // ===========================================================================

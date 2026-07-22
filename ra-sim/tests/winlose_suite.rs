@@ -15,7 +15,7 @@
 use ra_sim::coords::{CellCoord, Facing};
 use ra_sim::{
     AiPlayer, BuildingProto, Catalog, Command, Difficulty, EconRules, GameOver, Handle, MoveStats,
-    Passability, World,
+    Passability, Target, WarheadProfile, WeaponProfile, World,
 };
 
 /// The only building type in the test catalog: a cheap 1x1 "HUT". Win/lose
@@ -294,4 +294,138 @@ fn simultaneous_elimination_resolves_defeat_never_victory() {
          variant exists) — update_game_over checks the player's own elimination before ever \
          checking the AI houses"
     );
+}
+
+// ---------------------------------------------------------------------
+// M7.22 Fix 4: "I killed all units, but the game is not over."
+//
+// `house_alive`'s units arm used to be `units.any(|u| u.house == house)` with
+// NO liveness check, so a dead-but-not-yet-reaped unit (health 0) kept the
+// house alive and blocked game-over. The reference defeat scan
+// (`HouseClass::AI`, HOUSE.CPP:1225-1226) requires `!UScan && !ActiveIScan &&
+// !ActiveVScan && ...` — the `Active*Scan` masks only include LIVE objects.
+// ---------------------------------------------------------------------
+
+fn pct5(p: [i32; 5]) -> [i32; 5] {
+    let mut o = [0i32; 5];
+    for (d, v) in o.iter_mut().zip(p) {
+        *d = v * 65536 / 100;
+    }
+    o
+}
+
+/// A cheap, fast-firing weapon so a scripted kill resolves in a few ticks.
+fn quick_gun() -> WeaponProfile {
+    WeaponProfile {
+        damage: 200,
+        rof: 5,
+        range: 1216,
+        proj_speed: 102,
+        proj_rot: 0,
+        invisible: false,
+        instant: false,
+        warhead: WarheadProfile {
+            spread: 3,
+            verses: pct5([100, 100, 100, 100, 100]),
+        },
+        warhead_ap: false,
+        arcing: false,
+        ballistic_scatter: 256,
+        homing_scatter: 512,
+        min_damage: 1,
+        max_damage: 1000,
+    }
+}
+
+/// Directly pins the fix + its revert-drill: a corpse (health 0) still sitting
+/// in the arena must NOT keep its house alive. Restoring the old
+/// `units.any(|u| u.house == house)` (no `is_alive()`) fails this.
+#[test]
+fn dead_but_unreaped_unit_does_not_keep_house_alive() {
+    let mut w = world(0xDEAD_0001);
+    let u = w.spawn_unit(0, 2, CellCoord::new(40, 40), Facing(0), 100, stats());
+    assert!(w.house_alive(2), "a live unit keeps the house alive");
+
+    // Turn it into a corpse in place (health 0) without removing it — the exact
+    // dead-but-unreaped state the bug hinged on.
+    w.units.get_mut(u).unwrap().health = 0;
+    assert!(
+        !w.house_alive(2),
+        "a health-0 corpse must not count as a live unit (Fix 4)"
+    );
+}
+
+/// End-to-end through real combat + reap: house 1 guns down house 2's only
+/// unit (no buildings on either side means the win check is purely the units
+/// scan), and Victory must fire within a bounded tick budget after the kill.
+#[test]
+fn game_over_fires_within_bounded_ticks_after_last_unit_killed() {
+    let mut w = world(0xDEAD_0002);
+    let atk = w.spawn_unit(0, 1, CellCoord::new(20, 20), Facing(0), 400, stats());
+    w.set_unit_combat(atk, 3, Some(quick_gun()), true);
+    let victim = w.spawn_unit(0, 2, CellCoord::new(22, 20), Facing(0), 100, stats());
+    w.set_unit_combat(victim, 0, None, false);
+    w.set_player_house(1);
+    w.set_ai(vec![AiPlayer::new(2, Difficulty::Normal)]);
+
+    w.tick(&[Command::Attack {
+        unit: atk,
+        target: Target::Unit(victim),
+        house: 1,
+    }]);
+
+    // Bound: alignment + a couple of bullet flights + reap + the system-8 check.
+    let mut resolved_at = None;
+    for t in 0..80 {
+        w.tick(&[]);
+        if w.game_over() != GameOver::Ongoing {
+            resolved_at = Some(t);
+            break;
+        }
+    }
+    assert_eq!(
+        w.game_over(),
+        GameOver::Victory,
+        "killing the enemy's last unit must resolve Victory"
+    );
+    assert!(
+        !w.units.iter().any(|(_, u)| u.house == 2),
+        "the victim must actually be reaped, not lingering"
+    );
+    assert!(
+        resolved_at.is_some_and(|t| t < 80),
+        "game-over must fire within a bounded window after the last kill"
+    );
+}
+
+/// Do NOT overshoot: a house that has lost every unit but still owns a live
+/// building is NOT defeated (the original keeps the game going until the base
+/// is gone too — `!ActiveBScan` is part of the AND). Killing all units while a
+/// structure stands must leave the game Ongoing.
+#[test]
+fn buildings_only_house_is_still_alive() {
+    let mut w = world(0xDEAD_0003);
+    let (_pb, _pu) = give_house_assets(&mut w, 1, CellCoord::new(20, 20));
+    let (ab, au) = give_house_assets(&mut w, 2, CellCoord::new(60, 60));
+    w.set_player_house(1);
+    w.set_ai(vec![AiPlayer::new(2, Difficulty::Normal)]);
+
+    // Kill only the enemy's unit; its building still stands.
+    w.units.get_mut(au).unwrap().health = 0;
+    assert!(
+        w.house_alive(2),
+        "a house with a live building but no units is still alive"
+    );
+
+    w.tick(&[]);
+    assert_eq!(
+        w.game_over(),
+        GameOver::Ongoing,
+        "killing all units but leaving a building must NOT end the game"
+    );
+
+    // Finish the base off: now it resolves.
+    w.buildings.remove(ab);
+    w.tick(&[]);
+    assert_eq!(w.game_over(), GameOver::Victory);
 }

@@ -570,7 +570,11 @@ impl World {
 
     /// Whether `house` is still alive — it owns at least one live building **or**
     /// one live unit. Elimination is "all buildings AND all units destroyed"
-    /// (the classic MP defeat check, `house.cpp:1290`).
+    /// (the classic MP defeat check, `HouseClass::AI` at `HOUSE.CPP:1225-1226`:
+    /// `!ActiveBScan && !ActiveAScan && !UScan && !ActiveIScan && !ActiveVScan`
+    /// — no *active* structures, aircraft, units, infantry, or vessels). The
+    /// `Active*Scan` masks only include live, un-limboed objects, so a
+    /// dead-but-not-yet-reaped unit must NOT keep the house alive.
     pub fn house_alive(&self, house: u8) -> bool {
         // Walls (SBAG/CYCL/BRIK) are modeled as 1×1 buildings but are *not* base
         // structures — a house whose only remaining "buildings" are walls is
@@ -579,7 +583,16 @@ impl World {
         self.buildings
             .iter()
             .any(|(_, b)| b.house == house && b.is_alive() && !b.is_wall)
-            || self.units.iter().any(|(_, u)| u.house == house)
+            // `u.is_alive()` mirrors the `UScan`/`ActiveIScan`/`ActiveVScan`
+            // "active object" gate: a corpse (health 0) awaiting reap is not an
+            // active unit and never blocks defeat. Boarded passengers are removed
+            // from the arena (stowed as `cargo` snapshots on the transport, see
+            // `board_passenger`), so a house whose last infantry are inside a
+            // destroyed transport is correctly defeated.
+            || self
+                .units
+                .iter()
+                .any(|(_, u)| u.house == house && u.is_alive())
     }
 
     /// Read a house's credits (0 if the house index is out of range).
@@ -6881,7 +6894,10 @@ fn move_units(world: &mut World) {
                 .get(handle)
                 .map(|u| eff_speed(u.stats.max_speed))
                 .unwrap_or(0);
-            let (nc, _) = advance_along_path(coord, path, budget);
+            let (raw_nc, _) = advance_along_path(coord, path, budget);
+            // Re-attribute a diagonal corner-graze to its on-path waypoint so a
+            // squeeze past a building/wall corner is not falsely blocked (Fix 2a).
+            let nc = nudge_corner_graze(raw_nc, path, start_cell, world, grid, handle, loco);
             let land = nc.cell();
             if land == start_cell {
                 return (nc, false, None);
@@ -7029,13 +7045,29 @@ fn move_units(world: &mut World) {
             }
         }
 
+        // Consume the waypoints the (final) advance fully reached, applying the
+        // same diagonal corner-graze nudge as `is_blocked` (computed here, before
+        // the mutable unit borrow, since the nudge reads `&World`) so the applied
+        // coord matches `new_coord`. The nudge never changes `consumed` (a grazing
+        // step has not fully reached its waypoint).
+        let (coord_now, path_now, budget_now) = match world.units.get(handle) {
+            Some(u) => (u.coord, u.path.clone(), eff_speed(u.stats.max_speed)),
+            None => continue,
+        };
+        let (raw_applied, consumed) = advance_along_path(coord_now, &path_now, budget_now);
+        let applied_coord = nudge_corner_graze(
+            raw_applied,
+            &path_now,
+            start_cell,
+            world,
+            &grid,
+            handle,
+            loco,
+        );
+        debug_assert_eq!(applied_coord, new_coord);
         let Some(unit) = world.units.get_mut(handle) else {
             continue;
         };
-        // Consume the waypoints the (final) advance fully reached.
-        let (applied_coord, consumed) =
-            advance_along_path(unit.coord, &unit.path, eff_speed(unit.stats.max_speed));
-        debug_assert_eq!(applied_coord, new_coord);
         // Record real progress (coord changed) for the head-on tie-break's
         // "already advanced this tick" guard. Vehicles only — infantry never drive
         // the vehicle tie-break.
@@ -7433,6 +7465,46 @@ fn advance_along_path(
         }
     }
     (c, consumed)
+}
+
+/// Re-attribute a diagonal corner-graze landing to its on-path waypoint (M7.22
+/// Fix 2a). A pure-diagonal step between diagonally-adjacent cells passes through
+/// the exact shared corner, whose floor-rounded `cell()` can be an OFF-PATH
+/// perpendicular neighbour (a building/wall corner). The original checks only
+/// each step's destination cell (`Can_Enter_Cell(destcell)`, DRIVE.CPP:1082) and
+/// permits diagonal squeezes past corner-touching STATIC blockers, so grazing a
+/// building's corner must not block. When `nc` lands off-path (not a cell this
+/// path routes through) and the grazed cell holds no other vehicle, nudge `nc`
+/// just past the corner into the waypoint cell; otherwise return it unchanged —
+/// so a *vehicle* in the grazed cell still blocks (one-per-cell, QUIRKS Q30) and
+/// every non-grazing step is byte-identical. Shared by the movement validation
+/// (`is_blocked`) and the application so both agree on the landing coord.
+fn nudge_corner_graze(
+    nc: WorldCoord,
+    path: &[CellCoord],
+    start_cell: CellCoord,
+    world: &World,
+    grid: &UnitGrid,
+    handle: Handle,
+    loco: Locomotor,
+) -> WorldCoord {
+    let land = nc.cell();
+    if land == start_cell || path.contains(&land) {
+        return nc;
+    }
+    let Some(&wp) = path.first() else {
+        return nc;
+    };
+    let grazed_vehicle = grid.vehicle_at(land).filter(|&h| h != handle).is_some();
+    if grazed_vehicle || !world.passable.is_passable_loco(wp, loco) {
+        return nc;
+    }
+    let lo_x = wp.x * LEPTONS_PER_CELL;
+    let lo_y = wp.y * LEPTONS_PER_CELL;
+    WorldCoord::new(
+        nc.x.0.clamp(lo_x, lo_x + LEPTONS_PER_CELL - 1),
+        nc.y.0.clamp(lo_y, lo_y + LEPTONS_PER_CELL - 1),
+    )
 }
 
 /// The number of "excess" vehicles sharing cells — `sum over cells of

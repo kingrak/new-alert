@@ -248,8 +248,15 @@ enum EffectKind {
 /// cue never draws sim RNG, so audio on/off leaves the sim hash chain identical.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SoundEvent {
-    /// A weapon was fired (a projectile spawned).
+    /// A weapon was fired, but its `Report=` names no sound we map — the generic
+    /// fallback cue (`CANNON1.AUD`), preserving the pre-M7.22 behaviour.
     Fire,
+    /// A specific weapon fired: its `Report=` AUD name (e.g. `"GUN11.AUD"` for
+    /// the rifle). Carries the interned name straight from `ra_data`'s weapon
+    /// table so the shell plays the right per-weapon sound for BOTH projectile
+    /// and hitscan shots (`TechnoClass::Fire_At` plays `weapon->Sound` on every
+    /// shot regardless of bullet type, `TECHNO.CPP:3290`).
+    WeaponFire(&'static str),
     /// A unit or building was destroyed.
     Explosion,
     /// The player placed/finished a structure.
@@ -303,6 +310,15 @@ pub enum SoundEvent {
     /// left-clicking a cameo whose factory lane is already busy
     /// (`VOX_NO_FACTORY` = `PROGRES1.AUD`, `SIDEBAR.CPP:2204/2216`). (M7.21)
     NoFactory,
+}
+
+/// Pick the fire-sound cue for a weapon's resolved `Report=` AUD (or the generic
+/// [`SoundEvent::Fire`] when the weapon has no mapped report). (M7.22 Fix 3)
+fn fire_event(report: Option<&'static str>) -> SoundEvent {
+    match report {
+        Some(aud) => SoundEvent::WeaponFire(aud),
+        None => SoundEvent::Fire,
+    }
 }
 
 /// The logical mouse-cursor the UI wants shown, derived from the armed action
@@ -471,6 +487,12 @@ pub struct AppCore {
     /// Per-unit-type infantry animation layout, indexed by `Unit::type_id`
     /// (`None` = a vehicle). Drives the Do-table frame selection in `draw_units`.
     infantry_anim: Vec<Option<InfantryAnim>>,
+    /// Per-unit-type fire-sound AUD name (`Report=`), indexed by `Unit::type_id`.
+    /// Empty until installed; a missing/`None` entry falls back to the generic
+    /// fire cue. Cosmetic — never read by the sim (M7.22 Fix 3).
+    unit_fire_reports: Vec<Option<&'static str>>,
+    /// Per-building-type fire-sound AUD name (`Report=`), indexed by type id.
+    building_fire_reports: Vec<Option<&'static str>>,
     /// The buildable items the sidebar lists, in display order.
     buildables: Vec<BuildItem>,
     /// Active placement mode: a completed building type id awaiting a map click.
@@ -617,6 +639,8 @@ impl AppCore {
             building_sprites: Vec::new(),
             building_overlays: Vec::new(),
             infantry_anim: Vec::new(),
+            unit_fire_reports: Vec::new(),
+            building_fire_reports: Vec::new(),
             buildables: Vec::new(),
             placing: None,
             show_help: false,
@@ -865,6 +889,18 @@ impl AppCore {
     /// selection in the unit renderer.
     pub fn set_infantry_anim(&mut self, anim: Vec<Option<InfantryAnim>>) {
         self.infantry_anim = anim;
+    }
+
+    /// Install the per-type fire-sound tables (`Report=`), indexed by unit and
+    /// building type id (M7.22 Fix 3). Cosmetic — drives which weapon report the
+    /// fire cue plays; never touches the sim.
+    pub fn set_fire_reports(
+        &mut self,
+        unit_reports: Vec<Option<&'static str>>,
+        building_reports: Vec<Option<&'static str>>,
+    ) {
+        self.unit_fire_reports = unit_reports;
+        self.building_fire_reports = building_reports;
     }
 
     /// Optional overlay shapes drawn over the base building sprite (the war
@@ -1417,7 +1453,28 @@ impl AppCore {
                 is_repairing: b.is_repairing,
             })
             .collect();
-        let prev_bullets: Vec<Handle> = self.world.bullets.iter().map(|(h, _)| h).collect();
+        // Pre-tick rearm timers for every armed unit/building, keyed by arena
+        // slot index → (generation, arm). A shot resets `arm` up to the weapon's
+        // ROF (`Arm = Rearm_Delay`, TECHNO.CPP:3268), so after the tick any object
+        // whose `arm` jumped *up* (from a live earlier value) fired this tick —
+        // the fire-sound analogue of the muzzle-flash detection in `draw_units`,
+        // but exactly once per shot and independent of whether a bullet persists
+        // (hitscan weapons leave none). The generation guards against a slot being
+        // reused by a freshly spawned object within the same tick.
+        let prev_unit_arm: BTreeMap<u32, (u32, u16)> = self
+            .world
+            .units
+            .iter()
+            .filter(|(_, u)| u.weapon.is_some())
+            .map(|(h, u)| (h.index, (h.gen, u.arm)))
+            .collect();
+        let prev_building_arm: BTreeMap<u32, (u32, u16)> = self
+            .world
+            .buildings
+            .iter()
+            .filter(|(_, b)| b.weapon.is_some())
+            .map(|(h, b)| (h.index, (h.gen, b.arm)))
+            .collect();
         // Superweapon effect snapshots (marquee arc P2): pending nuke ground-zeros,
         // and the set of units/buildings already under an iron curtain, so the
         // post-tick diff can fire the launch/impact/curtain cosmetics. Cheap and
@@ -1454,15 +1511,49 @@ impl AppCore {
         // even in single player, so stages 2/3 inherit a battle-tested core).
         self.transport.report_hash(tick, hash);
 
-        // New projectiles → a fire cue (covers visible cannon shots; hitscan
-        // weapons are represented by the muzzle flash instead).
-        let fired = self
-            .world
-            .bullets
-            .iter()
-            .any(|(h, _)| !prev_bullets.contains(&h));
-        if fired {
-            self.push_sound(SoundEvent::Fire);
+        // Fire cues (M7.22 Fix 3). The original plays each weapon's own
+        // `Report=` sound on every shot — projectile *and* hitscan — at the fire
+        // chokepoint (`TechnoClass::Fire_At` → `Sound_Effect(weapon->Sound)`,
+        // TECHNO.CPP:3290). We detect a shot by the rearm-timer jump (`arm` reset
+        // up to ROF) rather than by a new bullet, so hitscan weapons (rifles,
+        // MGs, tesla, pillbox) — which leave no persistent projectile — cue too.
+        // Each firer's per-type `Report=` picks the sound; unmapped/absent reports
+        // degrade to the generic `Fire` cue (the pre-M7.22 `CANNON1` behaviour).
+        let mut fire_cues: Vec<SoundEvent> = Vec::new();
+        for (h, u) in self.world.units.iter() {
+            if u.weapon.is_none() {
+                continue;
+            }
+            if let Some(&(gen, prev)) = prev_unit_arm.get(&h.index) {
+                if gen == h.gen && u.arm > prev {
+                    let report = self
+                        .unit_fire_reports
+                        .get(u.type_id as usize)
+                        .copied()
+                        .flatten();
+                    fire_cues.push(fire_event(report));
+                }
+            }
+        }
+        for (h, b) in self.world.buildings.iter() {
+            if b.weapon.is_none() {
+                continue;
+            }
+            if let Some(&(gen, prev)) = prev_building_arm.get(&h.index) {
+                if gen == h.gen && b.arm > prev {
+                    let report = self
+                        .building_fire_reports
+                        .get(b.type_id as usize)
+                        .copied()
+                        .flatten();
+                    fire_cues.push(fire_event(report));
+                }
+            }
+        }
+        // Dedup per distinct sound (`push_sound` collapses a same-type burst to
+        // one cue this frame), matching the old single-`Fire`-per-tick behaviour.
+        for ev in fire_cues {
+            self.push_sound(ev);
         }
 
         let player = self.player_house;

@@ -14,7 +14,8 @@ use std::path::Path;
 use ra_data::buildings::building_stats;
 use ra_data::combat::{resolve_unit_combat, resolve_weapon, WeaponDef};
 use ra_data::house::{
-    build_house_remaps, house_from_name, identity_remap, RemapTable, HOUSE_COUNT,
+    build_color_remaps, build_house_remaps, house_from_name, identity_remap, RemapTable,
+    HOUSE_COUNT,
 };
 use ra_data::rules::unit_stats;
 use ra_data::scenario::{parse_units, Scenario};
@@ -948,6 +949,8 @@ pub fn load_campaign_from_bytes(
     core.set_building_sprites(building_sprites);
     core.set_building_overlays(building_overlays);
     core.set_infantry_anim(infantry_anim);
+    let (ufr, bfr) = fire_reports_from_catalog(&catalog, &rules);
+    core.set_fire_reports(ufr, bfr);
     // Sidebar with the standard buildables (mission 1 has no yard, so it is inert
     // — authentic: you fight with what you're given).
     core.enable_sidebar(player_house, content.buildables.clone());
@@ -1689,6 +1692,20 @@ pub fn load_sound_bank(dir: &Path) -> Vec<(SoundEvent, Vec<u8>)> {
             }
         }
     }
+    // Per-weapon fire sounds (M7.22 Fix 3): every distinct `Report=` AUD our
+    // shipped weapons name (`ra_data::combat::REPORT_AUDS`). Each is a
+    // `SoundEvent::WeaponFire(name)` keyed by the interned AUD name, so the shell
+    // plays the right report for both projectile and hitscan shots. All live in
+    // sounds.mix; a silently-absent one is simply skipped (graceful degrade).
+    if let Some(sounds) = sounds.as_ref() {
+        for name in ra_data::combat::REPORT_AUDS {
+            if let Some(bytes) = sounds.get(name) {
+                if let Ok(clip) = ra_formats::aud::decode(bytes) {
+                    out.push((SoundEvent::WeaponFire(name), ra_formats::aud::to_wav(&clip)));
+                }
+            }
+        }
+    }
     out
 }
 
@@ -2224,6 +2241,8 @@ pub fn load_econ_from_bytes(
     core.set_building_sprites(content.building_sprites);
     core.set_building_overlays(content.building_overlays);
     core.set_infantry_anim(content.infantry_anim.clone());
+    let (ufr, bfr) = fire_reports_from_catalog(&content.catalog, &rules);
+    core.set_fire_reports(ufr, bfr);
     core.enable_sidebar(controlled, content.buildables.clone());
     // M7 cosmetic art (ore/gem tiles, explosion/buildup anims, cameos, radar) so
     // the econ view shows real ore fields thinning as they are harvested.
@@ -2424,16 +2443,23 @@ pub fn load_skirmish_configured(
     spawn_mcv(&mut world, player_house, player_start);
     spawn_mcv(&mut world, ai_house, ai_start);
 
-    // Player colour choice: paint the player's units with the chosen house's
-    // remap (captured before `remaps` is moved into the core).
-    let player_color = settings
-        .color_house
-        .and_then(|c| remaps.get(c as usize).copied());
+    // Player colour choice: paint the player's units with the chosen
+    // `PlayerColorType` remap. `color_house` now carries a raw colour row
+    // (`PALETTE.CPS` row 0..8), so it must index the **colour**-keyed tables, not
+    // the house-keyed `remaps` (whose Germany/France rows differ from the raw
+    // blue/grey rows). Built from the same palette.cps opened above.
+    let player_color = settings.color_house.and_then(|c| {
+        let cps_bytes = local.get("palette.cps")?;
+        let cps = Cps::parse(cps_bytes).ok()?;
+        build_color_remaps(&cps).get(c as usize).copied()
+    });
 
     let mut core = AppCore::with_sim(raster, palette, world, content.unit_sprites, remaps);
     core.set_building_sprites(content.building_sprites);
     core.set_building_overlays(content.building_overlays);
     core.set_infantry_anim(content.infantry_anim.clone());
+    let (ufr, bfr) = fire_reports_from_catalog(&content.catalog, &rules);
+    core.set_fire_reports(ufr, bfr);
     core.enable_sidebar(player_house, content.buildables.clone());
     core.set_classic_radar(settings.classic_radar);
     if let Some(table) = player_color {
@@ -2562,6 +2588,8 @@ pub fn load_lan_configured(
     core.set_building_sprites(content.building_sprites);
     core.set_building_overlays(content.building_overlays);
     core.set_infantry_anim(content.infantry_anim.clone());
+    let (ufr, bfr) = fire_reports_from_catalog(&content.catalog, &rules);
+    core.set_fire_reports(ufr, bfr);
     core.enable_sidebar(spec.local_house, content.buildables.clone());
 
     let theater_mix = main.open_nested(scenario.theater.mix_name()).ok();
@@ -2768,6 +2796,34 @@ pub fn weapon_to_profile(w: &WeaponDef) -> ra_sim::WeaponProfile {
         min_damage: w.min_damage,
         max_damage: w.max_damage,
     }
+}
+
+/// Resolve the per-type fire-sound tables (`Report=`) for a finished catalog,
+/// indexed by unit and building type id (M7.22 Fix 3). Reads each type's
+/// `Primary=` weapon's `Report=` from `rules` by name, so it works uniformly for
+/// the skirmish and campaign loaders regardless of how scenario-specific types
+/// were appended. Cosmetic — never handed to the sim. Returns
+/// `(unit_reports, building_reports)`.
+pub fn fire_reports_from_catalog(
+    catalog: &Catalog,
+    rules: &Ini,
+) -> (Vec<Option<&'static str>>, Vec<Option<&'static str>>) {
+    let unit_reports = catalog
+        .units
+        .iter()
+        .map(|u| resolve_unit_combat(rules, &u.name).and_then(|c| c.weapon.and_then(|w| w.report)))
+        .collect();
+    let building_reports = catalog
+        .buildings
+        .iter()
+        .map(|b| {
+            rules
+                .get(&b.name, "Primary")
+                .and_then(|w| resolve_weapon(rules, w))
+                .and_then(|w| w.report)
+        })
+        .collect();
+    (unit_reports, building_reports)
 }
 
 // ===========================================================================

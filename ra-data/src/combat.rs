@@ -77,6 +77,67 @@ pub struct WeaponDef {
     pub min_damage: i32,
     /// `[General] MaxDamage`.
     pub max_damage: i32,
+    /// The weapon's fire-sound AUD (`Report=`, `WeaponTypeClass::Read_INI`,
+    /// `WEAPON.CPP:210`; played on every shot in `TechnoClass::Fire_At`,
+    /// `TECHNO.CPP:3290`), interned to a `'static` name so `WeaponDef` stays
+    /// `Copy`. `None` when the weapon has no `Report=` or names a sound we do not
+    /// ship a mapping for (degrades to the generic fire cue). Cosmetic only — the
+    /// sim never reads it, so it never touches the hash.
+    pub report: Option<&'static str>,
+}
+
+/// Every distinct weapon-fire AUD [`report_aud`] can return — the set of
+/// per-weapon fire sounds the client needs to load. Kept beside `report_aud` so
+/// the two stay in sync (a debug assertion in `report_aud`'s tests checks that).
+pub const REPORT_AUDS: [&str; 18] = [
+    "GUN5.AUD",
+    "GUN11.AUD",
+    "GUN13.AUD",
+    "GUN27.AUD",
+    "SILENCER.AUD",
+    "MISSILE6.AUD",
+    "MISSILE7.AUD",
+    "MISSILE1.AUD",
+    "CANNON1.AUD",
+    "CANNON2.AUD",
+    "TURRET1.AUD",
+    "TANK5.AUD",
+    "PILLBOX1.AUD",
+    "TESLA1.AUD",
+    "AACANON3.AUD",
+    "TORPEDO1.AUD",
+    "DOGG5P.AUD",
+    "HEAL2.AUD",
+];
+
+/// Map a rules.ini `Report=` value to the `.AUD` name to play, restricted to the
+/// weapon reports our shipped units actually name (each verified present in
+/// `sounds.mix`). Returns `None` for an absent/unknown report so the caller can
+/// fall back to the generic fire cue. The `Report=` value in RA *is* the AUD
+/// basename (`WeaponTypeClass::Sound`, a `VocType` resolved by name), so this is
+/// a faithful, data-shaped lookup — just gated to sounds we've confirmed exist.
+pub fn report_aud(report: &str) -> Option<&'static str> {
+    Some(match report.trim().to_ascii_uppercase().as_str() {
+        "GUN5" => "GUN5.AUD",         // Colt45 (Tanya/officer pistol)
+        "GUN11" => "GUN11.AUD",       // M1Carbine — rifle infantry (E1)
+        "GUN13" => "GUN13.AUD",       // Vulcan / ChainGun — machine gun
+        "GUN27" => "GUN27.AUD",       // Pistol (civilian)
+        "SILENCER" => "SILENCER.AUD", // Sniper
+        "MISSILE6" => "MISSILE6.AUD", // Dragon/Hellfire/MammothTusk/Stinger
+        "MISSILE7" => "MISSILE7.AUD", // Maverick
+        "MISSILE1" => "MISSILE1.AUD", // Nike/RedEye/SCUD
+        "CANNON1" => "CANNON1.AUD",   // 90mm/105mm/120mm
+        "CANNON2" => "CANNON2.AUD",   // 75mm / 2Inch (destroyer)
+        "TURRET1" => "TURRET1.AUD",   // TurretGun / 8Inch (cruiser)
+        "TANK5" => "TANK5.AUD",       // 155mm artillery
+        "PILLBOX1" => "PILLBOX1.AUD", // M60mg (vehicle MG)
+        "TESLA1" => "TESLA1.AUD",     // Tesla coil zap
+        "AACANON3" => "AACANON3.AUD", // ZSU-23 flak
+        "TORPEDO1" => "TORPEDO1.AUD", // submarine torpedo
+        "DOGG5P" => "DOGG5P.AUD",     // attack dog bite
+        "HEAL2" => "HEAL2.AUD",       // medic heal
+        _ => return None,
+    })
 }
 
 /// Parse an ASCII fixed-point number into raw 16.16, matching `fixed(char const*)`
@@ -232,6 +293,10 @@ pub fn resolve_weapon(rules: &Ini, weapon_name: &str) -> Option<WeaponDef> {
     let ballistic_scatter = get_lepton(rules, "General", "BallisticScatter", 256);
     let homing_scatter = get_lepton(rules, "General", "HomingScatter", 512);
 
+    // Per-weapon fire sound (`Report=`). Cosmetic; `None` degrades to the
+    // generic cue in the client.
+    let report = rules.get(weapon_name, "Report").and_then(report_aud);
+
     Some(WeaponDef {
         damage,
         rof,
@@ -248,6 +313,7 @@ pub fn resolve_weapon(rules: &Ini, weapon_name: &str) -> Option<WeaponDef> {
         homing_scatter,
         min_damage,
         max_damage,
+        report,
     })
 }
 
