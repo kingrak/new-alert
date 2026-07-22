@@ -59,7 +59,7 @@ pub mod scheduler;
 pub mod transport;
 pub mod wire;
 
-pub use lan::{LanTransport, PEER_TIMEOUT, REDUNDANT_TICKS};
+pub use lan::{LanTransport, ResyncEvent, PEER_TIMEOUT, REDUNDANT_TICKS, RESYNC_MAX_ATTEMPTS};
 pub use lobby::{
     DiscoveredSession, DiscoveryConfig, HostLobby, JoinLobby, SessionBrowser, SessionSettings,
     WelcomeInfo,

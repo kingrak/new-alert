@@ -357,3 +357,73 @@ fn real_scenario_ai_vs_ai_lan_lockstep_hash_identical() {
     assert!(tp_a.desync().is_none() && tp_b.desync().is_none());
     assert!(tp_a.connection_lost().is_none() && tp_b.connection_lost().is_none());
 }
+
+/// M8-C P2a — **real-map mid-game snapshot round-trip.** Load an actual
+/// scenario, install two skirmish AIs so a genuine mid-game develops (buildings,
+/// production, units, combat, ore growth, shroud — the full state a snapshot must
+/// capture), then `save_snapshot` → `load_snapshot` and prove the loaded world
+/// produces the byte-identical hash chain for 200 further ticks. Skips cleanly
+/// when the real assets are absent.
+#[test]
+fn realmap_midgame_snapshot_roundtrip() {
+    if !support::real_assets_available() {
+        eprintln!(
+            "SKIP: real assets not found under {} (set RA_ASSETS_DIR or copy \
+             main.mix/redalert.mix into assets/ to run this test)",
+            support::assets_dir().display()
+        );
+        return;
+    }
+    let dir = support::assets_dir();
+    let main_bytes = std::fs::read(dir.join("main.mix")).expect("main.mix should read");
+    let redalert_bytes = std::fs::read(dir.join("redalert.mix")).expect("redalert.mix should read");
+
+    let game = load_headless_world(&main_bytes, &redalert_bytes, SCENARIO, CREDITS)
+        .expect("headless world should load");
+    let mut world = game.world;
+    world.set_player_house(game.house_a);
+    world.set_ai(vec![
+        AiPlayer::new(game.house_a, Difficulty::Normal),
+        AiPlayer::new(game.house_b, Difficulty::Normal),
+    ]);
+
+    // Advance to a rich mid-game state.
+    let warmup = 400u32;
+    for _ in 0..warmup {
+        world.tick(&[]);
+    }
+
+    // Round-trip the snapshot against this peer's own shared catalog + map.
+    let bytes = world.save_snapshot();
+    eprintln!(
+        "realmap mid-game snapshot: {} bytes at tick {}",
+        bytes.len(),
+        world.tick_count()
+    );
+    let mut loaded =
+        World::load_snapshot(&bytes, world.catalog().clone(), world.passability().clone())
+            .expect("snapshot must load");
+    assert_eq!(
+        world.state_hash(),
+        loaded.state_hash(),
+        "loaded real-map world must hash-match at the snapshot tick"
+    );
+
+    // Hash-chain identity for 200 further ticks (AI keeps running on both).
+    let mut chain = Vec::new();
+    for t in 0..200u32 {
+        let h0 = world.tick(&[]);
+        let h1 = loaded.tick(&[]);
+        assert_eq!(
+            h0, h1,
+            "real-map hash chain diverged {t} ticks after resume"
+        );
+        chain.push(h0);
+    }
+    let distinct: std::collections::BTreeSet<u64> = chain.iter().copied().collect();
+    assert!(
+        distinct.len() > 50,
+        "post-snapshot chain suspiciously static ({} distinct of 200)",
+        distinct.len()
+    );
+}

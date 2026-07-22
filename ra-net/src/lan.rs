@@ -83,6 +83,102 @@ pub const PEER_TIMEOUT: Duration = Duration::from_secs(10);
 /// few windows can never legitimately be re-requested.
 const SENT_KEEP_TICKS: u32 = 64;
 
+/// Max resync attempts before falling back to the terminal "OUT OF SYNC" end
+/// (DESIGN.md §3.6 "never an infinite resync loop"). Attempt ids run `0..CAP`.
+pub const RESYNC_MAX_ATTEMPTS: u8 = 2;
+
+/// Wall-clock budget for one resync attempt (transfer + load). Exceeding it
+/// counts as a failed attempt: retry, or — past the cap — fail over to the
+/// desync end. Never a hang.
+const RESYNC_TIMEOUT: Duration = Duration::from_secs(8);
+
+/// Pacing for resync re-sends (OFFER/CHUNK re-transmit, ACK cadence). The
+/// appcore drives `resync_poll` at frame rate; this throttles the actual wire
+/// traffic so a slow load doesn't flood the link.
+const RESYNC_ACTION_INTERVAL: Duration = Duration::from_millis(40);
+
+/// Once the loser has ACKed a complete chunk set, the host waits this long for
+/// the explicit DONE before resuming optimistically — so an all-dropped DONE
+/// burst still completes the resync (a genuine load failure sends DONE{ok=false}
+/// first, which arrives well inside this grace).
+const RESYNC_CONFIRM_GRACE: Duration = Duration::from_millis(600);
+
+/// How many copies of the terminal DONE the loser bursts (loss tolerance).
+const DONE_BURST: usize = 5;
+
+/// What [`LanTransport::resync_poll`] tells the appcore to do next.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ResyncEvent {
+    /// Snapshot transfer under way — keep the "RESYNCHRONIZING..." overlay up.
+    Transferring,
+    /// Loser only, emitted once: the full snapshot has arrived. The caller must
+    /// `World::load_snapshot` it, verify the loaded hash equals `declared_hash`,
+    /// and report the outcome via [`LanTransport::resync_report_loaded`].
+    NeedsLoad {
+        /// The reassembled snapshot bytes.
+        bytes: Vec<u8>,
+        /// The tick both peers resume lockstep from.
+        resume_tick: Tick,
+        /// The host's declared state hash to verify the load against.
+        declared_hash: u64,
+    },
+    /// Resync succeeded: normal lockstep resumes at `resume_tick`. The caller
+    /// sets its loop tick to this (the host keeps its world; the loser uses the
+    /// world it just loaded) and shows the "GAME RESYNCED" toast.
+    Resumed {
+        /// The resumed tick.
+        resume_tick: Tick,
+    },
+    /// Resync failed past the attempt cap — fall back to the terminal desync
+    /// end ([`PollResult::Desync`] is still latched).
+    Failed,
+}
+
+/// The host's or loser's private transfer state.
+#[derive(Debug)]
+enum ResyncSide {
+    /// Authoritative peer: owns the snapshot, chunked; serves it on demand.
+    Host {
+        chunks: Vec<Vec<u8>>,
+        chunk_size: u16,
+        total_len: u32,
+        /// Chunk seqs still to (re)send — all of them until the loser ACKs.
+        pending: Vec<u32>,
+        /// When the loser first reported a complete set (grace timer start).
+        all_acked_at: Option<Instant>,
+        /// Set when a DONE (ok or fail) arrives.
+        done: Option<bool>,
+    },
+    /// Desynced peer: fills the chunk buffer, then loads + verifies.
+    Loser {
+        got_offer: bool,
+        chunk_size: u16,
+        n_chunks: u32,
+        received: Vec<Option<Vec<u8>>>,
+        have: u32,
+        /// Set by [`LanTransport::resync_report_loaded`].
+        loaded: Option<bool>,
+        /// Whether `NeedsLoad` has been emitted (emit once per attempt).
+        emitted_needs_load: bool,
+    },
+}
+
+/// An in-progress resync (M8-C P1). Lives beside the lockstep state; the sim is
+/// paused while it runs.
+#[derive(Debug)]
+struct Resync {
+    side: ResyncSide,
+    attempt: u8,
+    resume_tick: Tick,
+    declared_hash: u64,
+    /// Attempt start (timeout clock).
+    started: Instant,
+    /// Last wire action (pacing).
+    last_action: Instant,
+    /// Terminal flags.
+    failed: bool,
+}
+
 /// One endpoint of a two-player UDP lockstep session.
 #[derive(Debug)]
 pub struct LanTransport {
@@ -141,6 +237,21 @@ pub struct LanTransport {
     nacks_answered: u64,
     /// Datagrams that failed to decode (ignored, counted).
     decode_errors: u64,
+    /// In-progress resync, if any (M8-C P1). `None` during normal play.
+    resync: Option<Resync>,
+    /// Completed resyncs (observability: the e2e drill asserts this incremented,
+    /// proving the game self-healed rather than vacuously never desyncing).
+    resyncs_completed: u64,
+    /// Revert-drill knob (proof test f): when `false`, [`LanTransport::resume_at`]
+    /// keeps the stale scheduler/command windows instead of clearing them, so a
+    /// test can prove the window re-stamp is load-bearing (chains diverge without
+    /// it). Production always resumes with cleared windows.
+    resume_clear_windows: bool,
+    /// The tick lockstep last (re)started from: `0` at game start, or the resume
+    /// tick after a resync. The first `delay` ticks from here carry no peer
+    /// bundle by protocol (a fresh scheduler's earliest stamp lands at
+    /// `resume_base + delay`), exactly as ticks `0..delay` are empty at start.
+    resume_base: Tick,
 }
 
 impl LanTransport {
@@ -191,12 +302,22 @@ impl LanTransport {
             nacks_sent: 0,
             nacks_answered: 0,
             decode_errors: 0,
+            resync: None,
+            resyncs_completed: 0,
+            resume_clear_windows: true,
+            resume_base: 0,
         })
     }
 
     /// This endpoint's seat id.
     pub fn seat(&self) -> SeatId {
         self.seat
+    }
+
+    /// Whether this endpoint hosts the session — the authoritative peer on a
+    /// 2-player desync (it serves its snapshot; the joiner resyncs to it, §4.6).
+    pub fn is_host(&self) -> bool {
+        self.is_host
     }
 
     /// The latched divergence state, if any.
@@ -294,6 +415,311 @@ impl LanTransport {
         for _ in 0..3 {
             let _ = self.sock.send_to(&bytes, self.peer);
         }
+    }
+
+    // -- resync (M8-C P1) ---------------------------------------------------
+
+    /// Whether a resync is in progress (the sim is paused; drive it with
+    /// [`LanTransport::resync_poll`], not [`CommandTransport::poll`]).
+    pub fn resync_active(&self) -> bool {
+        self.resync.is_some()
+    }
+
+    /// Resyncs that completed successfully (self-heals). The forced-desync drill
+    /// asserts this incremented.
+    pub fn resyncs_completed(&self) -> u64 {
+        self.resyncs_completed
+    }
+
+    /// Begin an authoritative (host-side) resync: split `snapshot` into chunks
+    /// and start serving them to the desynced loser, which resumes lockstep at
+    /// `resume_tick` and verifies against `declared_hash`. The transport treats
+    /// all three as opaque (DESIGN.md §4.6). Call after [`PollResult::Desync`]
+    /// on the host (host is authoritative on a 2-player desync, §4.6).
+    pub fn begin_resync_host(&mut self, snapshot: Vec<u8>, resume_tick: Tick, declared_hash: u64) {
+        let chunk_size = wire::MAX_SNAP_CHUNK_DATA as u16;
+        let total_len = snapshot.len() as u32;
+        let chunks: Vec<Vec<u8>> = snapshot
+            .chunks(wire::MAX_SNAP_CHUNK_DATA)
+            .map(|c| c.to_vec())
+            .collect();
+        let pending: Vec<u32> = (0..chunks.len() as u32).collect();
+        let now = Instant::now();
+        self.resync = Some(Resync {
+            side: ResyncSide::Host {
+                chunks,
+                chunk_size,
+                total_len,
+                pending,
+                all_acked_at: None,
+                done: None,
+            },
+            attempt: 0,
+            resume_tick,
+            declared_hash,
+            started: now,
+            last_action: now - RESYNC_ACTION_INTERVAL,
+            failed: false,
+        });
+    }
+
+    /// Begin a loser-side resync: wait for the host's offer, fill the chunk
+    /// buffer, then surface the bytes for the caller to load + verify. Call after
+    /// [`PollResult::Desync`] on the non-host peer.
+    pub fn begin_resync_loser(&mut self) {
+        let now = Instant::now();
+        self.resync = Some(Resync {
+            side: ResyncSide::Loser {
+                got_offer: false,
+                chunk_size: 0,
+                n_chunks: 0,
+                received: Vec::new(),
+                have: 0,
+                loaded: None,
+                emitted_needs_load: false,
+            },
+            attempt: 0,
+            resume_tick: 0,
+            declared_hash: 0,
+            started: now,
+            last_action: now - RESYNC_ACTION_INTERVAL,
+            failed: false,
+        });
+    }
+
+    /// Report the outcome of loading the snapshot handed back by
+    /// [`ResyncEvent::NeedsLoad`]: `true` = loaded and hash-verified against
+    /// `declared_hash`, `false` = load/verify failed (triggers a retry or, past
+    /// the cap, the fallback).
+    pub fn resync_report_loaded(&mut self, ok: bool) {
+        if let Some(rs) = &mut self.resync {
+            if let ResyncSide::Loser { loaded, .. } = &mut rs.side {
+                *loaded = Some(ok);
+            }
+        }
+    }
+
+    /// Drive the in-progress resync one step: service the socket, (re)send the
+    /// next transfer traffic, and report progress. See [`ResyncEvent`].
+    pub fn resync_poll(&mut self) -> ResyncEvent {
+        self.pump(); // files OFFER/CHUNK/ACK/DONE into self.resync
+
+        let Some(mut rs) = self.resync.take() else {
+            return ResyncEvent::Failed;
+        };
+        if rs.failed {
+            self.resync = Some(rs);
+            return ResyncEvent::Failed;
+        }
+
+        // Per-attempt timeout → retry, or fail past the cap.
+        if rs.started.elapsed() >= RESYNC_TIMEOUT {
+            if rs.attempt + 1 >= RESYNC_MAX_ATTEMPTS {
+                rs.failed = true;
+                self.resync = Some(rs);
+                return ResyncEvent::Failed;
+            }
+            rs.attempt += 1;
+            rs.started = Instant::now();
+            rs.last_action = rs.started - RESYNC_ACTION_INTERVAL;
+            match &mut rs.side {
+                ResyncSide::Host {
+                    chunks,
+                    pending,
+                    all_acked_at,
+                    done,
+                    ..
+                } => {
+                    *pending = (0..chunks.len() as u32).collect();
+                    *all_acked_at = None;
+                    *done = None;
+                }
+                ResyncSide::Loser {
+                    got_offer,
+                    loaded,
+                    emitted_needs_load,
+                    ..
+                } => {
+                    *got_offer = false;
+                    *loaded = None;
+                    *emitted_needs_load = false;
+                }
+            }
+        }
+
+        let pace = rs.last_action.elapsed() >= RESYNC_ACTION_INTERVAL;
+        let mut outbound: Vec<Datagram> = Vec::new();
+        let mut resume: Option<Tick> = None;
+        let mut needs_load: Option<(Vec<u8>, Tick, u64)> = None;
+        let attempt = rs.attempt;
+        let resume_tick = rs.resume_tick;
+        let declared_hash = rs.declared_hash;
+
+        match &mut rs.side {
+            ResyncSide::Host {
+                chunks,
+                chunk_size,
+                total_len,
+                pending,
+                all_acked_at,
+                done,
+            } => match *done {
+                Some(true) => resume = Some(resume_tick),
+                Some(false) => {
+                    if attempt + 1 >= RESYNC_MAX_ATTEMPTS {
+                        rs.failed = true;
+                    } else {
+                        rs.attempt += 1;
+                        rs.started = Instant::now();
+                        *pending = (0..chunks.len() as u32).collect();
+                        *all_acked_at = None;
+                        *done = None;
+                    }
+                }
+                None => {
+                    // Optimistic-resume backstop (all-dropped DONE burst).
+                    if all_acked_at.map(|t| t.elapsed() >= RESYNC_CONFIRM_GRACE) == Some(true) {
+                        resume = Some(resume_tick);
+                    } else if pace {
+                        rs.last_action = Instant::now();
+                        outbound.push(Datagram::SnapshotOffer {
+                            attempt,
+                            resume_tick,
+                            declared_hash,
+                            total_len: *total_len,
+                            chunk_size: *chunk_size,
+                        });
+                        for &seq in pending.iter() {
+                            outbound.push(Datagram::SnapshotChunk {
+                                attempt,
+                                seq,
+                                data: chunks[seq as usize].clone(),
+                            });
+                        }
+                    }
+                }
+            },
+            ResyncSide::Loser {
+                got_offer,
+                n_chunks,
+                received,
+                have,
+                loaded,
+                emitted_needs_load,
+                ..
+            } => {
+                if !*got_offer {
+                    // Await the host's OFFER.
+                } else if *have < *n_chunks {
+                    if pace {
+                        rs.last_action = Instant::now();
+                        let missing: Vec<u32> = received
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, s)| s.is_none())
+                            .map(|(i, _)| i as u32)
+                            .take(wire::MAX_SNAP_MISSING)
+                            .collect();
+                        outbound.push(Datagram::SnapshotAck { attempt, missing });
+                    }
+                } else {
+                    // Complete: keep telling the host we have every chunk (arms
+                    // its optimistic-resume grace even if the DONE burst is lost).
+                    if pace {
+                        rs.last_action = Instant::now();
+                        outbound.push(Datagram::SnapshotAck {
+                            attempt,
+                            missing: Vec::new(),
+                        });
+                    }
+                    match *loaded {
+                        None => {
+                            if !*emitted_needs_load {
+                                *emitted_needs_load = true;
+                                let mut bytes = Vec::new();
+                                for chunk in received.iter().flatten() {
+                                    bytes.extend_from_slice(chunk);
+                                }
+                                needs_load = Some((bytes, resume_tick, declared_hash));
+                            }
+                        }
+                        Some(true) => {
+                            for _ in 0..DONE_BURST {
+                                outbound.push(Datagram::SnapshotDone { attempt, ok: true });
+                            }
+                            resume = Some(resume_tick);
+                        }
+                        Some(false) => {
+                            for _ in 0..DONE_BURST {
+                                outbound.push(Datagram::SnapshotDone { attempt, ok: false });
+                            }
+                            // The host owns the attempt id: reset and await its
+                            // re-offer (a higher attempt), or time out at the cap.
+                            *got_offer = false;
+                            *loaded = None;
+                            *emitted_needs_load = false;
+                        }
+                    }
+                }
+            }
+        }
+
+        let failed = rs.failed;
+        // Re-install (or drop) the resync before touching the socket / resuming.
+        self.resync = Some(rs);
+        for d in &outbound {
+            self.send(d);
+        }
+
+        if failed {
+            return ResyncEvent::Failed;
+        }
+        if let Some(t) = resume {
+            self.resyncs_completed += 1;
+            self.resume_at(t); // sets self.resync = None
+            return ResyncEvent::Resumed { resume_tick: t };
+        }
+        if let Some((bytes, rt, dh)) = needs_load {
+            return ResyncEvent::NeedsLoad {
+                bytes,
+                resume_tick: rt,
+                declared_hash: dh,
+            };
+        }
+        ResyncEvent::Transferring
+    }
+
+    /// Reset the lockstep state to resume at `tick` (M8-C): clear the desync
+    /// latch and — the load-bearing step, proven by the revert drill — re-stamp
+    /// the input windows (fresh scheduler + cleared bundle/hash maps) so no stale
+    /// pre-desync command replays into the resumed world.
+    fn resume_at(&mut self, tick: Tick) {
+        self.current = tick;
+        self.resume_base = tick;
+        self.stamped = false;
+        self.desync = None;
+        self.resync = None;
+        self.stall_polls = 0;
+        let now = Instant::now();
+        self.last_recv = now;
+        self.last_send = now;
+        if self.resume_clear_windows {
+            self.local_due = None;
+            self.remote.clear();
+            self.sent_bundles.clear();
+            self.sent_hashes.clear();
+            self.my_hashes.clear();
+            self.peer_hashes.clear();
+            self.sched = InputScheduler::new(self.delay);
+        }
+    }
+
+    /// Revert-drill knob (proof test f): when `false`, [`LanTransport::resume_at`]
+    /// leaves the stale command windows in place, so a test can prove the
+    /// re-stamp is load-bearing (post-resync chains diverge). Production never
+    /// calls this.
+    pub fn set_resume_clear_windows_for_test(&mut self, clear: bool) {
+        self.resume_clear_windows = clear;
     }
 
     // -- internals ----------------------------------------------------------
@@ -437,6 +863,96 @@ impl LanTransport {
                     self.send(&Datagram::Start);
                 }
             }
+            // --- Resync (M8-C P1): file transfer data into the resync state. ---
+            Datagram::SnapshotOffer {
+                attempt,
+                resume_tick,
+                declared_hash,
+                total_len,
+                chunk_size,
+            } => {
+                if let Some(rs) = &mut self.resync {
+                    if let ResyncSide::Loser {
+                        got_offer,
+                        chunk_size: cs,
+                        n_chunks,
+                        received,
+                        have,
+                        loaded,
+                        emitted_needs_load,
+                    } = &mut rs.side
+                    {
+                        // First offer, or a fresh (higher-numbered) retry: (re)size
+                        // the buffer. Duplicate offers of the current attempt are
+                        // idempotent.
+                        if !*got_offer || attempt > rs.attempt {
+                            let n = (total_len as usize).div_ceil(chunk_size as usize) as u32;
+                            rs.attempt = attempt;
+                            rs.resume_tick = resume_tick;
+                            rs.declared_hash = declared_hash;
+                            *cs = chunk_size;
+                            *n_chunks = n;
+                            *received = (0..n).map(|_| None).collect();
+                            *have = 0;
+                            *loaded = None;
+                            *emitted_needs_load = false;
+                            *got_offer = true;
+                            rs.started = Instant::now();
+                        }
+                    }
+                }
+            }
+            Datagram::SnapshotChunk { attempt, seq, data } => {
+                if let Some(rs) = &mut self.resync {
+                    if let ResyncSide::Loser {
+                        got_offer,
+                        n_chunks,
+                        received,
+                        have,
+                        ..
+                    } = &mut rs.side
+                    {
+                        if *got_offer && attempt == rs.attempt && seq < *n_chunks {
+                            let slot = &mut received[seq as usize];
+                            if slot.is_none() {
+                                *slot = Some(data);
+                                *have += 1;
+                            }
+                        }
+                    }
+                }
+            }
+            Datagram::SnapshotAck { attempt, missing } => {
+                if let Some(rs) = &mut self.resync {
+                    if let ResyncSide::Host {
+                        pending,
+                        all_acked_at,
+                        ..
+                    } = &mut rs.side
+                    {
+                        if attempt == rs.attempt {
+                            if missing.is_empty() {
+                                pending.clear();
+                                if all_acked_at.is_none() {
+                                    *all_acked_at = Some(Instant::now());
+                                }
+                            } else {
+                                *pending = missing;
+                                *all_acked_at = None;
+                            }
+                        }
+                    }
+                }
+            }
+            Datagram::SnapshotDone { attempt, ok } => {
+                if let Some(rs) = &mut self.resync {
+                    if let ResyncSide::Host { done, .. } = &mut rs.side {
+                        if attempt == rs.attempt {
+                            *done = Some(ok);
+                        }
+                    }
+                }
+            }
             // Lobby leftovers / stray discovery traffic: ignore in-game.
             Datagram::Announce { .. }
             | Datagram::Join { .. }
@@ -538,10 +1054,12 @@ impl CommandTransport for LanTransport {
             return PollResult::ConnectionLost(l);
         }
 
-        // Tick barrier: we need the peer's bundle for `tick`. Ticks below
-        // the input delay are empty by protocol definition (no stamp can
-        // land there — same rule as PairTransport).
-        let remote_cmds = if tick < self.delay {
+        // Tick barrier: we need the peer's bundle for `tick`. The first `delay`
+        // ticks from the lockstep (re)start point are empty by protocol
+        // definition (no stamp can land there — same rule as PairTransport, and
+        // after a resync the fresh scheduler's earliest stamp lands at
+        // `resume_base + delay`).
+        let remote_cmds = if tick < self.resume_base.saturating_add(self.delay) {
             Some(Vec::new())
         } else {
             self.remote.remove(&tick)

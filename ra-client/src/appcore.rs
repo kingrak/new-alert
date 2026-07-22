@@ -15,7 +15,7 @@ use std::collections::BTreeMap;
 
 use ra_data::house::{identity_remap, RemapTable};
 use ra_formats::tmpl::ICON_WIDTH;
-use ra_net::{CommandTransport, LanTransport, LocalTransport, LostReason, PollResult};
+use ra_net::{CommandTransport, LanTransport, LocalTransport, LostReason, PollResult, ResyncEvent};
 use ra_sim::coords::{CellCoord, Facing, WorldCoord, LEPTONS_PER_CELL};
 use ra_sim::{BuildItem, GameOver, Handle, Passability, ProdKind, SuperKind, Target, World};
 
@@ -361,6 +361,9 @@ pub enum CursorKind {
 /// tick.
 const STALL_OVERLAY_POLLS: u32 = 30;
 
+/// How long the "GAME RESYNCED" toast lingers after a successful resync (ms).
+const RESYNC_TOAST_MS: u32 = 2500;
+
 /// Which transport drives the sim (DESIGN.md §4.6 — one seam, swappable
 /// medium). Kept as an enum rather than `Box<dyn CommandTransport>` so the
 /// client can still reach LAN-specific observability (stall counters for the
@@ -469,6 +472,13 @@ pub struct AppCore {
     /// "waiting for player" overlay (M8-B P3; the original's frame-sync
     /// wait). Cleared the moment a tick completes.
     net_waiting: bool,
+    /// Whether a snapshot resync is in progress (M8-C P1): the sim is paused and
+    /// the "RESYNCHRONIZING..." overlay shows while the desynced peer pulls the
+    /// host's authoritative world snapshot.
+    net_resync: bool,
+    /// Remaining time (ms) for the "GAME RESYNCED" toast after a successful
+    /// resync. `0` = not showing.
+    net_resync_toast_ms: u32,
     /// Commands emitted since the last [`AppCore::drain_commands`] (for the net
     /// layer / tests to observe).
     emitted: Vec<Command>,
@@ -633,6 +643,8 @@ impl AppCore {
             mp_remote_house: None,
             net_end: None,
             net_waiting: false,
+            net_resync: false,
+            net_resync_toast_ms: 0,
             emitted: Vec::new(),
             sidebar_enabled: false,
             player_house: None,
@@ -1149,6 +1161,109 @@ impl AppCore {
         self.net_waiting
     }
 
+    /// Whether a snapshot resync is in progress (the "RESYNCHRONIZING..." overlay
+    /// is up and the sim is paused). M8-C P1.
+    pub fn net_resyncing(&self) -> bool {
+        self.net_resync
+    }
+
+    /// Whether the "GAME RESYNCED" toast is currently showing.
+    pub fn net_resynced_toast(&self) -> bool {
+        self.net_resync_toast_ms > 0
+    }
+
+    /// Completed resyncs on the LAN transport (observability; `0` off-LAN).
+    pub fn net_resyncs_completed(&self) -> u64 {
+        match &self.transport {
+            NetTransport::Lan(t) => t.resyncs_completed(),
+            _ => 0,
+        }
+    }
+
+    /// Whether the transport is mid-resync (drives the paused-sim branch of
+    /// [`AppCore::update`]).
+    fn net_resync_active(&self) -> bool {
+        matches!(&self.transport, NetTransport::Lan(t) if t.resync_active())
+    }
+
+    /// Begin a snapshot resync after a detected desync (M8-C P1). The host is
+    /// authoritative on a 2-player desync (DESIGN.md §4.6): it serves its world
+    /// snapshot; the joiner pulls and loads it. Single-player (which cannot
+    /// desync) falls straight through to the terminal desync end.
+    fn begin_net_resync(&mut self) {
+        let is_host = match &self.transport {
+            NetTransport::Lan(t) => t.is_host(),
+            _ => {
+                self.net_end.get_or_insert(NetEnd::Desync);
+                return;
+            }
+        };
+        if is_host {
+            // Compute the authoritative snapshot before borrowing the transport.
+            let snapshot = self.world.save_snapshot();
+            let resume_tick = self.world.tick_count();
+            let declared = self.world.state_hash();
+            if let NetTransport::Lan(t) = &mut self.transport {
+                t.begin_resync_host(snapshot, resume_tick, declared);
+            }
+        } else if let NetTransport::Lan(t) = &mut self.transport {
+            t.begin_resync_loser();
+        }
+        self.net_resync = true;
+        self.net_waiting = false;
+    }
+
+    /// Drive an in-progress resync one step (called once per frame from
+    /// [`AppCore::update`] while the sim is paused). On the joiner, loading the
+    /// received snapshot swaps in the new world; on success both peers resume and
+    /// a toast fires; past the attempt cap it falls back to the desync end.
+    fn drive_net_resync(&mut self) {
+        let event = match &mut self.transport {
+            NetTransport::Lan(t) => t.resync_poll(),
+            _ => return,
+        };
+        match event {
+            ResyncEvent::Transferring => {
+                self.net_resync = true;
+            }
+            ResyncEvent::NeedsLoad {
+                bytes,
+                resume_tick: _,
+                declared_hash,
+            } => {
+                // Load against this peer's own (shared) catalog + map; adopt the
+                // world only if it hash-verifies against the host's declaration.
+                let ok = match World::load_snapshot(
+                    &bytes,
+                    self.world.catalog().clone(),
+                    self.world.passability().clone(),
+                ) {
+                    Ok(w) if w.state_hash() == declared_hash => {
+                        self.world = w;
+                        self.prev_coords.clear();
+                        true
+                    }
+                    _ => false,
+                };
+                if let NetTransport::Lan(t) = &mut self.transport {
+                    t.resync_report_loaded(ok);
+                }
+            }
+            ResyncEvent::Resumed { resume_tick } => {
+                self.net_resync = false;
+                self.net_resync_toast_ms = RESYNC_TOAST_MS;
+                // Re-anchor the presentation clock to the resumed tick so the sim
+                // doesn't fast-forward a transfer's worth of backlog.
+                self.virtual_ms = (resume_tick as u64) * 1000 / TICKS_PER_SECOND;
+                self.prev_coords.clear();
+            }
+            ResyncEvent::Failed => {
+                self.net_resync = false;
+                self.net_end.get_or_insert(NetEnd::Desync);
+            }
+        }
+    }
+
     /// Send the clean-quit message to the LAN peer (so they see "player
     /// left" instead of waiting out the timeout). Call when leaving an
     /// in-progress LAN game; a no-op in single player.
@@ -1342,6 +1457,16 @@ impl AppCore {
             frames > 0 && now.saturating_sub(e.start_ms) < frames * FX_FRAME_MS
         });
 
+        // "GAME RESYNCED" toast countdown (presentation only).
+        self.net_resync_toast_ms = self.net_resync_toast_ms.saturating_sub(dt_ms);
+
+        // Snapshot resync (M8-C P1): while a transfer is in progress the sim is
+        // paused — drive the resync once per frame instead of stepping.
+        if self.net_resync_active() {
+            self.drive_net_resync();
+            return;
+        }
+
         // Fixed-timestep sim stepping on virtual time.
         self.virtual_ms = self.virtual_ms.saturating_add(dt_ms as u64);
         let target = (self.virtual_ms.saturating_mul(TICKS_PER_SECOND) / 1000) as u32;
@@ -1349,6 +1474,11 @@ impl AppCore {
         while self.world.tick_count() < target && steps < MAX_CATCHUP_TICKS {
             self.step_tick();
             steps += 1;
+            // A desync just started a resync: stop stepping this frame; the sim
+            // is paused until the transfer completes.
+            if self.net_resync_active() {
+                return;
+            }
         }
         if self.world.tick_count() < target {
             // Giant dt: snap the clock to the current tick so we neither spin
@@ -1384,6 +1514,10 @@ impl AppCore {
     /// effects (explosions on death, buildups on placement) — read-only over the
     /// world, so this never perturbs the sim or its RNG.
     fn step_tick(&mut self) {
+        // Paused while a resync transfer is in flight (M8-C).
+        if self.net_resync_active() {
+            return;
+        }
         // Poll the transport for this tick's full command bundle *first*: on a
         // stall or desync the sim must simply not advance (never happens for
         // the zero-delay LocalTransport; this seam is where M8-B's
@@ -1408,9 +1542,10 @@ impl AppCore {
             }
             PollResult::Desync(_) => {
                 self.net_waiting = false;
-                if self.net_end.is_none() {
-                    self.net_end = Some(NetEnd::Desync);
-                }
+                // M8-C: recover from a snapshot instead of ending the match. On a
+                // LAN game the host serves its authoritative world; single-player
+                // (which can't desync) falls straight through to the end screen.
+                self.begin_net_resync();
                 return;
             }
             PollResult::ConnectionLost(l) => {
@@ -1943,6 +2078,8 @@ impl AppCore {
         self.draw_sidebar(&mut frame);
         self.draw_game_over(&mut frame);
         self.draw_net_waiting(&mut frame);
+        self.draw_net_resync(&mut frame);
+        self.draw_net_resynced_toast(&mut frame);
         self.draw_help_overlay(&mut frame);
         // Sell/repair mode reminders, drawn topmost: a mode banner near the top
         // of the tactical area and the mode cursor glyph at the pointer.
@@ -2054,6 +2191,69 @@ impl AppCore {
             [90, 110, 160],
         );
         font::draw_text_scaled(frame, cx, cy, text, [230, 230, 240], scale);
+    }
+
+    /// "RESYNCHRONIZING..." overlay (M8-C P1): shown while a snapshot resync is
+    /// transferring and the sim is paused. Mirrors the waiting banner's style
+    /// (amber to distinguish "recovering" from the blue "waiting").
+    fn draw_net_resync(&self, frame: &mut RgbaImage) {
+        if !self.net_resync {
+            return;
+        }
+        let text = "RESYNCHRONIZING...";
+        let scale = 2;
+        let tw = font::text_width(text) * scale;
+        let th = font::GLYPH_H * scale;
+        let cx = (self.tactical_width() as i32 - tw) / 2;
+        let cy = 40;
+        fill_rect(
+            frame,
+            cx - 10,
+            cy - 8,
+            cx + tw + 10,
+            cy + th + 8,
+            [16, 12, 8],
+        );
+        draw_rect_outline(
+            frame,
+            cx - 10,
+            cy - 8,
+            cx + tw + 10,
+            cy + th + 8,
+            [200, 160, 60],
+        );
+        font::draw_text_scaled(frame, cx, cy, text, [245, 220, 150], scale);
+    }
+
+    /// "GAME RESYNCED" toast (M8-C P1): a brief confirmation after a successful
+    /// resync; fades out on the [`RESYNC_TOAST_MS`] timer.
+    fn draw_net_resynced_toast(&self, frame: &mut RgbaImage) {
+        if self.net_resync_toast_ms == 0 {
+            return;
+        }
+        let text = "GAME RESYNCED";
+        let scale = 2;
+        let tw = font::text_width(text) * scale;
+        let th = font::GLYPH_H * scale;
+        let cx = (self.tactical_width() as i32 - tw) / 2;
+        let cy = 40;
+        fill_rect(
+            frame,
+            cx - 10,
+            cy - 8,
+            cx + tw + 10,
+            cy + th + 8,
+            [8, 16, 10],
+        );
+        draw_rect_outline(
+            frame,
+            cx - 10,
+            cy - 8,
+            cx + tw + 10,
+            cy + th + 8,
+            [90, 200, 120],
+        );
+        font::draw_text_scaled(frame, cx, cy, text, [170, 245, 190], scale);
     }
 
     fn draw_game_over(&self, frame: &mut RgbaImage) {

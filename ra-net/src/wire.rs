@@ -80,6 +80,24 @@ const T_HASHES: u8 = 0x11;
 const T_NACK: u8 = 0x12;
 const T_KEEPALIVE: u8 = 0x13;
 const T_QUIT: u8 = 0x14;
+// M8-C resync (snapshot transfer). Opaque bytes: the transport never interprets
+// the snapshot payload or `declared_hash` — it only moves them (DESIGN.md §4.6).
+const T_SNAP_OFFER: u8 = 0x20;
+const T_SNAP_CHUNK: u8 = 0x21;
+const T_SNAP_ACK: u8 = 0x22;
+const T_SNAP_DONE: u8 = 0x23;
+
+/// Max snapshot payload a chunk carries — kept comfortably under a 1500-byte
+/// Ethernet MTU (minus IP/UDP + our header) so a CHUNK datagram is not IP
+/// fragmented, giving clean per-chunk loss behaviour.
+pub const MAX_SNAP_CHUNK_DATA: usize = 1200;
+/// Hard cap on a reassembled snapshot (matches `ra_sim::snapshot::MAX_SNAPSHOT`):
+/// a malformed `total_len` can never trigger an unbounded allocation.
+pub const MAX_SNAPSHOT_LEN: usize = 16 * 1024 * 1024;
+/// Cap on missing-chunk seqs reported in one ACK (a corrupt count must not
+/// over-allocate; the receiver re-ACKs across several datagrams if it is missing
+/// more than this, which never happens at realistic loss rates).
+pub const MAX_SNAP_MISSING: usize = 2048;
 
 /// Why a JOIN was refused.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -200,6 +218,50 @@ pub enum Datagram {
     /// Clean in-game exit: the peer's client shows "player left" rather than
     /// waiting out the keepalive timeout.
     Quit,
+    /// Resync (M8-C): the authoritative (host) peer offers a world snapshot to
+    /// the desynced loser. Re-sent until the loser acknowledges completion. The
+    /// snapshot bytes follow in [`Datagram::SnapshotChunk`]s.
+    SnapshotOffer {
+        /// Retry counter (0-based). Chunks/acks/done for a stale attempt are
+        /// ignored, so a re-offer cannot be corrupted by leftovers of the last.
+        attempt: u8,
+        /// The tick both peers resume lockstep from (the host's authoritative
+        /// tick at snapshot time).
+        resume_tick: Tick,
+        /// The host's declared state hash at `resume_tick` — the loser verifies
+        /// its loaded world against this. **Opaque to the transport.**
+        declared_hash: u64,
+        /// Total reassembled snapshot length in bytes.
+        total_len: u32,
+        /// Bytes carried per chunk (last chunk may be shorter).
+        chunk_size: u16,
+    },
+    /// One chunk of the offered snapshot (host → loser).
+    SnapshotChunk {
+        /// The attempt this chunk belongs to.
+        attempt: u8,
+        /// Zero-based chunk index.
+        seq: u32,
+        /// The chunk's snapshot bytes (`<= MAX_SNAP_CHUNK_DATA`).
+        data: Vec<u8>,
+    },
+    /// Loser → host: which chunk seqs are still missing (empty = have them all).
+    /// Drives selective re-send under loss.
+    SnapshotAck {
+        /// The attempt being acknowledged.
+        attempt: u8,
+        /// Still-missing chunk seqs (capped; empty means complete).
+        missing: Vec<u32>,
+    },
+    /// Loser → host: the transfer resolved — `ok` = loaded and hash-verified,
+    /// so both resume; `!ok` = load/verify failed, triggering a retry or, past
+    /// the attempt cap, the fallback to the terminal desync end.
+    SnapshotDone {
+        /// The attempt being reported.
+        attempt: u8,
+        /// Whether the loser loaded and hash-verified the snapshot.
+        ok: bool,
+    },
 }
 
 /// A decode failure. Malformed input is an *error value*, never a panic —
@@ -702,6 +764,42 @@ pub fn encode_with_protocol(d: &Datagram, protocol: u16) -> Vec<u8> {
             w.u32(*tick);
         }
         Datagram::Quit => w.u8(T_QUIT),
+        Datagram::SnapshotOffer {
+            attempt,
+            resume_tick,
+            declared_hash,
+            total_len,
+            chunk_size,
+        } => {
+            w.u8(T_SNAP_OFFER);
+            w.u8(*attempt);
+            w.u32(*resume_tick);
+            w.u64(*declared_hash);
+            w.u32(*total_len);
+            w.u16(*chunk_size);
+        }
+        Datagram::SnapshotChunk { attempt, seq, data } => {
+            w.u8(T_SNAP_CHUNK);
+            w.u8(*attempt);
+            w.u32(*seq);
+            let n = data.len().min(MAX_SNAP_CHUNK_DATA);
+            w.u16(n as u16);
+            w.0.extend_from_slice(&data[..n]);
+        }
+        Datagram::SnapshotAck { attempt, missing } => {
+            w.u8(T_SNAP_ACK);
+            w.u8(*attempt);
+            let n = missing.len().min(MAX_SNAP_MISSING);
+            w.u32(n as u32);
+            for &seq in missing.iter().take(MAX_SNAP_MISSING) {
+                w.u32(seq);
+            }
+        }
+        Datagram::SnapshotDone { attempt, ok } => {
+            w.u8(T_SNAP_DONE);
+            w.u8(*attempt);
+            w.u8(*ok as u8);
+        }
     }
     w.0
 }
@@ -778,6 +876,56 @@ pub fn decode(buf: &[u8]) -> Result<Datagram, WireError> {
         T_NACK => Datagram::Nack { from: r.u32()? },
         T_KEEPALIVE => Datagram::KeepAlive { tick: r.u32()? },
         T_QUIT => Datagram::Quit,
+        T_SNAP_OFFER => {
+            let attempt = r.u8()?;
+            let resume_tick = r.u32()?;
+            let declared_hash = r.u64()?;
+            let total_len = r.u32()?;
+            let chunk_size = r.u16()?;
+            if total_len as usize > MAX_SNAPSHOT_LEN {
+                return Err(WireError::BadValue("snapshot total_len over cap"));
+            }
+            if chunk_size == 0 || chunk_size as usize > MAX_SNAP_CHUNK_DATA {
+                return Err(WireError::BadValue("snapshot chunk_size"));
+            }
+            Datagram::SnapshotOffer {
+                attempt,
+                resume_tick,
+                declared_hash,
+                total_len,
+                chunk_size,
+            }
+        }
+        T_SNAP_CHUNK => {
+            let attempt = r.u8()?;
+            let seq = r.u32()?;
+            let n = r.u16()? as usize;
+            if n > MAX_SNAP_CHUNK_DATA {
+                return Err(WireError::BadValue("snapshot chunk len over cap"));
+            }
+            let data = r.take(n)?.to_vec();
+            Datagram::SnapshotChunk { attempt, seq, data }
+        }
+        T_SNAP_ACK => {
+            let attempt = r.u8()?;
+            let n = r.u32()? as usize;
+            if n > MAX_SNAP_MISSING {
+                return Err(WireError::BadValue("snapshot missing count over cap"));
+            }
+            let mut missing = Vec::with_capacity(n.min(256));
+            for _ in 0..n {
+                missing.push(r.u32()?);
+            }
+            Datagram::SnapshotAck { attempt, missing }
+        }
+        T_SNAP_DONE => Datagram::SnapshotDone {
+            attempt: r.u8()?,
+            ok: match r.u8()? {
+                0 => false,
+                1 => true,
+                _ => return Err(WireError::BadValue("snapshot done flag")),
+            },
+        },
         t => return Err(WireError::UnknownType(t)),
     };
     r.done()?;
