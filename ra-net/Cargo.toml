@@ -4,5 +4,10 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 publish = false
+description = "Red Alert command transport: lockstep input-delay scheduling behind the CommandTransport trait."
 
 [dependencies]
+# The transport moves `ra_sim::Command` values and 64-bit state hashes; it
+# never constructs, reads, or mutates a `World` (DESIGN.md §4.6: "The sim only
+# ever consumes (tick, ordered commands) and emits state hashes").
+ra-sim = { path = "../ra-sim" }

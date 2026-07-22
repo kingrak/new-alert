@@ -468,6 +468,7 @@ dependencies = [
  "proptest",
  "ra-data",
  "ra-formats",
+ "ra-net",
  "ra-sim",
 ]
 
@@ -489,6 +490,9 @@ dependencies = [
 [[package]]
 name = "ra-net"
 version = "0.1.0"
+dependencies = [
+ "ra-sim",
+]
 
 [[package]]
 name = "ra-sim"

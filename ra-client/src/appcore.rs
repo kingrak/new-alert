@@ -15,6 +15,7 @@ use std::collections::BTreeMap;
 
 use ra_data::house::{identity_remap, RemapTable};
 use ra_formats::tmpl::ICON_WIDTH;
+use ra_net::{CommandTransport, LocalTransport, PollResult};
 use ra_sim::coords::{CellCoord, Facing, WorldCoord, LEPTONS_PER_CELL};
 use ra_sim::{BuildItem, GameOver, Handle, Passability, ProdKind, SuperKind, Target, World};
 
@@ -355,8 +356,10 @@ pub struct AppCore {
     /// Active left-drag selection box, if any.
     drag: Option<DragBox>,
 
-    /// Commands queued for the next sim tick (loopback pipeline).
-    pending: Vec<Command>,
+    /// The command transport (DESIGN.md §4.6): single player runs the
+    /// zero-delay loopback, so a command submitted during tick `T` executes at
+    /// `T` in submission order — byte-identical to the pre-M8 `pending` drain.
+    transport: LocalTransport,
     /// Commands emitted since the last [`AppCore::drain_commands`] (for the net
     /// layer / tests to observe).
     emitted: Vec<Command>,
@@ -511,7 +514,7 @@ impl AppCore {
             prev_coords: BTreeMap::new(),
             selected: Vec::new(),
             drag: None,
-            pending: Vec::new(),
+            transport: LocalTransport::new(),
             emitted: Vec::new(),
             sidebar_enabled: false,
             player_house: None,
@@ -972,7 +975,7 @@ impl AppCore {
     /// input layer would — so a scripted drive can issue Move/Attack/Deploy
     /// without synthesizing pixel-accurate mouse events.
     pub fn inject_command(&mut self, cmd: Command) {
-        self.pending.push(cmd);
+        self.transport.submit(cmd);
     }
 
     /// The current sim state hash — the determinism backbone surfaced through
@@ -1173,6 +1176,16 @@ impl AppCore {
     /// effects (explosions on death, buildups on placement) — read-only over the
     /// world, so this never perturbs the sim or its RNG.
     fn step_tick(&mut self) {
+        // Poll the transport for this tick's full command bundle *first*: on a
+        // stall or desync the sim must simply not advance (never happens for
+        // the zero-delay LocalTransport; this seam is where M8-B's
+        // LanTransport will stall at the tick barrier).
+        let tick = self.world.tick_count();
+        let cmds = match self.transport.poll(tick) {
+            PollResult::Ready(bundle) => bundle.flatten(),
+            PollResult::Waiting | PollResult::Desync(_) => return,
+        };
+
         self.prev_coords.clear();
         // Handle + coord + airborne altitude-lift (pixels) so a crashing aircraft
         // explodes at its flight height, not on the ground beneath it.
@@ -1223,7 +1236,6 @@ impl AppCore {
             .map(|(h, _)| h)
             .collect();
 
-        let cmds = std::mem::take(&mut self.pending);
         // Buildings the player asked to sell this tick: a building that vanishes
         // and was a Sell target deconstructs (reverse buildup + cash SFX) rather
         // than exploding like a combat death.
@@ -1234,7 +1246,10 @@ impl AppCore {
                 _ => None,
             })
             .collect();
-        self.world.tick(&cmds);
+        let hash = self.world.tick(&cmds);
+        // Feed the hash chain back to the transport (§4.6: hashes are chained
+        // even in single player, so stages 2/3 inherit a battle-tested core).
+        self.transport.report_hash(tick, hash);
 
         // New projectiles → a fire cue (covers visible cannon shots; hitscan
         // weapons are represented by the muzzle flash instead).
@@ -2151,8 +2166,7 @@ impl AppCore {
                     transport,
                     house: *house,
                 };
-                self.pending.push(cmd);
-                self.emitted.push(cmd);
+                self.emit(cmd);
                 loaded_any = true;
             }
             if loaded_any {
@@ -2186,8 +2200,7 @@ impl AppCore {
                     target,
                     house,
                 };
-                self.pending.push(cmd);
-                self.emitted.push(cmd);
+                self.emit(cmd);
             }
         } else {
             let dest = CellCoord::new(
@@ -2196,8 +2209,7 @@ impl AppCore {
             );
             for (unit, house) in orders {
                 let cmd = Command::Move { unit, dest, house };
-                self.pending.push(cmd);
-                self.emitted.push(cmd);
+                self.emit(cmd);
             }
         }
     }
@@ -2460,9 +2472,9 @@ impl AppCore {
 
     // ---- Build UI actions (public so tests / the verification drive them) ----
 
-    /// Queue a command into the loopback pipeline and record it as emitted.
+    /// Queue a command into the loopback transport and record it as emitted.
     fn emit(&mut self, cmd: Command) {
-        self.pending.push(cmd);
+        self.transport.submit(cmd);
         self.emitted.push(cmd);
     }
 
