@@ -400,6 +400,10 @@ service. Replays fall out for free: the server already holds the canonical
 command log for every game. (An authoritative-sim server would prevent
 maphacks, but costs server CPU per game and a client rewrite — out of scope;
 the relay design is what CnCNet uses for the original games today.)
+The full server design — wire protocol v2, session lifecycle, sequencer
+semantics, arbitration, relayed resync, validation, ops, and the M9-A/B/C
+milestone split — is specified in **docs/SERVER-DESIGN.md**, which is law for
+the M9 cycles the way this document is for the engine.
 
 Stage boundaries are also trust boundaries: stage 1 trusts everything, stage 2
 trusts the LAN, stage 3 must validate commands server-side (rate, ownership:
