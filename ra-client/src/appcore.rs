@@ -15,7 +15,7 @@ use std::collections::BTreeMap;
 
 use ra_data::house::{identity_remap, RemapTable};
 use ra_formats::tmpl::ICON_WIDTH;
-use ra_net::{CommandTransport, LocalTransport, PollResult};
+use ra_net::{CommandTransport, LanTransport, LocalTransport, LostReason, PollResult};
 use ra_sim::coords::{CellCoord, Facing, WorldCoord, LEPTONS_PER_CELL};
 use ra_sim::{BuildItem, GameOver, Handle, Passability, ProdKind, SuperKind, Target, World};
 
@@ -336,6 +336,62 @@ pub enum CursorKind {
 }
 
 /// The windowless client core: terrain raster + camera + the sim view.
+/// How many consecutive stalled polls of one tick before the "WAITING FOR
+/// PLAYER" overlay shows (M8-B P3). The client polls the barrier at frame
+/// rate (and several times per frame while catching up), so this is well
+/// under a second of real stall — late enough to never flicker during
+/// ordinary lockstep jitter, early enough that a genuinely paused peer is
+/// obvious. Resume is seamless: the overlay clears on the next completed
+/// tick.
+const STALL_OVERLAY_POLLS: u32 = 30;
+
+/// Which transport drives the sim (DESIGN.md §4.6 — one seam, swappable
+/// medium). Kept as an enum rather than `Box<dyn CommandTransport>` so the
+/// client can still reach LAN-specific observability (stall counters for the
+/// waiting overlay, the clean-quit send) without downcasting.
+enum NetTransport {
+    /// Single player: the zero-delay loopback.
+    Local(LocalTransport),
+    /// LAN peer lockstep (M8-B). Boxed: the socketed transport is much
+    /// larger than the loopback, and this enum lives inside `AppCore`.
+    Lan(Box<LanTransport>),
+}
+
+impl CommandTransport for NetTransport {
+    fn submit(&mut self, cmd: Command) {
+        match self {
+            NetTransport::Local(t) => t.submit(cmd),
+            NetTransport::Lan(t) => t.submit(cmd),
+        }
+    }
+    fn poll(&mut self, tick: u32) -> PollResult {
+        match self {
+            NetTransport::Local(t) => t.poll(tick),
+            NetTransport::Lan(t) => t.poll(tick),
+        }
+    }
+    fn report_hash(&mut self, tick: u32, hash: u64) {
+        match self {
+            NetTransport::Local(t) => t.report_hash(tick, hash),
+            NetTransport::Lan(t) => t.report_hash(tick, hash),
+        }
+    }
+}
+
+/// Why a LAN session ended without a normal win/lose (M8-B P3). The three
+/// cases are deliberately distinguishable end screens: "player left" (clean
+/// quit), "connection lost" (keepalive timeout), "out of sync" (hash
+/// divergence — resync-from-snapshot is M8-C).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NetEnd {
+    /// The peer sent a clean quit.
+    PeerLeft,
+    /// Nothing heard from the peer within the keepalive timeout.
+    ConnectionLost,
+    /// The lockstep hash exchange detected divergence.
+    Desync,
+}
+
 pub struct AppCore {
     raster: IndexedImage,
     palette: Palette,
@@ -382,7 +438,21 @@ pub struct AppCore {
     /// The command transport (DESIGN.md §4.6): single player runs the
     /// zero-delay loopback, so a command submitted during tick `T` executes at
     /// `T` in submission order — byte-identical to the pre-M8 `pending` drain.
-    transport: LocalTransport,
+    /// A LAN game swaps in [`LanTransport`] via [`AppCore::install_lan`]
+    /// (M8-B): same seam, input-delayed lockstep instead of loopback.
+    transport: NetTransport,
+    /// The remote player's house in a LAN game (`None` = single player). Set
+    /// by [`AppCore::install_lan`]; drives the multiplayer win/lose read
+    /// ([`AppCore::game_over`]) without touching sim state.
+    mp_remote_house: Option<u8>,
+    /// Latched network end-of-session state (LAN only): the peer left, the
+    /// connection died, or the session desynced. Presentation-level — the
+    /// sim simply stops advancing.
+    net_end: Option<NetEnd>,
+    /// Whether the LAN tick barrier has been stalled long enough to show the
+    /// "waiting for player" overlay (M8-B P3; the original's frame-sync
+    /// wait). Cleared the moment a tick completes.
+    net_waiting: bool,
     /// Commands emitted since the last [`AppCore::drain_commands`] (for the net
     /// layer / tests to observe).
     emitted: Vec<Command>,
@@ -537,7 +607,10 @@ impl AppCore {
             prev_coords: BTreeMap::new(),
             selected: Vec::new(),
             drag: None,
-            transport: LocalTransport::new(),
+            transport: NetTransport::Local(LocalTransport::new()),
+            mp_remote_house: None,
+            net_end: None,
+            net_waiting: false,
             emitted: Vec::new(),
             sidebar_enabled: false,
             player_house: None,
@@ -828,14 +901,30 @@ impl AppCore {
 
     /// The current terminal game state (Ongoing / Victory / Defeat), surfaced for
     /// the overlay, the shell, and tests.
+    ///
+    /// LAN games (M8-B): the sim carries **no** designated player house — it
+    /// must stay byte-identical on both peers, and `World::player_house` is
+    /// hashed — so win/lose is a symmetric *read* over the identical state:
+    /// your elimination is Defeat, the peer's is Victory (the classic MP
+    /// check, `house.cpp:1290`, evaluated client-side per seat). Both clients
+    /// agree because both worlds are hash-identical.
     pub fn game_over(&self) -> GameOver {
+        if let (Some(remote), Some(local)) = (self.mp_remote_house, self.player_house) {
+            return if !self.world.house_alive(local) {
+                GameOver::Defeat
+            } else if !self.world.house_alive(remote) {
+                GameOver::Victory
+            } else {
+                GameOver::Ongoing
+            };
+        }
         self.world.game_over()
     }
 
     /// Whether the UI still accepts player orders — false once the game is over
     /// (§4.9 M6: "stops accepting orders").
     fn accepting_orders(&self) -> bool {
-        self.world.game_over() == GameOver::Ongoing
+        self.game_over() == GameOver::Ongoing
     }
 
     /// The controlled house's spendable credits (0 if none / no house).
@@ -997,6 +1086,60 @@ impl AppCore {
     /// without synthesizing pixel-accurate mouse events.
     pub fn inject_command(&mut self, cmd: Command) {
         self.transport.submit(cmd);
+    }
+
+    /// Swap in a LAN lockstep transport (M8-B): the sim now advances only
+    /// when the tick barrier opens, and `remote_house` is the peer's seat for
+    /// the multiplayer win/lose read ([`AppCore::game_over`]). Call before
+    /// the first `update` — the transport's tick 0 must align with a fresh
+    /// world.
+    pub fn install_lan(&mut self, transport: LanTransport, remote_house: u8) {
+        self.transport = NetTransport::Lan(Box::new(transport));
+        self.mp_remote_house = Some(remote_house);
+    }
+
+    /// The remote player's house in a LAN game.
+    pub fn remote_house(&self) -> Option<u8> {
+        self.mp_remote_house
+    }
+
+    /// The latched network end-of-session state, if any (LAN only).
+    pub fn net_end(&self) -> Option<NetEnd> {
+        self.net_end
+    }
+
+    /// Whether the "waiting for player" barrier overlay is currently up.
+    pub fn net_waiting(&self) -> bool {
+        self.net_waiting
+    }
+
+    /// Send the clean-quit message to the LAN peer (so they see "player
+    /// left" instead of waiting out the timeout). Call when leaving an
+    /// in-progress LAN game; a no-op in single player.
+    pub fn notify_net_quit(&mut self) {
+        if let NetTransport::Lan(t) = &mut self.transport {
+            t.send_quit();
+        }
+    }
+
+    /// Keep the LAN connection alive without advancing the sim: drains the
+    /// socket (answering the peer's re-requests), sends keepalives, and runs
+    /// the timeout check. The menu calls this while the game is paused or on
+    /// an end screen — a paused player must read as "stalled" to the peer
+    /// (their barrier waits), never as "vanished" (a spurious timeout).
+    /// No-op in single player.
+    pub fn net_service(&mut self) {
+        if let NetTransport::Lan(t) = &mut self.transport {
+            t.service();
+            if self.net_end.is_none() {
+                if let Some(l) = t.connection_lost() {
+                    self.net_end = Some(match l.reason {
+                        LostReason::PeerQuit => NetEnd::PeerLeft,
+                        LostReason::Timeout => NetEnd::ConnectionLost,
+                    });
+                }
+            }
+        }
     }
 
     /// The current sim state hash — the determinism backbone surfaced through
@@ -1179,7 +1322,8 @@ impl AppCore {
         self.tick_frac = (self.virtual_ms.saturating_mul(TICKS_PER_SECOND) % 1000) as u32;
 
         // Transition-driven audio cues (win/lose, low power) — cosmetic.
-        let go = self.world.game_over();
+        // (`self.game_over()` so LAN games fire the cue too.)
+        let go = self.game_over();
         if go != self.prev_game_over {
             match go {
                 GameOver::Victory => self.push_sound(SoundEvent::Victory),
@@ -1210,8 +1354,39 @@ impl AppCore {
         // LanTransport will stall at the tick barrier).
         let tick = self.world.tick_count();
         let cmds = match self.transport.poll(tick) {
-            PollResult::Ready(bundle) => bundle.flatten(),
-            PollResult::Waiting | PollResult::Desync(_) => return,
+            PollResult::Ready(bundle) => {
+                self.net_waiting = false;
+                bundle.flatten()
+            }
+            PollResult::Waiting => {
+                // LAN tick barrier: the sim stalls, never free-runs. After a
+                // sustained stall, raise the "waiting for player" overlay
+                // (the original's frame-sync wait); it clears seamlessly on
+                // the next Ready.
+                if let NetTransport::Lan(t) = &self.transport {
+                    if t.stalled_polls_current_tick() > STALL_OVERLAY_POLLS {
+                        self.net_waiting = true;
+                    }
+                }
+                return;
+            }
+            PollResult::Desync(_) => {
+                self.net_waiting = false;
+                if self.net_end.is_none() {
+                    self.net_end = Some(NetEnd::Desync);
+                }
+                return;
+            }
+            PollResult::ConnectionLost(l) => {
+                self.net_waiting = false;
+                if self.net_end.is_none() {
+                    self.net_end = Some(match l.reason {
+                        LostReason::PeerQuit => NetEnd::PeerLeft,
+                        LostReason::Timeout => NetEnd::ConnectionLost,
+                    });
+                }
+                return;
+            }
         };
 
         self.prev_coords.clear();
@@ -1676,6 +1851,7 @@ impl AppCore {
         }
         self.draw_sidebar(&mut frame);
         self.draw_game_over(&mut frame);
+        self.draw_net_waiting(&mut frame);
         self.draw_help_overlay(&mut frame);
         // Sell/repair mode reminders, drawn topmost: a mode banner near the top
         // of the tactical area and the mode cursor glyph at the pointer.
@@ -1756,8 +1932,41 @@ impl AppCore {
     }
 
     /// Draw the centred VICTORY / DEFEAT banner once the skirmish resolves.
+    /// "WAITING FOR PLAYER" barrier overlay (M8-B P3): a small banner over
+    /// the tactical area while the LAN tick barrier is stalled. Purely
+    /// presentational — it appears/disappears with [`AppCore::net_waiting`]
+    /// and never touches the sim.
+    fn draw_net_waiting(&self, frame: &mut RgbaImage) {
+        if !self.net_waiting {
+            return;
+        }
+        let text = "WAITING FOR PLAYER...";
+        let scale = 2;
+        let tw = font::text_width(text) * scale;
+        let th = font::GLYPH_H * scale;
+        let cx = (self.tactical_width() as i32 - tw) / 2;
+        let cy = 40;
+        fill_rect(
+            frame,
+            cx - 10,
+            cy - 8,
+            cx + tw + 10,
+            cy + th + 8,
+            [12, 12, 16],
+        );
+        draw_rect_outline(
+            frame,
+            cx - 10,
+            cy - 8,
+            cx + tw + 10,
+            cy + th + 8,
+            [90, 110, 160],
+        );
+        font::draw_text_scaled(frame, cx, cy, text, [230, 230, 240], scale);
+    }
+
     fn draw_game_over(&self, frame: &mut RgbaImage) {
-        let (text, rgb) = match self.world.game_over() {
+        let (text, rgb) = match self.game_over() {
             GameOver::Ongoing => return,
             GameOver::Victory => ("VICTORY", [120, 240, 120]),
             GameOver::Defeat => ("DEFEAT", [240, 90, 90]),

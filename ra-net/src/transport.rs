@@ -179,6 +179,29 @@ pub struct DesyncDetected {
     pub peer: SeatId,
 }
 
+/// Why a peer is gone (M8-B P3). Deliberately distinct from
+/// [`DesyncDetected`]: a vanished peer is a *connectivity* verdict, a hash
+/// mismatch is a *determinism* verdict, and the client must be able to show
+/// different end screens for them ("connection lost" / "player left" vs
+/// "out of sync").
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LostReason {
+    /// Nothing has been received from the peer for the transport's keepalive
+    /// timeout — the peer crashed, the cable was pulled, or the route died.
+    Timeout,
+    /// The peer sent a clean QUIT datagram on exit ("player left").
+    PeerQuit,
+}
+
+/// A latched peer-gone state (sticky, like [`DesyncDetected`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ConnectionLost {
+    /// The tick the local endpoint was assembling when the loss latched.
+    pub tick: Tick,
+    /// Why the peer is considered gone.
+    pub reason: LostReason,
+}
+
 /// Outcome of [`CommandTransport::poll`]. Non-blocking by design: a transport
 /// can never wait on a thread or the wall clock (§4.2), so "not yet" and
 /// "diverged" are values, not conditions.
@@ -198,6 +221,13 @@ pub enum PollResult {
     /// The session has diverged (hash mismatch). Sticky: every subsequent
     /// poll returns the same state.
     Desync(DesyncDetected),
+    /// The peer is gone (keepalive timeout or clean quit) — the networked
+    /// analogue of the original's "connection lost" teardown, surfaced as a
+    /// state instead of a hang (M8-B P3). Sticky, and **never** conflated with
+    /// [`PollResult::Desync`]: a dead peer produced no mismatching hash.
+    /// In-process transports ([`crate::LocalTransport`],
+    /// [`crate::PairTransport`]) never return this.
+    ConnectionLost(ConnectionLost),
 }
 
 /// One trait in `ra-net` behind which everything network-shaped hides

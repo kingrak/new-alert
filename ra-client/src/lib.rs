@@ -29,5 +29,5 @@ pub mod unit_render;
 #[cfg(feature = "window")]
 pub mod shell;
 
-pub use appcore::{AppCore, Command, Frame, SoundEvent};
+pub use appcore::{AppCore, Command, Frame, NetEnd, SoundEvent};
 pub use input::{InputEvent, Key, MouseButton, Rect};

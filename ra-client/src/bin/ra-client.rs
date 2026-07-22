@@ -215,14 +215,29 @@ fn cmd_window(mut args: Vec<String>) -> Result<(), BoxErr> {
         maps.len(),
         platform::user_maps_dir()
     );
+    // LAN player name: `--name NAME`, else $USER, else a default (M8-B).
+    let player_name = take_flag(&mut args, "--name")
+        .or_else(|| std::env::var("USER").ok())
+        .unwrap_or_else(|| "COMMANDER".to_string());
+
     let app = ra_client::menu::App::new(maps, Box::new(factory));
     // Enable the single-player Allied campaign (scg*ea.ini) if the archives are
-    // readable — the factory scans/builds missions on demand.
+    // readable — the factory scans/builds missions on demand — and the LAN
+    // multiplayer flow (M8-B), which needs its own archive-backed factory.
     let app = match (
         std::fs::read(dir.join("main.mix")),
         std::fs::read(dir.join("redalert.mix")),
     ) {
-        (Ok(m), Ok(r)) => app.with_campaign(Box::new(assets::ArchiveCampaignFactory::new(m, r))),
+        (Ok(m), Ok(r)) => {
+            let lan_factory =
+                assets::ArchiveFactory::new(m.clone(), r.clone(), platform::user_maps_dir());
+            app.with_campaign(Box::new(assets::ArchiveCampaignFactory::new(m, r)))
+                .with_lan(
+                    Box::new(lan_factory),
+                    ra_net::DiscoveryConfig::default(),
+                    &player_name,
+                )
+        }
         _ => app,
     };
 

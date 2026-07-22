@@ -1,50 +1,38 @@
-//! M8-A proof test (c): real-scenario lockstep — an AI-vs-AI match on a real
-//! map (`scg05ea.ini`, real terrain/rules/houses) where each AI's commands
-//! flow through `ra-net`'s [`PairTransport`] *as if it were a remote player*,
-//! and the two independent game instances must stay hash-chain-identical the
-//! whole way.
+//! M8-B proof test (b, real-map half): the M8-A real-scenario AI-vs-AI
+//! lockstep match (`net_lockstep_realmap.rs`) re-run with the in-process
+//! `PairTransport` swapped for two real **UDP** `LanTransport` endpoints on
+//! 127.0.0.1 (OS-assigned ports — never fixed). Same architecture: each
+//! instance owns its own `World` and steps ONLY its own house's `AiPlayer`
+//! externally; the only way either house acts in either world is via
+//! commands that crossed the socket with the input-delay stamp
+//! (QUEUE.CPP:2526). Hash chains must stay identical the whole way.
 //!
-//! Architecture under test (DESIGN.md §4.6): each instance owns its own
-//! `World` (built from the same bytes → byte-identical start) and steps ONLY
-//! its own house's `AiPlayer` — externally, against its local world, with its
-//! own command RNG — submitting the resulting commands through the transport.
-//! Neither world has an installed (`set_ai`) controller, so the *only* way
-//! either house acts in either world is via commands that crossed the
-//! lockstep pipeline with the input-delay stamp (queue.cpp:2526). This is
-//! exactly the remote-player shape M8-B's LAN transport will drive.
-//!
-//! The world loader is a near-copy of `ui_ai_vs_ai.rs`'s
-//! `load_ai_vs_ai_from_bytes` (itself the established "duplicate a `pub fn`
-//! loader, change one field" pattern) with one deliberate difference: no
-//! `world.set_ai(..)` — both controllers live outside the worlds.
-//!
-//! Budgets follow the M7.20 lesson: bounded tick budget plus a hard
-//! wall-clock guard so this can never hang a suite run; non-vacuity asserts
-//! (M7.19 lesson) prove commands flowed and bases actually grew before the
-//! identity claim counts.
+//! Budgets per the M7.20 lesson: bounded ticks + a hard wall-clock guard,
+//! with a minimum-progress floor so the run cannot silently go vacuous.
 
 mod support;
 
+use std::net::UdpSocket;
 use std::time::Instant;
 
 use ra_client::assets::{self, build_content, load_from_bytes};
 use ra_data::house::{house_from_name, HOUSE_COUNT};
 use ra_formats::ini::Ini;
 use ra_formats::mix::MixArchive;
-use ra_net::{CommandTransport, PairTransport, PollResult, DEFAULT_INPUT_DELAY};
+use ra_net::{CommandTransport, LanTransport, PollResult, DEFAULT_INPUT_DELAY};
 use ra_sim::coords::{CellCoord, Facing};
 use ra_sim::{AiPlayer, Command, Difficulty, OreField, Passability, RandomLcg, World};
 
 const CREDITS: i32 = 6000;
 const SCENARIO: &str = "scg05ea.ini";
-/// Bounded tick budget: 8 sim-minutes at 15 ticks/s — enough for both AIs to
-/// deploy their MCVs, build up a base, and produce and move units, all
-/// through the transport (measured ~4s of wall time per 1800 ticks in debug).
-const MAX_TICKS: u32 = 7200;
-/// Hard wall-clock guard (M7.20): bail — with the identity already proven for
-/// every completed tick — rather than hang, but require enough progress that
-/// the run cannot silently become vacuous.
-const WALL_SECS: u64 = 240;
+/// Bounded tick budget: 4 sim-minutes at 15 ticks/s — both AIs deploy,
+/// build up, and produce/move units, all through real sockets. (Half the
+/// PairTransport run's budget: that test already proves the long haul; this
+/// one proves the socketed medium.)
+const MAX_TICKS: u32 = 3600;
+/// Hard wall-clock guard: bail with the identity already proven for every
+/// completed tick rather than hang.
+const WALL_SECS: u64 = 180;
 const MIN_TICKS: u32 = 600;
 
 struct LockstepGame {
@@ -53,9 +41,8 @@ struct LockstepGame {
     house_b: u8,
 }
 
-/// Near-copy of `ui_ai_vs_ai.rs::load_ai_vs_ai_from_bytes`, with one
-/// deliberate difference: **no `set_ai`** — the returned `World` contains no
-/// controllers at all, so it only ever changes through `tick(&commands)`.
+/// Verbatim from `net_lockstep_realmap.rs` (the established loader-copy
+/// pattern): a controller-free world — no `set_ai`, no designated player.
 fn load_headless_world(
     main_bytes: &[u8],
     redalert_bytes: &[u8],
@@ -99,7 +86,7 @@ fn load_headless_world(
 
     let (start_a, start_b) = two_starts(&world, &scen_ini);
 
-    let mcv_proto = content.catalog.units[0].clone(); // U_MCV, per assets.rs's own convention
+    let mcv_proto = content.catalog.units[0].clone();
     let spawn_mcv = |world: &mut World, house: u8, cell: CellCoord| {
         let h = world.spawn_unit(
             mcv_proto.sprite_id,
@@ -123,8 +110,7 @@ fn load_headless_world(
     })
 }
 
-/// Two well-separated, land-connected starts (verbatim from `ui_ai_vs_ai.rs`,
-/// see its doc comment for the BFS-reachability rationale).
+/// Verbatim from `net_lockstep_realmap.rs` / `ui_ai_vs_ai.rs`.
 fn two_starts(world: &World, scen_ini: &Ini) -> (CellCoord, CellCoord) {
     let mut waypoints: Vec<CellCoord> = scen_ini
         .section_entries("Waypoints")
@@ -209,10 +195,21 @@ fn building_count(world: &World, house: u8) -> usize {
         .count()
 }
 
-/// Proof test (c): full lockstep protocol on a real scenario, both AIs as
-/// remote players, per-tick hash-chain identity between the two instances.
+/// Two directly-connected UDP endpoints on loopback, OS-assigned ports.
+fn udp_pair(seat_a: u8, seat_b: u8) -> (LanTransport, LanTransport) {
+    let sa = UdpSocket::bind("127.0.0.1:0").expect("bind");
+    let sb = UdpSocket::bind("127.0.0.1:0").expect("bind");
+    let aa = sa.local_addr().unwrap();
+    let ab = sb.local_addr().unwrap();
+    let ta = LanTransport::new(sa, ab, seat_a, seat_b, DEFAULT_INPUT_DELAY, true).unwrap();
+    let tb = LanTransport::new(sb, aa, seat_b, seat_a, DEFAULT_INPUT_DELAY, false).unwrap();
+    (ta, tb)
+}
+
+/// Proof (b, real map): the full lockstep protocol on a real scenario over
+/// real UDP sockets — per-tick hash-chain identity between the instances.
 #[test]
-fn real_scenario_ai_vs_ai_lockstep_hash_identical() {
+fn real_scenario_ai_vs_ai_lan_lockstep_hash_identical() {
     if !support::real_assets_available() {
         eprintln!(
             "SKIP: real assets not found under {} (set RA_ASSETS_DIR or copy \
@@ -225,7 +222,6 @@ fn real_scenario_ai_vs_ai_lockstep_hash_identical() {
     let main_bytes = std::fs::read(dir.join("main.mix")).expect("main.mix should read");
     let redalert_bytes = std::fs::read(dir.join("redalert.mix")).expect("redalert.mix should read");
 
-    // Two independent instances from the same bytes: byte-identical starts.
     let ga = load_headless_world(&main_bytes, &redalert_bytes, SCENARIO, CREDITS)
         .unwrap_or_else(|e| panic!("{SCENARIO}: failed to load instance A: {e}"));
     let gb = load_headless_world(&main_bytes, &redalert_bytes, SCENARIO, CREDITS)
@@ -239,15 +235,12 @@ fn real_scenario_ai_vs_ai_lockstep_hash_identical() {
         "instances must start byte-identical"
     );
 
-    // Each instance runs ONLY its own house's controller, externally, with its
-    // own command RNG (the remote-player shape; the sim RNG inside each world
-    // is never touched by the controllers).
     let mut ai_a = AiPlayer::new(house_a, Difficulty::Normal);
     let mut ai_b = AiPlayer::new(house_b, Difficulty::Normal);
     let mut rng_a = RandomLcg::new(0xA11C_E501);
     let mut rng_b = RandomLcg::new(0xB0B5_1DE5);
 
-    let (mut tp_a, mut tp_b) = PairTransport::pair(house_a, house_b, DEFAULT_INPUT_DELAY, None);
+    let (mut tp_a, mut tp_b) = udp_pair(house_a, house_b);
 
     let start = Instant::now();
     let mut submitted_a = 0u64;
@@ -262,7 +255,6 @@ fn real_scenario_ai_vs_ai_lockstep_hash_identical() {
             );
             break;
         }
-        // Local input generation, per instance, against the local world only.
         cmds.clear();
         ai_a.step(&world_a, &mut rng_a, &mut cmds);
         submitted_a += cmds.len() as u64;
@@ -276,9 +268,6 @@ fn real_scenario_ai_vs_ai_lockstep_hash_identical() {
             tp_b.submit(c);
         }
 
-        // Lockstep: poll both endpoints to Ready (clean link — no stalls
-        // expected beyond the barrier's own bookkeeping), apply, exchange
-        // hashes.
         let mut bundle_a = None;
         let mut bundle_b = None;
         let mut spins = 0u32;
@@ -288,21 +277,23 @@ fn real_scenario_ai_vs_ai_lockstep_hash_identical() {
                     PollResult::Ready(x) => bundle_a = Some(x),
                     PollResult::Waiting => {}
                     PollResult::Desync(d) => panic!("instance A desynced: {d:?}"),
-                    // M8-B: socketed transports only; PairTransport cannot lose a peer.
                     PollResult::ConnectionLost(l) => panic!("instance A lost its peer: {l:?}"),
                 }
+            } else {
+                tp_a.service();
             }
             if bundle_b.is_none() {
                 match tp_b.poll(t) {
                     PollResult::Ready(x) => bundle_b = Some(x),
                     PollResult::Waiting => {}
                     PollResult::Desync(d) => panic!("instance B desynced: {d:?}"),
-                    // M8-B: socketed transports only; PairTransport cannot lose a peer.
                     PollResult::ConnectionLost(l) => panic!("instance B lost its peer: {l:?}"),
                 }
+            } else {
+                tp_b.service();
             }
             spins += 1;
-            assert!(spins < 100_000, "lockstep deadlock at tick {t}");
+            assert!(spins < 500_000, "lockstep deadlock at tick {t}");
         }
         let bundle_a = bundle_a.unwrap();
         let bundle_b = bundle_b.unwrap();
@@ -321,14 +312,17 @@ fn real_scenario_ai_vs_ai_lockstep_hash_identical() {
     }
 
     eprintln!(
-        "{SCENARIO}: {ticks_run} lockstep ticks in {:.1}s; {submitted_a} cmds from A(house {house_a}), \
-         {submitted_b} from B(house {house_b}); buildings A={}, B={}",
+        "{SCENARIO}: {ticks_run} LAN lockstep ticks in {:.1}s; {submitted_a} cmds from A(house {house_a}), \
+         {submitted_b} from B(house {house_b}); buildings A={}, B={}; decode errors {}+{}",
         start.elapsed().as_secs_f64(),
         building_count(&world_a, house_a),
         building_count(&world_a, house_b),
+        tp_a.decode_errors(),
+        tp_b.decode_errors(),
     );
 
-    // Non-vacuity (M7.19): the game must have actually happened.
+    // Non-vacuity (M7.19): the game must have actually happened, through the
+    // sockets.
     assert!(
         ticks_run >= MIN_TICKS,
         "only {ticks_run} ticks completed before the wall-clock guard — too little to be a \
@@ -338,8 +332,6 @@ fn real_scenario_ai_vs_ai_lockstep_hash_identical() {
         submitted_a > 10 && submitted_b > 10,
         "AIs submitted too few commands (A={submitted_a}, B={submitted_b}) — commands did not flow"
     );
-    // Both houses must have deployed and built: base growth visible in BOTH
-    // worlds (they are hash-identical, but check each independently anyway).
     for (name, w) in [("A", &world_a), ("B", &world_b)] {
         assert!(
             building_count(w, house_a) >= 2 && building_count(w, house_b) >= 2,
@@ -356,5 +348,12 @@ fn real_scenario_ai_vs_ai_lockstep_hash_identical() {
         distinct.len(),
         chain.len()
     );
+    assert_eq!(
+        tp_a.decode_errors(),
+        0,
+        "clean sockets must decode all traffic"
+    );
+    assert_eq!(tp_b.decode_errors(), 0);
     assert!(tp_a.desync().is_none() && tp_b.desync().is_none());
+    assert!(tp_a.connection_lost().is_none() && tp_b.connection_lost().is_none());
 }

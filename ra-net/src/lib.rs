@@ -5,11 +5,13 @@
 //!
 //! # Contracts (DESIGN.md §4.6, §4.7)
 //!
-//! - **std-only.** This crate may talk `std::net` and nothing below it; in
-//!   M8-A it does not even do that — no sockets, no async, no threads, no
-//!   wall-clock. Anything OS-conditional in later stages hides behind the
-//!   [`CommandTransport`] impls; a `#[cfg(target_os)]` anywhere in this crate
-//!   fails review (§4.7).
+//! - **std-only.** This crate may talk `std::net` and nothing below it — no
+//!   async, no threads. As of M8-B the [`LanTransport`]/lobby layer uses
+//!   non-blocking UDP sockets and transport-local wall-clock (keepalives,
+//!   timeouts — never command scheduling); the in-process transports remain
+//!   socket- and clock-free. Anything OS-conditional hides in
+//!   [`platform`]; a `#[cfg(target_os)]` anywhere else in this crate fails
+//!   review (§4.7).
 //! - **No sim dependency beyond `ra-sim` types.** The transport moves
 //!   [`ra_sim::Command`] values, tick numbers, and 64-bit state hashes. It
 //!   never constructs, reads, or mutates a `World`; the sim only ever consumes
@@ -36,7 +38,9 @@
 //!   preserving single-player behavior exactly, plus [`PairTransport`] — two
 //!   in-process endpoints over deterministic in-memory queues, the socket-free
 //!   rehearsal of the full LAN lockstep protocol.
-//! - Stage 2 (M8-B): `LanTransport` — UDP peer-to-peer, same scheduler.
+//! - Stage 2 (M8-B, this cycle): [`LanTransport`] — UDP peer-to-peer over
+//!   the [`wire`] datagram format, same scheduler/barrier/hash semantics,
+//!   plus broadcast discovery and a host-authoritative lobby ([`lobby`]).
 //! - Stage 3: `RelayTransport` — server-sequenced internet play.
 //!
 //! One deliberate deviation from the §4.6 trait sketch: `poll` returns
@@ -46,12 +50,24 @@
 //! waits that §4.2/§4.7 forbid in this layer; the enum also carries the desync
 //! state the same non-blocking way.
 
+pub mod lan;
+pub mod lobby;
 pub mod local;
 pub mod pair;
+pub mod platform;
 pub mod scheduler;
 pub mod transport;
+pub mod wire;
 
+pub use lan::{LanTransport, PEER_TIMEOUT, REDUNDANT_TICKS};
+pub use lobby::{
+    DiscoveredSession, DiscoveryConfig, HostLobby, JoinLobby, SessionBrowser, SessionSettings,
+    WelcomeInfo,
+};
 pub use local::LocalTransport;
 pub use pair::{JitterConfig, PairTransport};
 pub use scheduler::{InputScheduler, DEFAULT_INPUT_DELAY};
-pub use transport::{CommandTransport, DesyncDetected, PollResult, SeatId, Tick, TickBundle};
+pub use transport::{
+    CommandTransport, ConnectionLost, DesyncDetected, LostReason, PollResult, SeatId, Tick,
+    TickBundle,
+};

@@ -129,6 +129,9 @@ fn try_poll(i: &mut Instance, t: u32) -> Result<Option<TickBundle>, DesyncDetect
         PollResult::Ready(b) => Ok(Some(b)),
         PollResult::Waiting => Ok(None),
         PollResult::Desync(d) => Err(d),
+        // M8-B: `ConnectionLost` exists for socketed transports only; an
+        // in-process PairTransport returning it would be a protocol bug.
+        PollResult::ConnectionLost(l) => panic!("PairTransport cannot lose its peer: {l:?}"),
     }
 }
 

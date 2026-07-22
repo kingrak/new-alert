@@ -153,6 +153,36 @@ pub trait CampaignFactory {
     fn build(&self, scenario: &str, difficulty: Difficulty) -> Result<BuiltMission, String>;
 }
 
+/// Everything a LAN game build needs (M8-B): the host-authoritative settings
+/// plus which seat is local. Both peers call their factory with the same
+/// settings (map/seed/credits and both seats), differing only in
+/// `local_house`/`remote_house` orientation — the built `World`s must be
+/// byte-identical.
+#[derive(Clone, Debug)]
+pub struct LanGameSpec {
+    /// Scenario filename both sides load.
+    pub map_filename: String,
+    /// World RNG seed (host-chosen).
+    pub seed: u32,
+    /// Starting credits for both houses.
+    pub credits: i32,
+    /// The local player's house (sidebar/camera/orders gate to it).
+    pub local_house: u8,
+    /// The remote player's house.
+    pub remote_house: u8,
+    /// The session host's house (start-position assignment is keyed to the
+    /// host seat on both sides, so the worlds agree).
+    pub host_house: u8,
+}
+
+/// Builds a LAN-game [`AppCore`] (world identical across peers; presentation
+/// oriented to the local seat). The real implementation reads the archives;
+/// tests inject a synthetic one.
+pub trait LanGameFactory {
+    /// Build the core plus the local player's start cell.
+    fn build(&self, spec: &LanGameSpec) -> Result<(AppCore, CellCoord), String>;
+}
+
 /// The current top-level UI state.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AppState {
@@ -164,12 +194,25 @@ pub enum AppState {
     CampaignList,
     /// Mission briefing text screen (before play).
     Briefing,
+    /// Multiplayer host/join chooser (M8-B).
+    MultiplayerMenu,
+    /// LAN host: map + credits selection before opening the lobby.
+    LanHostSetup,
+    /// LAN host: session open, waiting for a joiner / their READY.
+    LanHostLobby,
+    /// LAN join: discovered-session list.
+    LanJoinBrowse,
+    /// LAN join: joined a session, confirming READY / awaiting START.
+    LanJoinLobby,
     /// A running game (delegates to [`AppCore`]).
     InGame,
     /// In-game pause overlay (sim frozen).
     Paused,
     /// Victory/Defeat resolved; awaiting Continue (sim frozen).
     GameOver,
+    /// A LAN session ended abnormally (peer left / connection lost / out of
+    /// sync); showing the message, awaiting Continue.
+    NetEnded,
 }
 
 /// The setup screen's current selections (indices into the option tables).
@@ -207,6 +250,23 @@ impl Default for SkirmishConfig {
 enum Action {
     GotoSkirmish,
     GotoCampaign,
+    GotoMultiplayer,
+    GotoLanHostSetup,
+    GotoLanJoin,
+    /// Open the host lobby with the current map/credits selections.
+    LanCreate,
+    /// Host: fire START (enabled only when the joiner is READY).
+    LanStart,
+    /// Host: cancel the open session.
+    LanCancelHost,
+    /// Joiner: join the session list entry at this index.
+    LanJoinSession(usize),
+    /// Joiner: confirm READY.
+    LanReady,
+    /// Joiner: leave the joined lobby.
+    LanLeaveJoin,
+    /// Leave the NetEnded screen.
+    NetContinue,
     Quit,
     SelectMap(usize),
     ScrollMaps(i32),
@@ -266,6 +326,22 @@ pub struct App {
     in_campaign: bool,
     /// A mission core built eagerly by the briefing screen, ready to play.
     pending_core: Option<(AppCore, CellCoord)>,
+    // --- LAN multiplayer (M8-B). All `None`/empty unless `with_lan` was
+    // called AND the player entered the multiplayer flow; the single-player
+    // states never touch them. ---
+    lan_factory: Option<Box<dyn LanGameFactory>>,
+    lan_cfg: ra_net::DiscoveryConfig,
+    /// Local player display name (announcements / lobby lists).
+    lan_name: String,
+    host_lobby: Option<ra_net::HostLobby>,
+    join_browser: Option<ra_net::SessionBrowser>,
+    join_lobby: Option<ra_net::JoinLobby>,
+    /// Last lobby-flow error, shown on the multiplayer screens.
+    lan_error: Option<String>,
+    /// Whether the running game is a LAN game.
+    in_lan_game: bool,
+    /// Message shown on the [`AppState::NetEnded`] screen.
+    net_end_message: String,
     core: Option<AppCore>,
     viewport_w: u32,
     viewport_h: u32,
@@ -299,6 +375,15 @@ impl App {
             briefing_text: String::new(),
             in_campaign: false,
             pending_core: None,
+            lan_factory: None,
+            lan_cfg: ra_net::DiscoveryConfig::default(),
+            lan_name: "COMMANDER".to_string(),
+            host_lobby: None,
+            join_browser: None,
+            join_lobby: None,
+            lan_error: None,
+            in_lan_game: false,
+            net_end_message: String::new(),
             core: None,
             viewport_w: 1024,
             viewport_h: 768,
@@ -317,6 +402,66 @@ impl App {
         self.campaign_missions = factory.missions();
         self.campaign_factory = Some(factory);
         self
+    }
+
+    /// Install the LAN factory + discovery wiring, enabling the Multiplayer
+    /// button (M8-B). Without this the multiplayer states are unreachable and
+    /// the main menu is pixel-identical to before (same golden-preserving
+    /// pattern as the campaign button). Chainable after [`App::new`].
+    pub fn with_lan(
+        mut self,
+        factory: Box<dyn LanGameFactory>,
+        cfg: ra_net::DiscoveryConfig,
+        player_name: &str,
+    ) -> App {
+        self.lan_factory = Some(factory);
+        self.lan_cfg = cfg;
+        self.lan_name = player_name.to_string();
+        self
+    }
+
+    /// Mutable discovery config (test hook: aim announcements at an
+    /// OS-assigned browser port instead of the fixed LAN port).
+    pub fn lan_config_mut(&mut self) -> &mut ra_net::DiscoveryConfig {
+        &mut self.lan_cfg
+    }
+
+    /// The open host lobby, if hosting (tests / status display).
+    pub fn host_lobby(&self) -> Option<&ra_net::HostLobby> {
+        self.host_lobby.as_ref()
+    }
+
+    /// The joined lobby, if joining (tests / status display).
+    pub fn join_lobby(&self) -> Option<&ra_net::JoinLobby> {
+        self.join_lobby.as_ref()
+    }
+
+    /// The discovery browser's actually-bound port (tests aim the host at it).
+    pub fn browser_port(&self) -> Option<u16> {
+        self.join_browser.as_ref().map(|b| b.port())
+    }
+
+    /// The current discovered-session list (joiner browse screen).
+    pub fn lan_sessions(&self) -> Vec<ra_net::DiscoveredSession> {
+        self.join_browser
+            .as_ref()
+            .map(|b| b.sessions().to_vec())
+            .unwrap_or_default()
+    }
+
+    /// The last lobby-flow error, if any.
+    pub fn lan_error(&self) -> Option<&str> {
+        self.lan_error.as_deref()
+    }
+
+    /// The NetEnded screen's message (tests).
+    pub fn net_end_message(&self) -> &str {
+        &self.net_end_message
+    }
+
+    /// Whether the running game is a LAN game.
+    pub fn in_lan_game(&self) -> bool {
+        self.in_lan_game
     }
 
     /// The scanned campaign mission list (for tests / the shell).
@@ -444,11 +589,211 @@ impl App {
     }
 
     /// Return to the main menu, discarding any running game (fresh World next
-    /// time — no state leaks between games).
+    /// time — no state leaks between games). A LAN game tells the peer first
+    /// (clean "player left" instead of their keepalive timeout).
     pub fn quit_to_menu(&mut self) {
+        if self.in_lan_game {
+            if let Some(c) = self.core.as_mut() {
+                c.notify_net_quit();
+            }
+        }
+        self.in_lan_game = false;
+        self.lan_teardown();
         self.core = None;
         self.state = AppState::MainMenu;
         self.focus = 0;
+    }
+
+    // -------------------------------------------------------------------------
+    // LAN multiplayer flow (M8-B). Host is authority on settings; both sides
+    // must confirm before START; every wait is bounded (the lobby objects
+    // carry the timeouts).
+    // -------------------------------------------------------------------------
+
+    /// The fixed LAN seats: host = Greece (1), joiner = USSR (2). Seat ids
+    /// are house ids (canonical bundle order, `Execute_DoList`'s house-array
+    /// order); a seat picker is deliberately out of scope for M8-B.
+    pub const LAN_HOST_HOUSE: u8 = 1;
+    /// The joiner's house.
+    pub const LAN_JOIN_HOUSE: u8 = 2;
+
+    /// Drop every live lobby object (cancelling/leaving politely).
+    fn lan_teardown(&mut self) {
+        if let Some(h) = self.host_lobby.take() {
+            h.cancel();
+        }
+        if let Some(j) = self.join_lobby.take() {
+            j.leave();
+        }
+        self.join_browser = None;
+    }
+
+    /// Host: open the lobby with the currently selected map + credits.
+    /// Public as a verification hook (the UI reaches it via CREATE GAME).
+    pub fn lan_host_create(&mut self) {
+        let Some(map) = self.maps.get(self.config.map) else {
+            self.lan_error = Some("no map selected".to_string());
+            return;
+        };
+        // Seed: wall clock is fine here — this is the menu layer picking a
+        // session parameter; the sim only ever sees the resulting constant,
+        // which the host transmits to the joiner (host authority).
+        let seed = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| (d.as_secs() as u32) ^ d.subsec_nanos())
+            .unwrap_or(0x1234_5678);
+        let settings = ra_net::SessionSettings {
+            map: map.filename.clone(),
+            seed,
+            credits: CREDITS[self.config.credits.min(CREDITS.len() - 1)],
+            host_seat: App::LAN_HOST_HOUSE,
+            join_seat: App::LAN_JOIN_HOUSE,
+            delay: ra_net::DEFAULT_INPUT_DELAY,
+        };
+        match ra_net::HostLobby::create(&self.lan_name, settings, &self.lan_cfg) {
+            Ok(lobby) => {
+                self.host_lobby = Some(lobby);
+                self.lan_error = None;
+                self.state = AppState::LanHostLobby;
+                self.focus = 0;
+            }
+            Err(e) => self.lan_error = Some(format!("could not open session: {e}")),
+        }
+    }
+
+    /// Joiner: enter the browse screen (binds the discovery listener).
+    fn lan_goto_browse(&mut self) {
+        match ra_net::SessionBrowser::bind(&self.lan_cfg) {
+            Ok(b) => {
+                self.join_browser = Some(b);
+                self.lan_error = None;
+                self.state = AppState::LanJoinBrowse;
+                self.focus = 0;
+            }
+            Err(e) => {
+                self.lan_error = Some(format!(
+                    "could not listen for sessions: {e} (another joiner on this machine?)"
+                ));
+            }
+        }
+    }
+
+    /// Joiner: join the session-list entry at `idx` (verification hook).
+    pub fn lan_join(&mut self, idx: usize) {
+        let sessions = self.lan_sessions();
+        let Some(s) = sessions.get(idx) else {
+            return;
+        };
+        if !s.compatible {
+            self.lan_error = Some("session version is incompatible".to_string());
+            return;
+        }
+        match ra_net::JoinLobby::join(s.addr, &self.lan_name) {
+            Ok(j) => {
+                self.join_lobby = Some(j);
+                self.lan_error = None;
+                self.state = AppState::LanJoinLobby;
+                self.focus = 0;
+            }
+            Err(e) => self.lan_error = Some(format!("could not join: {e}")),
+        }
+    }
+
+    /// Joiner: confirm READY (verification hook).
+    pub fn lan_ready(&mut self) {
+        if let Some(j) = self.join_lobby.as_mut() {
+            j.set_ready();
+        }
+    }
+
+    /// Host: fire START and enter the game (verification hook; the UI's
+    /// START button is enabled only when the joiner is READY).
+    pub fn lan_start_game(&mut self) {
+        let Some(lobby) = self.host_lobby.take() else {
+            return;
+        };
+        if !lobby.can_start() {
+            self.host_lobby = Some(lobby);
+            return;
+        }
+        let settings = lobby.settings().clone();
+        match lobby.start() {
+            Ok(tp) => {
+                let spec = LanGameSpec {
+                    map_filename: settings.map.clone(),
+                    seed: settings.seed,
+                    credits: settings.credits,
+                    local_house: settings.host_seat,
+                    remote_house: settings.join_seat,
+                    host_house: settings.host_seat,
+                };
+                self.lan_enter_game(&spec, tp);
+            }
+            Err(e) => {
+                self.lan_error = Some(format!("could not start: {e}"));
+                self.state = AppState::MultiplayerMenu;
+            }
+        }
+    }
+
+    /// Joiner side: START arrived — build and enter.
+    fn lan_join_enter_game(&mut self) {
+        let Some(lobby) = self.join_lobby.take() else {
+            return;
+        };
+        let Some(w) = lobby.welcome().cloned() else {
+            return;
+        };
+        match lobby.into_transport() {
+            Ok(tp) => {
+                let spec = LanGameSpec {
+                    map_filename: w.map.clone(),
+                    seed: w.seed,
+                    credits: w.credits,
+                    local_house: w.seat,
+                    remote_house: w.host_seat,
+                    host_house: w.host_seat,
+                };
+                self.lan_enter_game(&spec, tp);
+            }
+            Err(e) => {
+                self.lan_error = Some(format!("could not start: {e}"));
+                self.state = AppState::MultiplayerMenu;
+            }
+        }
+    }
+
+    /// Build the LAN world via the factory, install the transport, enter.
+    fn lan_enter_game(&mut self, spec: &LanGameSpec, transport: ra_net::LanTransport) {
+        let Some(f) = &self.lan_factory else {
+            self.lan_error = Some("no LAN factory".to_string());
+            self.state = AppState::MultiplayerMenu;
+            return;
+        };
+        match f.build(spec) {
+            Ok((mut core, start)) => {
+                core.install_lan(transport, spec.remote_house);
+                core.handle(InputEvent::Resize {
+                    width: self.viewport_w,
+                    height: self.viewport_h,
+                });
+                let tw = core.tactical_width();
+                core.set_camera(
+                    (start.x * crate::appcore::CELL_PIXELS) as f32 - tw as f32 / 2.0,
+                    (start.y * crate::appcore::CELL_PIXELS) as f32 - self.viewport_h as f32 / 2.0,
+                );
+                self.core = Some(core);
+                self.in_lan_game = true;
+                self.lan_teardown();
+                self.last_error = None;
+                self.lan_error = None;
+                self.state = AppState::InGame;
+            }
+            Err(e) => {
+                self.lan_error = Some(e);
+                self.state = AppState::MultiplayerMenu;
+            }
+        }
     }
 
     // -------------------------------------------------------------------------
@@ -477,8 +822,14 @@ impl App {
             | AppState::SkirmishSetup
             | AppState::CampaignList
             | AppState::Briefing
+            | AppState::MultiplayerMenu
+            | AppState::LanHostSetup
+            | AppState::LanHostLobby
+            | AppState::LanJoinBrowse
+            | AppState::LanJoinLobby
             | AppState::Paused
-            | AppState::GameOver => self.handle_menu(ev),
+            | AppState::GameOver
+            | AppState::NetEnded => self.handle_menu(ev),
         }
     }
 
@@ -522,10 +873,18 @@ impl App {
             InputEvent::KeyDown(Key::Menu) => {
                 // Back out one level.
                 match self.state {
-                    AppState::SkirmishSetup | AppState::CampaignList => {
-                        self.state = AppState::MainMenu
-                    }
+                    AppState::SkirmishSetup
+                    | AppState::CampaignList
+                    | AppState::MultiplayerMenu => self.state = AppState::MainMenu,
                     AppState::Briefing => self.state = AppState::CampaignList,
+                    AppState::LanHostSetup => self.state = AppState::MultiplayerMenu,
+                    AppState::LanHostLobby => self.activate(Action::LanCancelHost),
+                    AppState::LanJoinBrowse => {
+                        self.join_browser = None;
+                        self.state = AppState::MultiplayerMenu;
+                    }
+                    AppState::LanJoinLobby => self.activate(Action::LanLeaveJoin),
+                    AppState::NetEnded => self.activate(Action::NetContinue),
                     AppState::Paused => self.state = AppState::InGame,
                     _ => {}
                 }
@@ -583,6 +942,41 @@ impl App {
                 self.state = AppState::CampaignList;
                 self.focus = 0;
             }
+            Action::GotoMultiplayer => {
+                self.state = AppState::MultiplayerMenu;
+                self.lan_error = None;
+                self.focus = 0;
+            }
+            Action::GotoLanHostSetup => {
+                self.state = AppState::LanHostSetup;
+                self.focus = 0;
+            }
+            Action::GotoLanJoin => self.lan_goto_browse(),
+            Action::LanCreate => self.lan_host_create(),
+            Action::LanStart => self.lan_start_game(),
+            Action::LanCancelHost => {
+                if let Some(h) = self.host_lobby.take() {
+                    h.cancel();
+                }
+                self.state = AppState::MultiplayerMenu;
+                self.focus = 0;
+            }
+            Action::LanJoinSession(i) => self.lan_join(i),
+            Action::LanReady => self.lan_ready(),
+            Action::LanLeaveJoin => {
+                if let Some(j) = self.join_lobby.take() {
+                    j.leave();
+                }
+                // Back to browsing (the listener stays bound across a join
+                // attempt, so this cannot fail).
+                if self.join_browser.is_some() {
+                    self.state = AppState::LanJoinBrowse;
+                    self.focus = 0;
+                } else {
+                    self.lan_goto_browse();
+                }
+            }
+            Action::NetContinue => self.quit_to_menu(),
             Action::Quit => self.quit = true,
             Action::SelectMap(i) => self.select_map(i),
             Action::ScrollMaps(d) => self.scroll_maps(d),
@@ -736,11 +1130,67 @@ impl App {
     /// `GameOver` freeze it (tick count does not advance), and the menus have no
     /// sim.
     pub fn update(&mut self, dt_ms: u32) {
+        // LAN lobby states are poll-driven: pump their sockets every frame.
+        match self.state {
+            AppState::LanHostLobby => {
+                if let Some(h) = self.host_lobby.as_mut() {
+                    h.poll();
+                    if h.take_joiner_lost() {
+                        self.lan_error = Some("player left the lobby".to_string());
+                    }
+                }
+            }
+            AppState::LanJoinBrowse => {
+                if let Some(b) = self.join_browser.as_mut() {
+                    b.poll();
+                }
+            }
+            // A paused LAN game must stay network-alive: the peer's barrier
+            // shows "waiting for player", not a spurious connection loss.
+            AppState::Paused | AppState::GameOver => {
+                if self.in_lan_game {
+                    if let Some(c) = self.core.as_mut() {
+                        c.net_service();
+                    }
+                }
+            }
+            AppState::LanJoinLobby => {
+                if let Some(j) = self.join_lobby.as_mut() {
+                    j.poll();
+                    if j.started() {
+                        self.lan_join_enter_game();
+                    } else if let Some(e) = j.error() {
+                        self.lan_error = Some(e.to_string());
+                        self.join_lobby = None;
+                        if self.join_browser.is_some() {
+                            self.state = AppState::LanJoinBrowse;
+                        } else {
+                            self.state = AppState::MultiplayerMenu;
+                        }
+                        self.focus = 0;
+                    }
+                }
+            }
+            _ => {}
+        }
+
         if self.state == AppState::InGame {
             if let Some(c) = self.core.as_mut() {
                 c.update(dt_ms);
                 let mut cues = c.drain_sounds();
                 self.sounds.append(&mut cues);
+                // LAN: an abnormal session end (peer left / connection lost /
+                // desync) preempts the normal game-over flow.
+                if let Some(end) = c.net_end() {
+                    self.net_end_message = match end {
+                        crate::appcore::NetEnd::PeerLeft => "PLAYER LEFT THE GAME".to_string(),
+                        crate::appcore::NetEnd::ConnectionLost => "CONNECTION LOST".to_string(),
+                        crate::appcore::NetEnd::Desync => "OUT OF SYNC".to_string(),
+                    };
+                    self.state = AppState::NetEnded;
+                    self.focus = 0;
+                    return;
+                }
                 // Transition to the game-over screen when the sim resolves.
                 if c.game_over() != ra_sim::GameOver::Ongoing {
                     self.state = AppState::GameOver;
@@ -773,9 +1223,15 @@ impl App {
             AppState::SkirmishSetup => self.compose_setup(),
             AppState::CampaignList => self.compose_campaign_list(),
             AppState::Briefing => self.compose_briefing(),
+            AppState::MultiplayerMenu => self.compose_multiplayer_menu(),
+            AppState::LanHostSetup => self.compose_lan_host_setup(),
+            AppState::LanHostLobby => self.compose_lan_host_lobby(),
+            AppState::LanJoinBrowse => self.compose_lan_join_browse(),
+            AppState::LanJoinLobby => self.compose_lan_join_lobby(),
             AppState::InGame => self.compose_ingame(),
             AppState::Paused => self.compose_paused(),
             AppState::GameOver => self.compose_gameover(),
+            AppState::NetEnded => self.compose_net_ended(),
         }
     }
 
@@ -967,6 +1423,209 @@ impl App {
         frame
     }
 
+    fn compose_multiplayer_menu(&self) -> Frame {
+        let mut frame = self.blank();
+        fill_background(&mut frame, [10, 14, 26]);
+        font::draw_text_scaled(&mut frame, 40, 24, "MULTIPLAYER - LAN", [220, 200, 120], 3);
+        self.draw_items(&mut frame);
+        self.draw_lan_error(&mut frame);
+        frame
+    }
+
+    fn compose_lan_host_setup(&self) -> Frame {
+        let mut frame = self.blank();
+        fill_background(&mut frame, [10, 14, 26]);
+        font::draw_text_scaled(&mut frame, 40, 24, "HOST LAN GAME", [220, 200, 120], 3);
+        font::draw_text(&mut frame, 40, 70, "MAP", [150, 160, 180]);
+        if let Some(map) = self.maps.get(self.config.map) {
+            let px0 = self.viewport_w as i32 - 40 - 200;
+            let py0 = 70;
+            draw_rect_outline(&mut frame, px0, py0, px0 + 200, py0 + 200, [80, 90, 110]);
+            fill_rect(
+                &mut frame,
+                px0 + 1,
+                py0 + 1,
+                px0 + 199,
+                py0 + 199,
+                [6, 8, 14],
+            );
+            blit_fit(&mut frame, &map.preview, px0 + 2, py0 + 2, 196, 196);
+            font::draw_text(&mut frame, px0, py0 + 208, &map.name, [220, 224, 232]);
+        }
+        self.draw_items(&mut frame);
+        self.draw_lan_error(&mut frame);
+        frame
+    }
+
+    fn compose_lan_host_lobby(&self) -> Frame {
+        let mut frame = self.blank();
+        fill_background(&mut frame, [10, 14, 26]);
+        font::draw_text_scaled(
+            &mut frame,
+            40,
+            24,
+            "LAN LOBBY - HOSTING",
+            [220, 200, 120],
+            3,
+        );
+        let mut y = 84;
+        let line = |frame: &mut Frame, text: &str, col: [u8; 3], y: &mut i32| {
+            font::draw_text(frame, 40, *y, text, col);
+            *y += font::GLYPH_H + 8;
+        };
+        if let Some(h) = &self.host_lobby {
+            line(
+                &mut frame,
+                &format!("SESSION: {}", self.lan_name.to_uppercase()),
+                [210, 214, 222],
+                &mut y,
+            );
+            line(
+                &mut frame,
+                &format!("MAP: {}", h.settings().map.to_uppercase()),
+                [210, 214, 222],
+                &mut y,
+            );
+            line(
+                &mut frame,
+                &format!("UDP PORT: {}", h.port()),
+                [150, 160, 180],
+                &mut y,
+            );
+            y += 10;
+            match h.joiner_name() {
+                Some(name) => {
+                    let status = if h.joiner_ready() {
+                        "READY"
+                    } else {
+                        "NOT READY"
+                    };
+                    line(
+                        &mut frame,
+                        &format!("PLAYER JOINED: {} ({status})", name.to_uppercase()),
+                        [120, 220, 120],
+                        &mut y,
+                    );
+                }
+                None => line(
+                    &mut frame,
+                    "WAITING FOR A PLAYER TO JOIN...",
+                    [180, 190, 210],
+                    &mut y,
+                ),
+            }
+        }
+        self.draw_items(&mut frame);
+        self.draw_lan_error(&mut frame);
+        frame
+    }
+
+    fn compose_lan_join_browse(&self) -> Frame {
+        let mut frame = self.blank();
+        fill_background(&mut frame, [10, 14, 26]);
+        font::draw_text_scaled(&mut frame, 40, 24, "JOIN LAN GAME", [220, 200, 120], 3);
+        if self.lan_sessions().is_empty() {
+            font::draw_text(
+                &mut frame,
+                40,
+                90,
+                "SEARCHING FOR GAMES ON THE LAN...",
+                [180, 190, 210],
+            );
+        }
+        self.draw_items(&mut frame);
+        self.draw_lan_error(&mut frame);
+        frame
+    }
+
+    fn compose_lan_join_lobby(&self) -> Frame {
+        let mut frame = self.blank();
+        fill_background(&mut frame, [10, 14, 26]);
+        font::draw_text_scaled(&mut frame, 40, 24, "LAN LOBBY", [220, 200, 120], 3);
+        let mut y = 84;
+        let line = |frame: &mut Frame, text: &str, col: [u8; 3], y: &mut i32| {
+            font::draw_text(frame, 40, *y, text, col);
+            *y += font::GLYPH_H + 8;
+        };
+        match self.join_lobby.as_ref().and_then(|j| j.welcome()) {
+            Some(w) => {
+                line(
+                    &mut frame,
+                    &format!("HOST: {}", w.host_name.to_uppercase()),
+                    [210, 214, 222],
+                    &mut y,
+                );
+                line(
+                    &mut frame,
+                    &format!("MAP: {}", w.map.to_uppercase()),
+                    [210, 214, 222],
+                    &mut y,
+                );
+                line(
+                    &mut frame,
+                    &format!("CREDITS: {}", w.credits),
+                    [210, 214, 222],
+                    &mut y,
+                );
+                y += 10;
+                let ready = self
+                    .join_lobby
+                    .as_ref()
+                    .map(|j| j.is_ready())
+                    .unwrap_or(false);
+                line(
+                    &mut frame,
+                    if ready {
+                        "READY - WAITING FOR HOST TO START..."
+                    } else {
+                        "CLICK READY WHEN SET"
+                    },
+                    [180, 190, 210],
+                    &mut y,
+                );
+            }
+            None => line(&mut frame, "CONTACTING HOST...", [180, 190, 210], &mut y),
+        }
+        self.draw_items(&mut frame);
+        self.draw_lan_error(&mut frame);
+        frame
+    }
+
+    fn compose_net_ended(&self) -> Frame {
+        // The frozen game frame, dimmed, with the reason + Continue over it.
+        let mut frame = self.compose_ingame();
+        dim(&mut frame, 45);
+        let title = if self.net_end_message.is_empty() {
+            "CONNECTION LOST"
+        } else {
+            &self.net_end_message
+        };
+        let scale = 4;
+        let tw = font::text_width(title) * scale;
+        font::draw_text_scaled(
+            &mut frame,
+            (self.viewport_w as i32 - tw) / 2,
+            self.viewport_h as i32 / 2 - 120,
+            title,
+            [235, 120, 100],
+            scale,
+        );
+        self.draw_items(&mut frame);
+        frame
+    }
+
+    fn draw_lan_error(&self, frame: &mut Frame) {
+        if let Some(e) = &self.lan_error {
+            font::draw_text(
+                frame,
+                40,
+                self.viewport_h as i32 - 20,
+                &format!("ERROR: {}", e.to_uppercase()),
+                [220, 100, 100],
+            );
+        }
+    }
+
     // -------------------------------------------------------------------------
     // Layout: the single source of geometry for both draw and hit-test.
     // -------------------------------------------------------------------------
@@ -977,8 +1636,14 @@ impl App {
             AppState::SkirmishSetup => self.items_setup(),
             AppState::CampaignList => self.items_campaign_list(),
             AppState::Briefing => self.items_briefing(),
+            AppState::MultiplayerMenu => self.items_multiplayer_menu(),
+            AppState::LanHostSetup => self.items_lan_host_setup(),
+            AppState::LanHostLobby => self.items_lan_host_lobby(),
+            AppState::LanJoinBrowse => self.items_lan_join_browse(),
+            AppState::LanJoinLobby => self.items_lan_join_lobby(),
             AppState::Paused => self.items_paused(),
             AppState::GameOver => self.items_gameover(),
+            AppState::NetEnded => self.items_net_ended(),
             AppState::InGame => Vec::new(),
         }
     }
@@ -1009,8 +1674,211 @@ impl App {
             items.push(push("CAMPAIGN - COMING SOON", Action::Disabled, false, y));
         }
         y += gap;
+        // The Multiplayer row exists only when a LAN factory is installed
+        // (M8-B) — asset-free menu goldens construct the App without one, so
+        // their button list and geometry are byte-identical to before.
+        if self.lan_factory.is_some() {
+            items.push(push("MULTIPLAYER", Action::GotoMultiplayer, true, y));
+            y += gap;
+        }
         items.push(push("QUIT", Action::Quit, true, y));
         items
+    }
+
+    fn items_multiplayer_menu(&self) -> Vec<Item> {
+        let cx = self.viewport_w as i32 / 2;
+        let bw = 260;
+        let bh = 36;
+        let x0 = cx - bw / 2;
+        let mut y = self.viewport_h as i32 / 2 - 60;
+        let gap = bh + 14;
+        let mut items = Vec::new();
+        let mut push = |label: &str, action: Action| {
+            items.push(Item {
+                rect: (x0, y, x0 + bw, y + bh),
+                label: label.to_string(),
+                action,
+                enabled: true,
+                selected: false,
+            });
+            y += gap;
+        };
+        push("HOST GAME", Action::GotoLanHostSetup);
+        push("JOIN GAME", Action::GotoLanJoin);
+        push("BACK", Action::BackToMenu);
+        items
+    }
+
+    fn items_lan_host_setup(&self) -> Vec<Item> {
+        let mut items = Vec::new();
+        // Map rows (same scrollable list geometry as the skirmish setup).
+        let list_x0 = 40;
+        let list_x1 = 40 + 300;
+        let list_y0 = 84;
+        let end = (self.map_scroll + MAP_ROWS).min(self.maps.len());
+        for (row, idx) in (self.map_scroll..end).enumerate() {
+            let y = list_y0 + row as i32 * ROW_H;
+            let map = &self.maps[idx];
+            items.push(Item {
+                rect: (list_x0, y, list_x1, y + ROW_H - 1),
+                label: format!("{} ({}P)", trunc(&map.name, 30), map.players),
+                action: Action::SelectMap(idx),
+                enabled: true,
+                selected: idx == self.config.map,
+            });
+        }
+        if self.maps.len() > MAP_ROWS {
+            let by = list_y0 + MAP_ROWS as i32 * ROW_H + 4;
+            items.push(Item {
+                rect: (list_x0, by, list_x0 + 60, by + ROW_H),
+                label: "UP".to_string(),
+                action: Action::ScrollMaps(-1),
+                enabled: self.map_scroll > 0,
+                selected: false,
+            });
+            items.push(Item {
+                rect: (list_x0 + 70, by, list_x0 + 130, by + ROW_H),
+                label: "DOWN".to_string(),
+                action: Action::ScrollMaps(1),
+                enabled: self.map_scroll + MAP_ROWS < self.maps.len(),
+                selected: false,
+            });
+        }
+        let ox0 = 40;
+        let ow = 300;
+        let oh = 28;
+        let mut oy = list_y0 + MAP_ROWS as i32 * ROW_H + 32;
+        let gap = oh + 8;
+        items.push(Item {
+            rect: (ox0, oy, ox0 + ow, oy + oh),
+            label: format!(
+                "CREDITS: {}",
+                CREDITS[self.config.credits.min(CREDITS.len() - 1)]
+            ),
+            action: Action::Cycle(Field::Credits, 1),
+            enabled: true,
+            selected: false,
+        });
+        oy += gap;
+        items.push(Item {
+            rect: (ox0, oy, ox0 + 140, oy + oh + 4),
+            label: "CREATE GAME".to_string(),
+            action: Action::LanCreate,
+            enabled: !self.maps.is_empty(),
+            selected: false,
+        });
+        items.push(Item {
+            rect: (ox0 + 160, oy, ox0 + 300, oy + oh + 4),
+            label: "BACK".to_string(),
+            action: Action::GotoMultiplayer,
+            enabled: true,
+            selected: false,
+        });
+        items
+    }
+
+    fn items_lan_host_lobby(&self) -> Vec<Item> {
+        let ox0 = 40;
+        let oh = 32;
+        let oy = self.viewport_h as i32 - 80;
+        vec![
+            Item {
+                rect: (ox0, oy, ox0 + 180, oy + oh),
+                label: "START GAME".to_string(),
+                action: Action::LanStart,
+                enabled: self
+                    .host_lobby
+                    .as_ref()
+                    .map(|h| h.can_start())
+                    .unwrap_or(false),
+                selected: false,
+            },
+            Item {
+                rect: (ox0 + 200, oy, ox0 + 340, oy + oh),
+                label: "CANCEL".to_string(),
+                action: Action::LanCancelHost,
+                enabled: true,
+                selected: false,
+            },
+        ]
+    }
+
+    fn items_lan_join_browse(&self) -> Vec<Item> {
+        let mut items = Vec::new();
+        let x0 = 40;
+        let w = (self.viewport_w as i32 - 80).min(560);
+        let mut y = 90;
+        for (i, s) in self.lan_sessions().iter().enumerate() {
+            let label = if s.compatible {
+                format!("{} - {}", trunc(&s.name, 20), trunc(&s.map, 24))
+            } else {
+                format!("{} - INCOMPATIBLE VERSION", trunc(&s.name, 20))
+            };
+            items.push(Item {
+                rect: (x0, y, x0 + w, y + 24),
+                label,
+                action: Action::LanJoinSession(i),
+                enabled: s.compatible,
+                selected: false,
+            });
+            y += 28;
+        }
+        y += 12;
+        items.push(Item {
+            rect: (x0, y, x0 + 140, y + 32),
+            label: "BACK".to_string(),
+            action: Action::GotoMultiplayer,
+            enabled: true,
+            selected: false,
+        });
+        items
+    }
+
+    fn items_lan_join_lobby(&self) -> Vec<Item> {
+        let ox0 = 40;
+        let oh = 32;
+        let oy = self.viewport_h as i32 - 80;
+        let ready = self
+            .join_lobby
+            .as_ref()
+            .map(|j| j.is_ready())
+            .unwrap_or(false);
+        let welcomed = self
+            .join_lobby
+            .as_ref()
+            .map(|j| j.welcome().is_some())
+            .unwrap_or(false);
+        vec![
+            Item {
+                rect: (ox0, oy, ox0 + 180, oy + oh),
+                label: if ready { "WAITING..." } else { "READY" }.to_string(),
+                action: Action::LanReady,
+                enabled: welcomed && !ready,
+                selected: ready,
+            },
+            Item {
+                rect: (ox0 + 200, oy, ox0 + 340, oy + oh),
+                label: "LEAVE".to_string(),
+                action: Action::LanLeaveJoin,
+                enabled: true,
+                selected: false,
+            },
+        ]
+    }
+
+    fn items_net_ended(&self) -> Vec<Item> {
+        let cx = self.viewport_w as i32 / 2;
+        let bw = 240;
+        let bh = 36;
+        let x0 = cx - bw / 2;
+        let y = self.viewport_h as i32 - 120;
+        vec![Item {
+            rect: (x0, y, x0 + bw, y + bh),
+            label: "CONTINUE".to_string(),
+            action: Action::NetContinue,
+            enabled: true,
+            selected: false,
+        }]
     }
 
     fn items_campaign_list(&self) -> Vec<Item> {

@@ -2462,6 +2462,123 @@ pub fn load_skirmish_configured(
     })
 }
 
+/// A built LAN game (M8-B): the oriented core plus the local start cell.
+pub struct LanGame {
+    /// The ready-to-drive core (sidebar + shroud enabled for the local seat;
+    /// **no** AI, **no** sim-side player house — the world is byte-identical
+    /// on both peers).
+    pub core: AppCore,
+    /// The local player's MCV start cell (camera framing).
+    pub local_start: CellCoord,
+}
+
+/// Build a LAN-game world from a scenario INI's text and the in-memory
+/// archives (M8-B). Twin of [`load_skirmish_configured`] with the multiplayer
+/// invariants applied:
+///
+/// - **World state derives only from host-authoritative inputs** (scenario
+///   text, seed, credits, the two seats) — both peers construct byte-identical
+///   `World`s. In particular there is **no** `set_player_house` (it is hashed)
+///   and **no** `set_ai` (both houses are humans); win/lose is the client-side
+///   symmetric read in [`AppCore::game_over`].
+/// - **Start assignment is keyed to the host seat**, not the local seat: the
+///   host's house takes the first start, the joiner's the second, on both
+///   machines — so MCV spawn order (and thus arena handles and the RNG-free
+///   spawn sequence) is identical everywhere.
+/// - Only *presentation* is oriented per side: sidebar/orders gate to
+///   `spec.local_house`, and the returned start cell frames the local base.
+pub fn load_lan_configured(
+    main_bytes: &[u8],
+    redalert_bytes: &[u8],
+    scenario_ini_text: &str,
+    spec: &crate::menu::LanGameSpec,
+) -> Result<LanGame, Box<dyn Error>> {
+    let main = MixArchive::parse(main_bytes)?;
+    let redalert = MixArchive::parse(redalert_bytes)?;
+
+    let loaded = load_from_text(main_bytes, redalert_bytes, scenario_ini_text)?;
+    let raster = rasterize(&loaded.scenario, &loaded.tiles);
+    let palette = loaded.palette;
+    let scenario = loaded.scenario;
+
+    let scen_ini = Ini::parse(scenario_ini_text);
+
+    let local = redalert.open_nested("local.mix")?;
+    let rules = Ini::parse(&String::from_utf8_lossy(
+        local.get("rules.ini").ok_or("rules.ini not found")?,
+    ));
+    let remaps: Vec<RemapTable> = match local.get("palette.cps") {
+        Some(cps_bytes) => match Cps::parse(cps_bytes) {
+            Ok(cps) => build_house_remaps(&cps).to_vec(),
+            Err(_) => vec![identity_remap(); HOUSE_COUNT],
+        },
+        None => vec![identity_remap(); HOUSE_COUNT],
+    };
+
+    let conquer = main.open_nested("conquer.mix")?;
+    let lores = redalert.open_nested("lores.mix").ok();
+    let content = build_content(&rules, &conquer, lores.as_ref())?;
+
+    let grid = make_passability(&scenario, &loaded.tiles, &rules);
+    let mut world = World::new(grid, spec.seed);
+    world.set_catalog(content.catalog.clone());
+    world.init_houses(HOUSE_COUNT, spec.credits);
+    world.set_ore(OreField::from_overlay(128, 128, &scenario.overlay));
+    world.enable_shroud();
+    let (grows, spreads) = ore_growth_flags(&rules);
+    world.set_ore_growth(grows, spreads);
+
+    // Deterministic start assignment: host house first (both machines agree).
+    let (start_a, start_b) = pick_two_starts(&world, &scenario, &scen_ini);
+    let join_house = if spec.host_house == spec.local_house {
+        spec.remote_house
+    } else {
+        spec.local_house
+    };
+
+    let mcv_proto = content.catalog.units[U_MCV as usize].clone();
+    let spawn_mcv = |world: &mut World, house: u8, cell: CellCoord| {
+        let h = world.spawn_unit(
+            mcv_proto.sprite_id,
+            house,
+            cell,
+            Facing(0),
+            mcv_proto.max_health,
+            mcv_proto.stats,
+        );
+        world.set_unit_max_health(h, mcv_proto.max_health);
+        world.set_unit_combat(h, mcv_proto.armor, mcv_proto.weapon, mcv_proto.has_turret);
+        world.set_unit_sight(h, mcv_proto.sight);
+    };
+    spawn_mcv(&mut world, spec.host_house, start_a);
+    spawn_mcv(&mut world, join_house, start_b);
+    let local_start = if spec.local_house == spec.host_house {
+        start_a
+    } else {
+        start_b
+    };
+
+    let mut core = AppCore::with_sim(raster, palette, world, content.unit_sprites, remaps);
+    core.set_building_sprites(content.building_sprites);
+    core.set_building_overlays(content.building_overlays);
+    core.set_infantry_anim(content.infantry_anim.clone());
+    core.enable_sidebar(spec.local_house, content.buildables.clone());
+
+    let theater_mix = main.open_nested(scenario.theater.mix_name()).ok();
+    let hires = redalert.open_nested("hires.mix").ok();
+    install_cosmetic_art(
+        &mut core,
+        &content.catalog,
+        &content.buildables,
+        &conquer,
+        theater_mix.as_ref(),
+        scenario.theater.suffix(),
+        hires.as_ref(),
+    );
+
+    Ok(LanGame { core, local_start })
+}
+
 /// Choose two well-separated base starts **on the same landmass** — so a
 /// ground-only skirmish (no transports yet) can actually resolve. The player
 /// takes the first multiplayer `[Waypoints]` start (or the map centre); the AI
@@ -2866,6 +2983,15 @@ impl GameFactory for ArchiveFactory {
             load_skirmish_configured(&self.main_bytes, &self.redalert_bytes, &text, &settings)
                 .map_err(|e| e.to_string())?;
         Ok((game.core, game.player_start))
+    }
+}
+
+impl crate::menu::LanGameFactory for ArchiveFactory {
+    fn build(&self, spec: &crate::menu::LanGameSpec) -> Result<(AppCore, CellCoord), String> {
+        let text = self.scenario_text(&spec.map_filename)?;
+        let game = load_lan_configured(&self.main_bytes, &self.redalert_bytes, &text, spec)
+            .map_err(|e| e.to_string())?;
+        Ok((game.core, game.local_start))
     }
 }
 
