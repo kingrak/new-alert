@@ -142,6 +142,58 @@ impl<T> Arena<T> {
     }
 }
 
+use crate::snapshot::{SnapError, SnapReader, SnapWriter};
+
+impl<T> Arena<T> {
+    /// Byte-exact snapshot of the arena — **including** the free-list and every
+    /// slot's generation counter, so handles (index+gen) round-trip identically
+    /// and cross-references between entities stay valid (M8-C). Each element is
+    /// written by `f`.
+    pub(crate) fn snap_write<F: Fn(&mut SnapWriter, &T)>(&self, w: &mut SnapWriter, f: F) {
+        w.u32(self.slots.len() as u32);
+        for slot in &self.slots {
+            w.u32(slot.gen);
+            match &slot.value {
+                Some(v) => {
+                    w.u8(1);
+                    f(w, v);
+                }
+                None => w.u8(0),
+            }
+        }
+        w.u32(self.free.len() as u32);
+        for &fr in &self.free {
+            w.u32(fr);
+        }
+        w.u32(self.len);
+    }
+
+    /// Inverse of [`Arena::snap_write`]; `f` decodes one element.
+    pub(crate) fn snap_read<F: Fn(&mut SnapReader) -> Result<T, SnapError>>(
+        r: &mut SnapReader,
+        f: F,
+    ) -> Result<Arena<T>, SnapError> {
+        let nslots = r.count("arena.slots")?;
+        let mut slots = Vec::with_capacity(nslots.min(4096));
+        for _ in 0..nslots {
+            let gen = r.u32()?;
+            let value = match r.u8()? {
+                0 => None,
+                1 => Some(f(r)?),
+                _ => return Err(SnapError::BadTag("arena.slot")),
+            };
+            slots.push(Slot { gen, value });
+        }
+        let nfree = r.count("arena.free")?;
+        let mut free = Vec::with_capacity(nfree.min(4096));
+        for _ in 0..nfree {
+            free.push(r.u32()?);
+        }
+        let len = r.u32()?;
+        Ok(Arena { slots, free, len })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -419,6 +419,37 @@ impl Catalog {
         }
     }
 
+    /// A content fingerprint of the static build data (M8-C). A world snapshot
+    /// records this so the loading peer can reject a snapshot built against a
+    /// different ruleset/map catalog before resuming into a divergent world —
+    /// the catalog itself is never shipped (both peers already share it). Folds
+    /// the proto counts plus each proto's name and its build-relevant numeric
+    /// identity, so two catalogs that differ in unit stats hash differently.
+    pub fn content_hash(&self) -> u64 {
+        let mut h = crate::hash::Fnv1a::new();
+        h.write_u32(self.buildings.len() as u32);
+        for b in &self.buildings {
+            h.write_bytes(b.name.as_bytes());
+            h.write_u8(0);
+            h.write_u8(b.foot_w);
+            h.write_u8(b.foot_h);
+            h.write_u16(b.max_health);
+            h.write_i32(b.cost);
+            h.write_i32(b.power);
+            h.write_u32(b.sprite_id);
+        }
+        h.write_u32(self.units.len() as u32);
+        for u in &self.units {
+            h.write_bytes(u.name.as_bytes());
+            h.write_u8(0);
+            h.write_u16(u.max_health);
+            h.write_i32(u.cost);
+            h.write_u32(u.sprite_id);
+            h.write_u8(u.locomotor);
+        }
+        h.finish()
+    }
+
     /// Borrow a building prototype by id.
     pub fn building(&self, id: u32) -> Option<&BuildingProto> {
         self.buildings.get(id as usize)

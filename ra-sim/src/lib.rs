@@ -39,6 +39,7 @@ pub mod ore;
 pub mod path;
 pub mod rng;
 pub mod shroud;
+pub mod snapshot;
 pub mod superweapon;
 pub mod unit;
 pub mod world;
@@ -63,6 +64,7 @@ pub use ore::{OreCell, OreField};
 pub use path::Passability;
 pub use rng::RandomLcg;
 pub use shroud::Shroud;
+pub use snapshot::{SnapError, SnapReader, SnapWriter, GAME_BUILD, SNAPSHOT_VERSION};
 pub use superweapon::{NukeStrike, SuperKind, SuperWeapon};
 pub use unit::{
     AirState, HarvStatus, HarvestState, Mission, MoveStats, Passenger, Unit, UnitKind, FLIGHT_LEVEL,

@@ -25,6 +25,9 @@ use crate::ore::OreField;
 use crate::path::{find_path, find_path_avoiding, Passability};
 use crate::rng::RandomLcg;
 use crate::shroud::Shroud;
+use crate::snapshot::{
+    SnapError, SnapReader, SnapWriter, GAME_BUILD, MAX_SNAPSHOT, SNAPSHOT_MAGIC, SNAPSHOT_VERSION,
+};
 use crate::superweapon::{NukeStrike, SuperKind, SuperWeapon};
 use crate::unit::{AirState, HarvStatus, Mission, MoveStats, Passenger, Unit, FLIGHT_LEVEL};
 
@@ -625,6 +628,14 @@ impl World {
         &self.passable
     }
 
+    /// Borrow the build catalog (shared static content). A peer reconstructing a
+    /// world from a snapshot supplies its own copy of this and the passability
+    /// grid to [`World::load_snapshot`]; the snapshot ships neither, only their
+    /// content hashes (M8-C).
+    pub fn catalog(&self) -> &Catalog {
+        &self.catalog
+    }
+
     /// Read-only view of the sim RNG seed (also folded into the state hash).
     pub fn rng_seed(&self) -> u32 {
         self.rng.seed()
@@ -915,6 +926,158 @@ impl World {
             }
         }
         h.finish()
+    }
+
+    /// Serialize the complete **dynamic** simulation state to a versioned,
+    /// self-describing byte stream (M8-C P0, DESIGN.md §3.6). Everything a
+    /// subsequent tick can read is included — both entity arenas (with their
+    /// free-lists and generation counters, so handles round-trip exactly),
+    /// houses, ore overlay, shroud, the passability occupancy layer, RNG, tick,
+    /// AI controllers, campaign scripting, superweapons. The static shared
+    /// content (build [`Catalog`] and the map's static terrain) is **not**
+    /// shipped — only its content hash is recorded, so [`World::load_snapshot`]
+    /// can reject a snapshot built against a different ruleset/map.
+    ///
+    /// Guarantee: for any mid-game world, `load_snapshot(&save_snapshot(), …)`
+    /// yields a world that produces the byte-identical state-hash chain for every
+    /// subsequent tick.
+    pub fn save_snapshot(&self) -> Vec<u8> {
+        let mut w = SnapWriter::new();
+        // Envelope.
+        w.u32(SNAPSHOT_MAGIC);
+        w.u16(SNAPSHOT_VERSION);
+        w.u32(GAME_BUILD);
+        w.u64(self.catalog.content_hash());
+        w.u64(self.passable.content_hash());
+        w.u32(self.tick_count);
+        // Payload (fixed field order; must mirror `load_snapshot` exactly).
+        self.units.snap_write(&mut w, |w, u| u.snap_write(w));
+        self.buildings.snap_write(&mut w, |w, b| b.snap_write(w));
+        self.bullets.snap_write(&mut w, |w, b| b.snap_write(w));
+        w.seq(&self.houses, |w, h| h.snap_write(w));
+        self.ore.snap_write(&mut w);
+        self.passable.snap_write_blocked(&mut w);
+        self.shroud.snap_write(&mut w);
+        w.option(&self.ore_growth, |w, g| g.snap_write(w));
+        w.seq(&self.ai, |w, a| a.snap_write(w));
+        w.option(&self.player_house, |w, p| w.u8(*p));
+        w.u8(match self.game_over {
+            GameOver::Ongoing => 0,
+            GameOver::Victory => 1,
+            GameOver::Defeat => 2,
+        });
+        w.u32(self.rng.seed());
+        w.option(&self.campaign, |w, c| c.snap_write(w));
+        w.option(&self.alliances, |w, a| w.seq(a, |w, b| w.u64(*b)));
+        w.option(&self.enemy_activation, |w, e| e.snap_write(w));
+        w.seq(&self.superweapons, |w, s| s.snap_write(w));
+        w.seq(&self.nuke_strikes, |w, n| n.snap_write(w));
+        w.into_bytes()
+    }
+
+    /// Reconstruct a world from a [`World::save_snapshot`] byte stream plus the
+    /// shared static content both peers already hold: the build `catalog` and a
+    /// `passable` grid carrying this map's static terrain (its occupancy layer is
+    /// overwritten from the snapshot). Decoding is **total** — any malformed,
+    /// truncated, version-mismatched, or content-mismatched input returns a
+    /// [`SnapError`], never a panic — and the buffer must be consumed exactly.
+    pub fn load_snapshot(
+        bytes: &[u8],
+        catalog: Catalog,
+        mut passable: Passability,
+    ) -> Result<World, SnapError> {
+        if bytes.len() > MAX_SNAPSHOT {
+            return Err(SnapError::TooLong("snapshot"));
+        }
+        let mut r = SnapReader::new(bytes);
+        // Envelope.
+        if r.u32()? != SNAPSHOT_MAGIC {
+            return Err(SnapError::BadMagic);
+        }
+        if r.u16()? != SNAPSHOT_VERSION {
+            return Err(SnapError::Version);
+        }
+        if r.u32()? != GAME_BUILD {
+            return Err(SnapError::Build);
+        }
+        if r.u64()? != catalog.content_hash() {
+            return Err(SnapError::CatalogMismatch);
+        }
+        if r.u64()? != passable.content_hash() {
+            return Err(SnapError::MapMismatch);
+        }
+        let tick_count = r.u32()?;
+        // Payload.
+        let units = Arena::snap_read(&mut r, Unit::snap_read)?;
+        let buildings = Arena::snap_read(&mut r, Building::snap_read)?;
+        let bullets = Arena::snap_read(&mut r, Bullet::snap_read)?;
+        let houses = r.seq("world.houses", House::snap_read)?;
+        let ore = OreField::snap_read(&mut r)?;
+        passable.load_blocked(&mut r)?;
+        let shroud = Shroud::snap_read(&mut r)?;
+        let ore_growth = r.option("world.ore_growth", OreGrowth::snap_read)?;
+        let ai = r.seq("world.ai", AiPlayer::snap_read)?;
+        let player_house = r.option("world.player_house", |r| r.u8())?;
+        let game_over = match r.u8()? {
+            0 => GameOver::Ongoing,
+            1 => GameOver::Victory,
+            2 => GameOver::Defeat,
+            _ => return Err(SnapError::BadTag("GameOver")),
+        };
+        let rng = RandomLcg::new(r.u32()?);
+        let campaign = r.option("world.campaign", Campaign::snap_read)?;
+        let alliances = r.option("world.alliances", |r| r.seq("alliances", |r| r.u64()))?;
+        let enemy_activation = r.option(
+            "world.enemy_activation",
+            campaign::EnemyActivation::snap_read,
+        )?;
+        let superweapons = r.seq("world.superweapons", SuperWeapon::snap_read)?;
+        let nuke_strikes = r.seq("world.nuke_strikes", NukeStrike::snap_read)?;
+        r.finish()?;
+        Ok(World {
+            units,
+            buildings,
+            bullets,
+            houses,
+            ore,
+            catalog,
+            passable,
+            shroud,
+            ore_growth,
+            ai,
+            player_house,
+            game_over,
+            rng,
+            tick_count,
+            campaign,
+            alliances,
+            enemy_activation,
+            superweapons,
+            nuke_strikes,
+        })
+    }
+}
+
+impl OreGrowth {
+    fn snap_write(&self, w: &mut SnapWriter) {
+        w.boolean(self.grows);
+        w.boolean(self.spreads);
+        w.i32(self.scan);
+        w.seq(&self.grow_list, |w, c| c.snap_write(w));
+        w.i32(self.grow_excess);
+        w.seq(&self.spread_list, |w, c| c.snap_write(w));
+        w.i32(self.spread_excess);
+    }
+    fn snap_read(r: &mut SnapReader) -> Result<OreGrowth, SnapError> {
+        Ok(OreGrowth {
+            grows: r.boolean()?,
+            spreads: r.boolean()?,
+            scan: r.i32()?,
+            grow_list: r.seq("oregrowth.grow_list", CellCoord::snap_read)?,
+            grow_excess: r.i32()?,
+            spread_list: r.seq("oregrowth.spread_list", CellCoord::snap_read)?,
+            spread_excess: r.i32()?,
+        })
     }
 }
 

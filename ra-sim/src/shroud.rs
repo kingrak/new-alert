@@ -149,6 +149,25 @@ impl Shroud {
     /// Fold the shroud into the world hash. A disabled shroud contributes **no**
     /// bytes (so a non-skirmish world's hash is byte-identical to M5); an enabled
     /// one writes a marker byte followed by the packed explored bits.
+    /// Byte-exact snapshot (M8-C): dims, the enable flag, and every explored bit.
+    pub(crate) fn snap_write(&self, w: &mut crate::snapshot::SnapWriter) {
+        w.i32(self.width);
+        w.i32(self.height);
+        w.boolean(self.enabled);
+        w.seq(&self.explored, |w, b| w.boolean(*b));
+    }
+    /// Inverse of [`Shroud::snap_write`].
+    pub(crate) fn snap_read(
+        r: &mut crate::snapshot::SnapReader,
+    ) -> Result<Shroud, crate::snapshot::SnapError> {
+        Ok(Shroud {
+            width: r.i32()?,
+            height: r.i32()?,
+            enabled: r.boolean()?,
+            explored: r.seq("shroud.explored", |r| r.boolean())?,
+        })
+    }
+
     pub(crate) fn hash_into(&self, h: &mut Fnv1a) {
         if !self.enabled {
             return;

@@ -218,6 +218,48 @@ impl Passability {
 
     /// Stamp (or clear) a building's occupancy on `cell`. Off-grid cells are
     /// ignored. Called by the sim when a building is placed or destroyed.
+    /// A content fingerprint of the **static** terrain (dims + the four
+    /// per-locomotor land masks) — everything a snapshot references by hash
+    /// rather than shipping (M8-C). The dynamic `blocked` occupancy layer is
+    /// deliberately excluded: it is snapshot *state*, restored via
+    /// [`Passability::snap_write_blocked`]/[`Passability::load_blocked`].
+    pub(crate) fn content_hash(&self) -> u64 {
+        let mut h = crate::hash::Fnv1a::new();
+        h.write_i32(self.width);
+        h.write_i32(self.height);
+        for mask in [&self.foot, &self.track, &self.wheel, &self.water] {
+            for &b in mask {
+                h.write_u8(b as u8);
+            }
+        }
+        h.finish()
+    }
+
+    /// Serialize the dynamic building/terrain occupancy layer (M8-C). Dims are
+    /// written for a cross-check on load; the static masks are never shipped.
+    pub(crate) fn snap_write_blocked(&self, w: &mut crate::snapshot::SnapWriter) {
+        w.i32(self.width);
+        w.i32(self.height);
+        w.seq(&self.blocked, |w, b| w.boolean(*b));
+    }
+
+    /// Overwrite this (shared, statically-correct) grid's occupancy layer from a
+    /// snapshot, validating dimensions against the loader's own map.
+    pub(crate) fn load_blocked(
+        &mut self,
+        r: &mut crate::snapshot::SnapReader,
+    ) -> Result<(), crate::snapshot::SnapError> {
+        use crate::snapshot::SnapError;
+        let width = r.i32()?;
+        let height = r.i32()?;
+        let blocked = r.seq("passable.blocked", |r| r.boolean())?;
+        if width != self.width || height != self.height || blocked.len() != self.blocked.len() {
+            return Err(SnapError::MapMismatch);
+        }
+        self.blocked = blocked;
+        Ok(())
+    }
+
     pub fn set_occupied(&mut self, cell: CellCoord, occupied: bool) {
         if self.in_bounds(cell) {
             self.blocked[(cell.y * self.width + cell.x) as usize] = occupied;

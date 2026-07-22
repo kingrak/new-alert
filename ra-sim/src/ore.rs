@@ -218,6 +218,31 @@ impl OreField {
 
     /// Fold the ore field into the world hash: only non-empty cells, in
     /// row-major (fixed) order, so a divergent harvest is caught.
+    /// Byte-exact snapshot (M8-C): dims plus every cell's bails+gem flag.
+    pub(crate) fn snap_write(&self, w: &mut crate::snapshot::SnapWriter) {
+        w.i32(self.width);
+        w.i32(self.height);
+        w.seq(&self.cells, |w, c| {
+            w.u16(c.bails);
+            w.boolean(c.gem);
+        });
+    }
+    /// Inverse of [`OreField::snap_write`].
+    pub(crate) fn snap_read(
+        r: &mut crate::snapshot::SnapReader,
+    ) -> Result<OreField, crate::snapshot::SnapError> {
+        Ok(OreField {
+            width: r.i32()?,
+            height: r.i32()?,
+            cells: r.seq("ore.cells", |r| {
+                Ok(OreCell {
+                    bails: r.u16()?,
+                    gem: r.boolean()?,
+                })
+            })?,
+        })
+    }
+
     pub(crate) fn hash_into(&self, h: &mut Fnv1a) {
         let mut live = 0u32;
         for c in &self.cells {

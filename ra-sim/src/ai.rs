@@ -179,6 +179,37 @@ enum TeamPhase {
 }
 
 impl Team {
+    /// Byte-exact snapshot (M8-C).
+    fn snap_write(&self, w: &mut crate::snapshot::SnapWriter) {
+        w.seq(&self.members, |w, m| m.snap_write(w));
+        w.u8(match self.phase {
+            TeamPhase::Staging => 0,
+            TeamPhase::Attacking => 1,
+        });
+        self.target.snap_write(w);
+        self.staging.snap_write(w);
+        w.u32(self.initial_size as u32);
+        w.u32(self.stage_timer);
+        w.boolean(self.is_harass);
+    }
+    /// Inverse of [`Team::snap_write`].
+    fn snap_read(r: &mut crate::snapshot::SnapReader) -> Result<Team, crate::snapshot::SnapError> {
+        use crate::snapshot::SnapError;
+        Ok(Team {
+            members: r.seq("team.members", crate::Handle::snap_read)?,
+            phase: match r.u8()? {
+                0 => TeamPhase::Staging,
+                1 => TeamPhase::Attacking,
+                _ => return Err(SnapError::BadTag("TeamPhase")),
+            },
+            target: Target::snap_read(r)?,
+            staging: CellCoord::snap_read(r)?,
+            initial_size: r.u32()? as usize,
+            stage_timer: r.u32()?,
+            is_harass: r.boolean()?,
+        })
+    }
+
     fn hash_into(&self, h: &mut Fnv1a) {
         h.write_u32(self.members.len() as u32);
         for m in &self.members {
@@ -362,6 +393,65 @@ impl AiPlayer {
     /// The base-building/economy policy this controller runs.
     pub fn profile(&self) -> AiProfile {
         self.profile
+    }
+
+    /// Byte-exact snapshot (M8-C) of the full controller decision state — all of
+    /// it, unlike [`AiPlayer::hash_into`] which gates on non-default so the hash
+    /// stays golden-stable; a resumed AI must resume its exact timers/enemy/team.
+    pub(crate) fn snap_write(&self, w: &mut crate::snapshot::SnapWriter) {
+        w.u8(self.house);
+        w.u8(match self.difficulty {
+            Difficulty::Easy => 0,
+            Difficulty::Normal => 1,
+            Difficulty::Hard => 2,
+        });
+        w.u32(self.decide_timer);
+        w.u32(self.attack_timer);
+        w.boolean(self.deployed);
+        w.u32(self.expert_timer);
+        w.option(&self.enemy, |w, e| w.u8(*e));
+        w.u32(self.max_units);
+        w.u32(self.max_buildings);
+        w.u32(self.max_infantry);
+        w.option(&self.team, |w, t| t.snap_write(w));
+        w.u32(self.failed_attacks);
+        w.u8(match self.profile {
+            AiProfile::Legacy => 0,
+            AiProfile::Expert => 1,
+        });
+        w.u32(self.repair_timer);
+    }
+
+    /// Inverse of [`AiPlayer::snap_write`].
+    pub(crate) fn snap_read(
+        r: &mut crate::snapshot::SnapReader,
+    ) -> Result<AiPlayer, crate::snapshot::SnapError> {
+        use crate::snapshot::SnapError;
+        Ok(AiPlayer {
+            house: r.u8()?,
+            difficulty: match r.u8()? {
+                0 => Difficulty::Easy,
+                1 => Difficulty::Normal,
+                2 => Difficulty::Hard,
+                _ => return Err(SnapError::BadTag("Difficulty")),
+            },
+            decide_timer: r.u32()?,
+            attack_timer: r.u32()?,
+            deployed: r.boolean()?,
+            expert_timer: r.u32()?,
+            enemy: r.option("ai.enemy", |r| r.u8())?,
+            max_units: r.u32()?,
+            max_buildings: r.u32()?,
+            max_infantry: r.u32()?,
+            team: r.option("ai.team", Team::snap_read)?,
+            failed_attacks: r.u32()?,
+            profile: match r.u8()? {
+                0 => AiProfile::Legacy,
+                1 => AiProfile::Expert,
+                _ => return Err(SnapError::BadTag("AiProfile")),
+            },
+            repair_timer: r.u32()?,
+        })
     }
 
     pub(crate) fn hash_into(&self, h: &mut Fnv1a) {
