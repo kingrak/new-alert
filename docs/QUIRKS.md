@@ -2339,7 +2339,15 @@ citations below are verified against the EA GPL source checkout
   It was a **sim-rate collapse** — ~14,000 ticks/s → ~20 ticks/s (700×,
   ~50 ms/tick) once both bases gridlocked (6 of 7 harvesters pinned) — caused
   by every blocked/targeting unit re-running a *failing* full-grid A* every
-  tick, forever.
+  tick, forever. **Scope (audit-corrected):** that 700× figure is the
+  *pre-fix* P0 measurement. Post-M7.20, disabling the path-retry throttle
+  alone reproduces only a transient ~24× dip (581 t/s at worst) and the map
+  still resolves — the corridor-placement fix removes the mass-pinning
+  precondition that fed the full collapse. The throttle stands on its original
+  fidelity citations (`PathDelay`/`TryTryAgain`) and as defense-in-depth
+  against gridlock states placement cannot prevent; it is not independently
+  necessary on the two pinned maps. Known gap: no synthetic unit test pins
+  the collapse magnitude in isolation.
 - `scg05ea`/Normal was a stalemate: the stronger AI's team slot was held by a
   stalled 2-survivor team (28,000+ ticks in Attacking), so a 60-unit army sat
   idle with the escalation counter frozen.
@@ -2417,7 +2425,13 @@ counterpart line (the original's harvester relies on its mission delays +
 Attacking that long dissolves as a **failed** attack (bumps the escalation
 counter, retreats survivors, frees the slot). The original's `TeamClass::AI`
 dissolves stalled teams through its own mission/timer machinery; ours collapses
-that to one timeout. This was the actual scg05ea/scm01ea decider.
+that to one timeout. **Necessity (audit-corrected):** disabling the timeout in
+isolation stalls **scm01ea** for the full budget (team frozen 29,000+ ticks —
+the documented zombie signature) but **scg05ea resolves at all three
+difficulties without it** — the corridor-placement fix alone removes that map's
+stall precondition. The mechanisms are jointly sufficient with overlapping
+coverage, not each independently necessary on every map; the timeout's
+load-bearing pin is scm01ea plus the `m720` unit pin.
 
 **Runaway guard.** Rubber-band caps now include **infantry**
 (`Control.MaxInfantry` raise, HOUSE.CPP:4962-4963; `AI_Infantry` gate
