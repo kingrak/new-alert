@@ -216,6 +216,13 @@ desync).
   playing bundles back on schedule — M9-B client feature, closing the §4.6 "replays work" loop
   end-to-end with hash verification against the recorded chain).
 - Retention: config knob, default keep last 200 games or 7 days (in-memory index, files on disk).
+- **Known limitation (M7.23 audit finding):** the local `.rarp` stream has no
+  snapshot/rebase record, so a recording that crossed a mid-game resync fails
+  `replay-verify` loudly at the resume tick (safe — never a silent pass, but
+  verification is unavailable for that game). M9-B should add a resync record
+  (resume tick + snapshot hash, or embed the snapshot) so relayed games with
+  resync episodes stay verifiable end-to-end — the server's canonical log
+  needs this anyway for rejoin replays.
 
 ## 9. Server runtime model
 
