@@ -10,7 +10,10 @@
 //!    open flank — even though the defended one is *closer*.
 //! §3 production-quarry preference: a war factory is targeted over a much
 //!    nearer non-production building.
-//! §4 all-out-at-exactly-4-failures boundary (`ALL_OUT_ESCALATION`).
+//! §4 all-out boundary — per-difficulty since M7.20 P3
+//!    (`Difficulty::all_out_escalation()`: Normal = 4, Hard = 2, Easy = 5);
+//!    the staged-wave scripts below run at Normal (the historical 4-wave
+//!    boundary) and a dedicated pin covers Hard's earlier trigger.
 //! §5 determinism of the whole escalation/all-out state machine (same seed
 //!    twice, forced dissolves included).
 //!
@@ -229,11 +232,14 @@ fn force_current_team_to_dissolve(w: &mut World) {
 /// wave's `initial_size` (one entry per forced dissolve) and the tick chain,
 /// for both the growth pin and the determinism pin.
 fn run_escalation_script(seed: u32) -> (Vec<usize>, bool, Vec<u64>) {
-    // Ample tanks: worst case (escalation=3, Hard) wants up to
-    // `team_vehicles(4) + jitter(<=1) + escalation*2(6)` = 11 in a single
+    // Ample tanks: worst case (escalation=3, Normal) wants up to
+    // `team_vehicles(3) + jitter(<=1) + escalation*2(6)` = 10 in a single
     // wave, across 4 waves with survivors recycling back into the pool —
     // 60 is comfortably more than any sequence of 4 waves can ever consume.
-    let mut w = attacker_world(seed, 60, Difficulty::Hard);
+    // Normal (not Hard): since M7.20 P3 the all-out boundary is per-difficulty
+    // and Hard now commits after only 2 dissolves — Normal keeps the
+    // historical 4-staged-wave escalation this script pins.
+    let mut w = attacker_world(seed, 60, Difficulty::Normal);
     // A single, undefended, far-away production building: the sole target,
     // isolating escalation/all-out from §2/§3's target-selection logic.
     w.spawn_building(B_WEAP, 2, CellCoord::new(110, 110))
@@ -309,7 +315,8 @@ fn failed_attacks_escalation_grows_each_successive_wave() {
 fn all_out_engages_at_exactly_the_fourth_dissolve_not_the_third() {
     // Repeat the first 3 dissolves only, and confirm a 4th team CAN still
     // form (all-out has not engaged yet) — the boundary's "not early" half.
-    let mut w = attacker_world(0xE5CA_1002, 60, Difficulty::Hard);
+    // Normal difficulty: its `all_out_escalation()` is the historical 4.
+    let mut w = attacker_world(0xE5CA_1002, 60, Difficulty::Normal);
     w.spawn_building(B_WEAP, 2, CellCoord::new(110, 110))
         .unwrap();
 
@@ -326,6 +333,50 @@ fn all_out_engages_at_exactly_the_fourth_dissolve_not_the_third() {
     );
 }
 
+/// M7.20 P3 pin — Hard's earlier all-out trigger
+/// (`Difficulty::all_out_escalation()` = 2). After ONE dissolve a second team
+/// still forms; after the SECOND dissolve no further staged team may ever
+/// form (the AI is all-out), and individual attack orders appear. Reverting
+/// the per-difficulty knob to the old flat 4 makes the "no 3rd team" half
+/// fail (a 3rd team would form), so the knob is proven load-bearing.
+#[test]
+fn hard_goes_all_out_after_exactly_two_dissolves() {
+    let mut w = attacker_world(0xE5CA_1003, 60, Difficulty::Hard);
+    w.spawn_building(B_WEAP, 2, CellCoord::new(110, 110))
+        .unwrap();
+
+    wait_for_attacking(&mut w, 3000).expect("wave 1 should form and attack");
+    force_current_team_to_dissolve(&mut w); // failed_attacks -> 1
+    wait_for_attacking(&mut w, 3000)
+        .expect("at 1 prior dissolve (< 2), a 2nd Hard team must still form");
+    force_current_team_to_dissolve(&mut w); // failed_attacks -> 2 == boundary
+
+    let mut all_out_confirmed = false;
+    for _ in 0..1500 {
+        w.tick(&[]);
+        assert!(
+            w.ai()
+                .iter()
+                .find(|a| a.house() == 1)
+                .unwrap()
+                .team_summary()
+                .is_none(),
+            "a 3rd staged team formed after 2 dissolves at Hard — the M7.20 \
+             per-difficulty all-out boundary (Hard = 2) has regressed"
+        );
+        if w.units
+            .iter()
+            .any(|(_, u)| u.house == 1 && matches!(u.target, Some(Target::Building(_))))
+        {
+            all_out_confirmed = true;
+        }
+    }
+    assert!(
+        all_out_confirmed,
+        "after 2 dissolves a Hard AI must be all-out (individual attack orders), not idle"
+    );
+}
+
 /// Regression pin for a bug found while building this suite (fixed in the
 /// same pass, `ra-sim/src/ai.rs::advance_team`): a team that gets wiped out
 /// **entirely** (`alive == 0`) used to hit an early `return` before the
@@ -336,7 +387,9 @@ fn all_out_engages_at_exactly_the_fourth_dissolve_not_the_third() {
 /// does. Fixed by removing the redundant, incorrect early return.
 #[test]
 fn total_wipeout_escalates_the_next_wave_same_as_partial_decimation() {
-    let mut w = attacker_world(0xE5CA_5001, 30, Difficulty::Hard);
+    // Normal: needs 3 staged waves, and Hard now goes all-out after 2
+    // dissolves (M7.20 P3), which would suppress wave 3.
+    let mut w = attacker_world(0xE5CA_5001, 30, Difficulty::Normal);
     w.spawn_building(B_WEAP, 2, CellCoord::new(110, 110))
         .unwrap();
 

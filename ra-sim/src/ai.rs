@@ -86,6 +86,24 @@ impl Difficulty {
             Difficulty::Hard => 4,
         }
     }
+
+    /// Consecutive decimated waves before the AI abandons staged waves and goes
+    /// **all-out** (M7.20 P3 — the per-difficulty escalation trigger). A Hard AI
+    /// commits its whole army after only two failed waves; an Easy one keeps
+    /// politely staging longer. The original has **no** per-difficulty cadence
+    /// knob to cite — its `[Easy]/[Difficult]` sections carry only stat biases
+    /// plus `RepairDelay`/`BuildDelay` (RULES.CPP:311-327, `Difficulty_Get`),
+    /// and `BuildDelay`/`IsBuildSlowdown` are loaded but never consumed (dead:
+    /// no reader of `HouseClass::BuildDelay` outside its assignment,
+    /// HOUSE.CPP:294/304) — so this, like `attack_interval`, is our documented
+    /// extension (QUIRKS Q30).
+    fn all_out_escalation(self) -> u32 {
+        match self {
+            Difficulty::Easy => 5,
+            Difficulty::Normal => 4,
+            Difficulty::Hard => 2,
+        }
+    }
 }
 
 /// Which base-building/economy *policy* an [`AiPlayer`] runs — a
@@ -143,7 +161,10 @@ struct Team {
     staging: CellCoord,
     /// Member count at formation — the denominator for the retreat threshold.
     initial_size: usize,
-    /// Countdown while `Staging` before we give up waiting and attack anyway.
+    /// Phase countdown: while `Staging`, ticks before the team gives up
+    /// gathering and attacks anyway ([`STAGE_TIMEOUT`]); while `Attacking`
+    /// (M7.20), ticks before a stalled attack is dissolved as failed
+    /// ([`ATTACK_TIMEOUT`], armed on the Staging→Attacking transition).
     stage_timer: u32,
     /// A harvester-harassment team (targets an enemy harvester) vs. a base assault.
     is_harass: bool,
@@ -195,6 +216,21 @@ impl Team {
 /// the rally cell.
 const STAGE_TIMEOUT: u32 = 200;
 
+/// How long a team may stay in the **Attacking** phase before it is dissolved
+/// as a *failed* attack (M7.20 — the zombie-team fix). Observed on scm01ea: a
+/// 4-member wave ground down to exactly its retreat floor (2 survivors) that
+/// could no longer reach its objective sat in Attacking for 28,000+ ticks,
+/// monopolising the one team slot — so no new wave ever formed, the escalation
+/// counter froze, and a 60-unit army idled at base forever (the M7.20 stalemate
+/// signature). ~3.3 sim-minutes is enough to cross a 128-cell map and fight
+/// (~800-1800 ticks at typical speeds); a team that has neither won nor died by
+/// then is stalled, and dissolving it as a failure both frees the slot and
+/// feeds the M7.11 escalation (eventually all-out). The original's `TeamClass`
+/// dissolves stalled teams through its own mission/timer machinery
+/// (TEAM.CPP `TeamClass::AI` transient checks); ours collapses that to one
+/// timeout (QUIRKS Q30).
+const ATTACK_TIMEOUT: u32 = 3000;
+
 /// `RepairDelay` in hundredths (`Rule.Diff[].RepairDelay`, rules.cpp:316 = `.02`
 /// fixed default) — the difficulty handicap that scales the repair-throttle re-arm
 /// window (`RepairTimer`, building.cpp:5842). Kept in integer hundredths so the
@@ -237,6 +273,12 @@ pub struct AiPlayer {
     /// AI's discretionary base expansion so it doesn't spam power plants and wall
     /// itself in. `0` until the first Expert_AI pass sets it (= uncapped).
     max_buildings: u32,
+    /// Rubber-band **infantry** cap (`Control.MaxInfantry`, HOUSE.CPP:4962-4963,
+    /// gating `AI_Infantry` at HOUSE.CPP:6281 `CurInfantry >= Control.MaxInfantry`)
+    /// — M7.20 runaway guard: before this, the infantry lane was the one
+    /// production stream with **no** cap at all (the observed 30-42-infantry
+    /// blobs on both diagnostic maps). `0` until the first Expert_AI pass.
+    max_infantry: u32,
     /// The one active composed attack team, if any (M7.10 d).
     team: Option<Team>,
     /// Consecutive attack teams dissolved by decimation (M7.11 P1a — escalating
@@ -271,12 +313,18 @@ pub struct AiPlayer {
 /// growth is pointless — the cap keeps the value bounded (and its hash stable).
 const MAX_ESCALATION: u32 = 8;
 
-/// Consecutive decimated waves after which the AI abandons staged waves and goes
-/// **all-out** (M7.11 P1d). Below this, escalating staged waves (P1a) apply
-/// graduated pressure; at/above it, the whole army assaults enemy production
-/// continuously. Chosen so a few genuine failures still play out as normal waves
-/// (fidelity) before committing everything (decisiveness).
-const ALL_OUT_ESCALATION: u32 = 4;
+/// Ceiling for every rubber-band cap (M7.20 runaway guard): the original
+/// constructs each house at `MaxUnit(Rule.UnitMax/6)`,
+/// `MaxBuilding(Rule.BuildingMax/6)`, `MaxInfantry(Rule.InfantryMax/6)`
+/// (HOUSE.CPP:729-731) with the stock `[Maximums] Unit/Building/Infantry = 500`
+/// (RULES.CPP:235-246) — 500/6 = 83 each — and its Expert_AI raises are further
+/// bounded in practice by the global 500-object heaps. We have no heap limit, so
+/// the constructor value doubles as a hard clamp on the raise: two symmetric AIs
+/// can rubber-band each other up to 83, never beyond (the structural bound that
+/// makes an unbounded cap-escalation spiral impossible — QUIRKS Q30 notes the
+/// divergence: the original could theoretically raise past 83 until the heap
+/// filled).
+const RUBBER_BAND_CEILING: u32 = 500 / 6;
 
 /// Economy/build decisions are re-evaluated on this cadence (~1 s), matching the
 /// original's `AI_Building` returning `TICKS_PER_SECOND` (`house.cpp` return).
@@ -296,6 +344,7 @@ impl AiPlayer {
             enemy: None,
             max_units: 0,
             max_buildings: 0,
+            max_infantry: 0,
             team: None,
             failed_attacks: 0,
             profile: AiProfile::Expert,
@@ -337,6 +386,10 @@ impl AiPlayer {
             h.write_u8(0xCB);
             h.write_u32(self.max_buildings);
         }
+        if self.max_infantry != 0 {
+            h.write_u8(0xCC);
+            h.write_u32(self.max_infantry);
+        }
         if let Some(t) = &self.team {
             h.write_u8(0x7E);
             t.hash_into(h);
@@ -373,6 +426,26 @@ impl AiPlayer {
     /// The rubber-band unit / building caps (`Control.MaxUnit`/`MaxBuilding`).
     pub fn caps(&self) -> (u32, u32) {
         (self.max_units, self.max_buildings)
+    }
+
+    /// The rubber-band infantry cap (`Control.MaxInfantry`, HOUSE.CPP:4962 —
+    /// M7.20 runaway guard).
+    pub fn infantry_cap(&self) -> u32 {
+        self.max_infantry
+    }
+
+    /// Consecutive decimated attack waves (the M7.11 escalation counter) —
+    /// read-only, for tests/diagnostics.
+    pub fn failed_attacks(&self) -> u32 {
+        self.failed_attacks
+    }
+
+    /// Test-only probe (M7.20): the placement cell this AI would choose for
+    /// building `id` right now — exposes the corridor-clear placement scorer
+    /// to the pin suite without a command round-trip. Not for gameplay use.
+    #[doc(hidden)]
+    pub fn debug_placement_cell(&self, world: &World, id: u32) -> Option<CellCoord> {
+        self.placement_cell(world, id)
     }
 
     /// A read-only snapshot of the active composed team, for showcase/inspection:
@@ -587,6 +660,7 @@ impl AiPlayer {
         let mut best: Option<(i32, u8)> = None;
         let mut enemy_units_sum = 0i32;
         let mut enemy_buildings_sum = 0i32;
+        let mut enemy_infantry_sum = 0i32;
         let mut enemy_count = 0i32;
         // Houses in index order (deterministic), skipping ourself + dead houses.
         for h in 0..world.houses.len() as u8 {
@@ -602,6 +676,7 @@ impl AiPlayer {
             let ei = self.infantry_size(world, h);
             enemy_units_sum += eu;
             enemy_buildings_sum += eb;
+            enemy_infantry_sum += ei;
             enemy_count += 1;
 
             // house.cpp:4941 weighted score (all terms cited):
@@ -629,20 +704,40 @@ impl AiPlayer {
         }
         self.enemy = best.map(|(_, h)| h);
 
-        // Rubber-band caps (house.cpp:5010): raise our unit + building appetite to
+        // Rubber-band caps (`Control.MaxUnit/MaxBuilding/MaxInfantry` raises,
+        // HOUSE.CPP:4954-4964): raise our unit + building + infantry appetite to
         // the average enemy's size + 10, never shrinking (max with the current
-        // cap), with sane early-game floors so a base with no visible enemies still
-        // builds a starting force and a full base.
-        let (avg_u, avg_b) = if enemy_count > 0 {
+        // cap), with sane early-game floors so a base with no visible enemies
+        // still builds a starting force and a full base.
+        //
+        // **Runaway guard (M7.20).** Every raise is clamped at
+        // [`RUBBER_BAND_CEILING`] (= `Rule.UnitMax/6`, the original's
+        // constructor cap value, HOUSE.CPP:729-731): two symmetric AIs each
+        // matching the other's army is a positive-feedback loop, and without a
+        // ceiling the mutual `avg+10` raises could ratchet the caps — and the
+        // world's unit count — without structural bound (no 500-object heap
+        // exists here to stop it, unlike the original).
+        let (avg_u, avg_b, avg_i) = if enemy_count > 0 {
             (
                 enemy_units_sum / enemy_count,
                 enemy_buildings_sum / enemy_count,
+                enemy_infantry_sum / enemy_count,
             )
         } else {
-            (0, 0)
+            (0, 0, 0)
         };
-        self.max_units = self.max_units.max((avg_u + 10).max(10) as u32);
-        self.max_buildings = self.max_buildings.max((avg_b + 10).max(10) as u32);
+        self.max_units = self
+            .max_units
+            .max((avg_u + 10).max(10) as u32)
+            .min(RUBBER_BAND_CEILING);
+        self.max_buildings = self
+            .max_buildings
+            .max((avg_b + 10).max(10) as u32)
+            .min(RUBBER_BAND_CEILING);
+        self.max_infantry = self
+            .max_infantry
+            .max((avg_i + 10).max(10) as u32)
+            .min(RUBBER_BAND_CEILING);
     }
 
     // ---- Base building (AI_Building, house.cpp:5696) -----------------------
@@ -1226,7 +1321,16 @@ impl AiPlayer {
             .role_building(cat, Role::Barracks)
             .map(|b| hs.owns_building(b))
             .unwrap_or(false);
-        if hs.infantry_prod.is_none() && world.house_credits(self.house) > 0 && has_barracks {
+        // Rubber-band infantry cap (M7.20 runaway guard): `AI_Infantry` refuses
+        // once `CurInfantry >= Control.MaxInfantry` (HOUSE.CPP:6281). `0` cap
+        // (before the first Expert_AI pass) means "uncapped", like the others.
+        let under_icap = self.max_infantry == 0
+            || self.infantry_size(world, self.house) < self.max_infantry as i32;
+        if hs.infantry_prod.is_none()
+            && world.house_credits(self.house) > 0
+            && has_barracks
+            && under_icap
+        {
             // Only **offensive** infantry (a weapon that does positive damage) —
             // this admits the new combat specialists E4 (flamethrower) and DOG but
             // excludes the medic (heal weapon, negative damage) and the engineer
@@ -1265,7 +1369,8 @@ impl AiPlayer {
     /// harvester-harassment team.
     fn manage_team(&mut self, world: &World, rng: &mut RandomLcg, out: &mut Vec<Command>) {
         // Sustained-failure endgame (M7.11 P1d — `Do_All_To_Hunt`, house.cpp:7651).
-        // After `ALL_OUT_ESCALATION` consecutive decimated waves, abandon the
+        // After `difficulty.all_out_escalation()` consecutive decimated waves
+        // (M7.20 P3: Hard commits after 2, Easy after 5), abandon the
         // cautious stage-and-retreat cadence and commit the whole army to a
         // relentless assault on enemy production, re-pointing any idle or merely
         // auto-guarding armed unit each tick (units already attack-ordered keep
@@ -1274,7 +1379,7 @@ impl AiPlayer {
         // always retreat at 50% losses can stalemate forever (the observed
         // scg05ea/Easy stall), whereas an all-out assault presses until one side's
         // production falls and the loser's own fire-sale/all-hunt finishes it.
-        if self.failed_attacks >= ALL_OUT_ESCALATION {
+        if self.failed_attacks >= self.difficulty.all_out_escalation() {
             self.team = None;
             self.all_out_assault(world, out);
             return;
@@ -1361,6 +1466,8 @@ impl AiPlayer {
                     if let Some(target) = target {
                         team.target = target;
                         team.phase = TeamPhase::Attacking;
+                        // Arm the attack-stall timeout (M7.20 zombie-team fix).
+                        team.stage_timer = ATTACK_TIMEOUT;
                         for &unit in &team.members {
                             out.push(Command::Attack {
                                 unit,
@@ -1374,6 +1481,26 @@ impl AiPlayer {
                 }
             }
             TeamPhase::Attacking => {
+                // Attack-stall timeout (M7.20): a team that has neither won nor
+                // been decimated within `ATTACK_TIMEOUT` is stalled (e.g. its
+                // remnant sits exactly at the retreat floor with an abandoned
+                // approach). Dissolve it as a FAILED attack — bump the
+                // escalation counter and retreat the survivors — so the team
+                // slot frees for a bigger wave instead of being monopolised
+                // forever (the observed scm01ea/scg05ea stalemate).
+                team.stage_timer = team.stage_timer.saturating_sub(1);
+                if team.stage_timer == 0 {
+                    self.failed_attacks = (self.failed_attacks + 1).min(MAX_ESCALATION);
+                    let base = self.base_center(world);
+                    for &unit in &team.members {
+                        out.push(Command::Move {
+                            unit,
+                            dest: base,
+                            house: self.house,
+                        });
+                    }
+                    return; // team dissolved (stalled)
+                }
                 // Re-target if the objective died (chase the next-nearest enemy).
                 if self.validate_target(world, team.target).is_none() {
                     if let Some(target) = self.enemy_target(world) {
@@ -2008,8 +2135,37 @@ impl AiPlayer {
             .unwrap_or(CellCoord::new(64, 64))
     }
 
-    /// A legal footprint top-left near the base for building `id`, spiralling out
-    /// from the construction yard (deterministic scan order).
+    /// A legal footprint top-left near the base for building `id`, chosen by a
+    /// deterministic integer **score** over the bounded box around the
+    /// construction yard (M7.20 P1 — replaces the old first-fit spiral, whose
+    /// maximum-density packing walled AI bases solid and pinned their own
+    /// harvesters/armies: the user-observed gridlock).
+    ///
+    /// **Reference behaviour** (`HouseClass::Find_Build_Location`,
+    /// HOUSE.CPP:4575-4674): the original never max-packs either — it rates the
+    /// N/S/E/W/core *zones* around the base `Center` (defenses go to the most
+    /// under-defended zone, HOUSE.CPP:4620-4645; anything else to a random zone,
+    /// HOUSE.CPP:4648 `Random_Pick(ZONE_FIRST, ZONE_WEST)`), then takes the legal
+    /// cell nearest a random spot in that zone (`Find_Cell_In_Zone`,
+    /// HOUSE.CPP:7874-7921 via `Random_Cell_In_Zone`). It also *intends* combat
+    /// buildings never to sit adjacent to each other ("spacing defensive
+    /// buildings out will yield a better defense", HOUSE.CPP:4589-4597 — the
+    /// computed `adj` flag is dead code in RA, but the comment states the
+    /// design). Our port keeps the *shape* of that behaviour (spread, defenses
+    /// toward the threat) but is deterministic — integer scoring, no RNG — and
+    /// adds an explicit ore-corridor reservation; divergences in QUIRKS Q30.
+    ///
+    /// Score components (all integer, fixed iteration order, strict `>` keeps
+    /// the first-seen candidate on ties — §4.2):
+    /// - **Hard reject**: any footprint cell on a reserved harvester corridor
+    ///   (each refinery's dock cell + the walked line from dock toward its
+    ///   nearest ore), so the AI never bricks its own economy.
+    /// - **Lane preservation**: −16 per own-building-adjacent neighbour of the
+    ///   footprint (−32 for defenses, per the original's spacing intent).
+    /// - **Threat facing**: defenses gain up to +8/cell of displacement toward
+    ///   the designated enemy (our collapsed form of the zone-deficit rating).
+    /// - **Compactness**: −4 per Chebyshev ring from the anchor (everything
+    ///   still prefers to be near the yard, as before — just not wall-solid).
     fn placement_cell(&self, world: &World, id: u32) -> Option<CellCoord> {
         let anchor = world
             .buildings
@@ -2017,17 +2173,131 @@ impl AiPlayer {
             .find(|(_, b)| b.house == self.house && b.is_construction_yard)
             .or_else(|| world.buildings.iter().find(|(_, b)| b.house == self.house))
             .map(|(_, b)| b.cell)?;
-        for r in 1..14 {
-            for dy in -r..=r {
-                for dx in -r..=r {
-                    let c = CellCoord::new(anchor.x + dx, anchor.y + dy);
-                    if world.can_place_building(self.house, id, c) {
-                        return Some(c);
+        let proto = world.catalog.building(id)?;
+        let (fw, fh) = (proto.foot_w as i32, proto.foot_h as i32);
+        let is_defense = proto.weapon.is_some() && !proto.is_wall;
+        let reserved = self.reserved_corridor_cells(world);
+        // Displacement direction toward the designated enemy (sign per axis).
+        let enemy_dir = self.enemy.map(|e| {
+            let ec = self.base_center_of(world, e);
+            ((ec.x - anchor.x).signum(), (ec.y - anchor.y).signum())
+        });
+
+        const RING: i32 = 13; // same bounded reach as the old 1..14 spiral
+        let mut best: Option<(i64, CellCoord)> = None;
+        for dy in -RING..=RING {
+            for dx in -RING..=RING {
+                let c = CellCoord::new(anchor.x + dx, anchor.y + dy);
+                if !world.can_place_building(self.house, id, c) {
+                    continue;
+                }
+                // Hard reject: footprint may not cover a reserved corridor cell.
+                let mut on_corridor = false;
+                let mut adjacency = 0i64;
+                for fy in 0..fh {
+                    for fx in 0..fw {
+                        let fc = CellCoord::new(c.x + fx, c.y + fy);
+                        if reserved.contains(&fc) {
+                            on_corridor = true;
+                        }
+                        // Count neighbours already occupied by a building
+                        // footprint (any house — enemy walls block lanes too).
+                        for (nx, ny) in [
+                            (-1, -1),
+                            (0, -1),
+                            (1, -1),
+                            (-1, 0),
+                            (1, 0),
+                            (-1, 1),
+                            (0, 1),
+                            (1, 1),
+                        ] {
+                            let n = CellCoord::new(fc.x + nx, fc.y + ny);
+                            // Skip the footprint's own cells.
+                            let own = n.x >= c.x && n.x < c.x + fw && n.y >= c.y && n.y < c.y + fh;
+                            if !own && world.passability().is_occupied(n) {
+                                adjacency += 1;
+                            }
+                        }
                     }
+                }
+                if on_corridor {
+                    continue;
+                }
+                let mut score: i64 = 0;
+                score -= adjacency * if is_defense { 32 } else { 16 };
+                score -= dx.abs().max(dy.abs()) as i64 * 4;
+                if is_defense {
+                    if let Some((ex, ey)) = enemy_dir {
+                        score += (dx * ex + dy * ey) as i64 * 8;
+                    }
+                }
+                if best.map(|(bs, _)| score > bs).unwrap_or(true) {
+                    best = Some((score, c));
                 }
             }
         }
-        None
+        best.map(|(_, c)| c)
+    }
+
+    /// The cells the AI must keep clear for its economy (M7.20 P1a): for each
+    /// own refinery, its preferred dock cell (south of centre — the free
+    /// harvester's spawn cell, `building.cpp:2640` DIR_S, and
+    /// `nearest_refinery`'s first candidate) plus a walked line from that dock
+    /// toward the refinery's nearest ore cell (bounded by
+    /// [`CORRIDOR_MAX_CELLS`]). Deterministic: refineries in slot order, ore
+    /// pick by distance-then-cell-key, and a sign-stepped Chebyshev walk. The
+    /// original needs no such reservation because its zone-scattered placement
+    /// (HOUSE.CPP:7874) rarely packs a base solid — ours is the explicit
+    /// equivalent guarantee (QUIRKS Q30).
+    fn reserved_corridor_cells(&self, world: &World) -> Vec<CellCoord> {
+        let mut reserved: Vec<CellCoord> = Vec::new();
+        let scan = world.catalog.econ.long_scan_cells;
+        for (_, b) in world.buildings.iter() {
+            if b.house != self.house || !b.is_refinery || !b.is_alive() {
+                continue;
+            }
+            let center = b.center_cell();
+            let dock = CellCoord::new(center.x, b.cell.y + b.foot_h as i32);
+            reserved.push(dock);
+            // Nearest ore cell to the dock (bounded box scan, deterministic
+            // distance-then-cell-key tie-break, mirroring `nearest_reachable_ore`).
+            let mut ore: Option<(i32, CellCoord)> = None;
+            for dy in -scan..=scan {
+                for dx in -scan..=scan {
+                    let c = CellCoord::new(dock.x + dx, dock.y + dy);
+                    if !world.ore.has_ore(c) {
+                        continue;
+                    }
+                    let d = dx.abs().max(dy.abs());
+                    let better = match ore {
+                        None => true,
+                        Some((bd, bc)) => d < bd || (d == bd && (c.y, c.x) < (bc.y, bc.x)),
+                    };
+                    if better {
+                        ore = Some((d, c));
+                    }
+                }
+            }
+            if let Some((_, o)) = ore {
+                // Sign-stepped walk from the dock toward the ore: one diagonal-
+                // then-straight line, each step moving one cell per axis toward
+                // the target. Bounded so a far patch reserves only the base-side
+                // corridor segment.
+                let mut cur = dock;
+                for _ in 0..CORRIDOR_MAX_CELLS {
+                    if cur == o {
+                        break;
+                    }
+                    cur = CellCoord::new(
+                        cur.x + (o.x - cur.x).signum(),
+                        cur.y + (o.y - cur.y).signum(),
+                    );
+                    reserved.push(cur);
+                }
+            }
+        }
+        reserved
     }
 
     fn count_owned(&self, world: &World, id: u32) -> i32 {
@@ -2271,6 +2541,13 @@ enum Urgency {
     #[allow(dead_code)]
     Critical,
 }
+
+/// Maximum length (cells) of the reserved dock→ore corridor per refinery
+/// (M7.20 P1a). Matches the placement box reach so the corridor covers exactly
+/// the stretch the AI could otherwise wall; beyond it the base can't build
+/// anyway. Behaviour-tuned (the original reserves nothing — its zone-scattered
+/// `Find_Build_Location` placement never packs solid, HOUSE.CPP:7874).
+const CORRIDOR_MAX_CELLS: i32 = 14;
 
 /// Radius (cells) of the local defense-threat scan used to route attacks toward
 /// the enemy base's weakest-defended production building (M7.11 P1b). A modest

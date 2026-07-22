@@ -222,9 +222,18 @@ fn blocker_scatters_into_a_dead_end_niche_off_the_movers_path() {
     // leaves exactly one legal destination: the north niche.
     world.spawn_unit(0, 2, CellCoord::new(9, row), Facing(0), 400, stats(24, 8));
 
+    // Order the mover PAST the blocker (not onto its cell): since M7.20 P1.5
+    // the destination-only static-corner rule would let a mover ordered onto
+    // the blocker's cell get its dest auto-adjusted to the niche and legally
+    // diagonal-squeeze into it itself, bypassing the scatter this test pins.
+    // A far-east dest keeps the plain path on the corridor row (units are
+    // invisible to plain A*), so the mover jams against the blocker exactly
+    // as before, and its unit-avoiding re-route may NOT corner-clip past the
+    // blocker (the retained unit-corner strictness) — the scatter request is
+    // the only unjam.
     world.tick(&[Command::Move {
         unit: mover,
-        dest: CellCoord::new(8, row),
+        dest: CellCoord::new(15, row),
         house: 1,
     }]);
     let mut niche_used = false;
@@ -240,9 +249,10 @@ fn blocker_scatters_into_a_dead_end_niche_off_the_movers_path() {
         niche_used,
         "the blocker never took its one legal escape (the off-path niche)"
     );
-    // The mover, having lost its blocker, should be free to close in on (8,row)
-    // (it can't fully occupy it since the destination cell itself is the
-    // blocker's old cell, now vacated).
+    // The mover, having lost its blocker, should be free to close in on
+    // (8,row) — the enemy wall at (9,row) still blocks the rest of the trip
+    // (the mover eventually abandons that half via the PATH_RETRY budget, but
+    // the vacated blocker cell must be reached first).
     let mut progressed = false;
     for _ in 0..200 {
         world.tick(&[]);
@@ -260,9 +270,14 @@ fn blocker_scatters_into_a_dead_end_niche_off_the_movers_path() {
 // ===========================================================================
 // 3. Fully boxed blocker: no free adjacent cell in any of the 8 directions
 //    (mover occupies one neighbour, a permanent enemy "wall" occupies the
-//    opposite, the rest are impassable 1-wide-corridor terrain). Pin:
-//    mover holds stably, never panics, and the RNG draw count is bounded —
-//    exactly one draw per blocked tick, forever, never more.
+//    opposite, the rest are impassable 1-wide-corridor terrain). Pin (M7.20):
+//    mover holds stably, never panics, and — with the `PathDelay` throttle
+//    (`PATH_DELAY_TICKS`) and the `TryTryAgain` budget (`PATH_RETRY`,
+//    FOOT.H:241 / DRIVE.CPP:988-995) — its retries are *finite*: once the
+//    budget exhausts it abandons the impossible order entirely (dest cleared)
+//    and the scatter RNG goes silent, instead of drawing every tick forever
+//    (the pre-M7.20 behaviour this suite used to pin, and a driver of the
+//    scm01ea sim-rate collapse).
 // ===========================================================================
 
 #[test]
@@ -283,8 +298,10 @@ fn fully_boxed_blocker_holds_forever_no_panic_and_draws_are_bounded() {
     }]);
 
     // Run long enough for the mover to park adjacent to the blocker (west
-    // neighbour) and settle into the indefinite hold-and-retry pattern.
-    for t in 0..150 {
+    // neighbour), burn through its full retry budget (`PATH_RETRY` attempts
+    // spaced `PATH_DELAY_TICKS` apart ≈ 140 ticks after parking), and abandon
+    // the impossible order.
+    for t in 0..400 {
         world.tick(&[]);
         assert!(no_overlap(&world), "tick {t}: overlap");
     }
@@ -299,19 +316,18 @@ fn fully_boxed_blocker_holds_forever_no_panic_and_draws_are_bounded() {
         blocker_start,
         "a fully boxed blocker must never appear to move"
     );
+    // The `TryTryAgain` abandonment must have fired: the order is gone
+    // (`Assign_Destination(TARGET_NONE)`, DRIVE.CPP:991-994), so the unit is
+    // genuinely idle and re-taskable — not a permanent CPU drain.
+    assert!(
+        world.units.get(mover).unwrap().dest.is_none(),
+        "after exhausting PATH_RETRY the mover must abandon its move order"
+    );
 
-    // Settled window: one *logical* scatter draw (one `world.rng.range(0, 2)`
-    // call) per blocked tick, every tick, forever. `range()` is a faithful
-    // port of `RandomClass::operator()(min,max)`'s mask-and-reject scheme
-    // (`ra-sim/src/rng.rs`), so a single logical draw can itself consume more
-    // than one underlying `next()` step on a rejection — `range(0,2)`'s mask
-    // is 2 bits wide (0..=3) against a magnitude of 2, so value `3` is
-    // rejected and redrawn, roughly 1-in-4 of the time. Counting *raw* LCG
-    // steps is therefore not 1:1 with tick count; the invariant we can pin
-    // without being fragile against legitimate rejections is a generous
-    // bound: at least one step per tick (a draw always consumes >=1 step),
-    // and nowhere near a runaway (e.g. a double-draw-per-tick bug, or an
-    // unbounded rejection chain) — capped at a very loose 6x.
+    // Settled window: with the order abandoned there are NO further re-route
+    // attempts and therefore NO scatter requests — the sim RNG must not
+    // advance at all (this is what bounds per-tick cost in a gridlocked
+    // world; the pre-M7.20 code drew every tick forever here).
     let seed_before = world.rng_seed();
     const WINDOW: u32 = 50;
     for t in 0..WINDOW {
@@ -328,16 +344,10 @@ fn fully_boxed_blocker_holds_forever_no_panic_and_draws_are_bounded() {
             "boxed blocker must never move, tick {t}"
         );
     }
-    let seed_after = world.rng_seed();
-    let steps = lcg_steps_between(seed_before, seed_after, WINDOW * 6)
-        .expect("draw count should be small and bounded, not runaway");
-    assert!(
-        steps >= WINDOW,
-        "at least one RNG draw per blocked tick over the settled window (got {steps} for {WINDOW} ticks)"
-    );
-    assert!(
-        steps <= WINDOW * 6,
-        "draw count must not run away (got {steps} for {WINDOW} ticks)"
+    assert_eq!(
+        world.rng_seed(),
+        seed_before,
+        "an abandoned (given-up) mover must draw zero scatter RNG"
     );
 }
 
@@ -571,14 +581,14 @@ fn a_successful_reroute_never_touches_the_scatter_rng() {
 
 /// Three friendly, stationary infantry packed into one cell, all boxed in
 /// (no legal escape for any of them — same construction as the single-boxed-
-/// blocker case, scaled to a full 3-occupant cell): a blocked vehicle mover
-/// asks the cell's occupants every tick, and every one of the three genuinely
-/// eligible ("ask" = true) blockers draws once — three *logical* draws per
-/// tick (the whole cell isn't collapsed into a single scatter event), not
-/// one. As in the single-blocker case, each logical `range(0,2)` draw can
-/// itself cost more than one raw LCG step on a rejection, so the bound below
-/// is `>= 3` steps/tick (never fewer — three real draws did happen) with a
-/// generous headroom multiplier (never a runaway).
+/// blocker case, scaled to a full 3-occupant cell): each scatter *request*
+/// asks every genuinely eligible occupant, so each request costs three
+/// logical `range(0,2)` draws (the cell is not collapsed into one event).
+/// Since M7.20 the requests themselves are finite: one per `PATH_DELAY_TICKS`
+/// re-route attempt, at most `PATH_RETRY` of them, then the mover abandons
+/// the order and the RNG goes silent. This pins both halves: ≥3 draws total
+/// (at least one full request fired, all three occupants asked) and ZERO
+/// draws after abandonment.
 #[test]
 fn three_packed_infantry_blockers_each_draw_exactly_once_per_tick() {
     let (grid, row) = corridor(20, 5);
@@ -591,12 +601,14 @@ fn three_packed_infantry_blockers_each_draw_exactly_once_per_tick() {
     // escape eastward either (a vehicle's presence blocks infantry entry).
     world.spawn_unit(0, 2, CellCoord::new(11, row), Facing(0), 400, stats(24, 8));
 
+    let seed_start = world.rng_seed();
     world.tick(&[Command::Move {
         unit: mover,
         dest: CellCoord::new(18, row),
         house: 1,
     }]);
-    for t in 0..150 {
+    // Long enough to park, burn the full retry budget, and abandon.
+    for t in 0..400 {
         world.tick(&[]);
         assert!(no_overlap(&world), "tick {t}: overlap");
     }
@@ -613,7 +625,20 @@ fn three_packed_infantry_blockers_each_draw_exactly_once_per_tick() {
             "{label} should still be boxed in place after settling"
         );
     }
+    // At least one full scatter request fired during the retry phase, asking
+    // each of the three occupants once (>=3 logical draws => >=3 LCG steps).
+    let steps_total = lcg_steps_between(seed_start, world.rng_seed(), 3 * 6 * PATH_RETRY_BOUND)
+        .expect("draw count should be small and bounded");
+    assert!(
+        steps_total >= 3,
+        "each of the three boxed occupants must be asked (>=3 draws total, got {steps_total})"
+    );
+    assert!(
+        world.units.get(mover).unwrap().dest.is_none(),
+        "after exhausting PATH_RETRY the mover must abandon its move order"
+    );
 
+    // Post-abandonment: the RNG must be silent.
     let seed_before = world.rng_seed();
     const WINDOW: u32 = 20;
     for t in 0..WINDOW {
@@ -621,15 +646,13 @@ fn three_packed_infantry_blockers_each_draw_exactly_once_per_tick() {
         assert!(no_overlap(&world), "tick {t} (window): overlap");
         assert_eq!(world.units.get(mover).unwrap().cell(), mover_settled);
     }
-    let seed_after = world.rng_seed();
-    let steps = lcg_steps_between(seed_before, seed_after, WINDOW * 3 * 6)
-        .expect("draw count should be small and bounded");
-    assert!(
-        steps >= WINDOW * 3,
-        "at least 3 RNG draws per tick, one per still-boxed infantry blocker (got {steps} for {WINDOW} ticks)"
-    );
-    assert!(
-        steps <= WINDOW * 3 * 6,
-        "draw count must not run away (got {steps} for {WINDOW} ticks)"
+    assert_eq!(
+        world.rng_seed(),
+        seed_before,
+        "an abandoned mover must issue no further scatter requests (zero draws)"
     );
 }
+
+/// Loose upper bound on scatter requests for the packed-cell test: `PATH_RETRY`
+/// (10) requests × 3 occupants × 6 steps-per-draw headroom.
+const PATH_RETRY_BOUND: u32 = 10;

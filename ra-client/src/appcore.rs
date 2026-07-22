@@ -16,7 +16,7 @@ use std::collections::BTreeMap;
 use ra_data::house::{identity_remap, RemapTable};
 use ra_formats::tmpl::ICON_WIDTH;
 use ra_sim::coords::{CellCoord, Facing, WorldCoord, LEPTONS_PER_CELL};
-use ra_sim::{BuildItem, GameOver, Handle, Passability, ProdKind, Target, World};
+use ra_sim::{BuildItem, GameOver, Handle, Passability, ProdKind, SuperKind, Target, World};
 
 use crate::compositor::{viewport_rgba, IndexedImage, Palette, RgbaImage};
 use crate::font;
@@ -75,6 +75,13 @@ const SCROLL_BTN_W: i32 = 16;
 /// Tesla-coil charge duration for the render glow ramp — mirrors the sim's
 /// `TESLA_CHARGE_TICKS` (cosmetic only; the sim owns the real timing).
 const TESLA_CHARGE_MAX: i32 = 15;
+
+/// Superweapon ready/charge indicator button height (marquee arc). Full-width
+/// buttons stacked at the bottom of the sidebar strip; only drawn when the player
+/// owns a superweapon structure (absent from every pinned frame → no golden churn).
+const SW_BTN_H: i32 = 22;
+/// Chronosphere warp-flash effect lifetime, in synthetic frames.
+const WARP_FRAMES: u64 = 9;
 
 /// Approximate classic-RA per-house marker colours for the radar, indexed by
 /// house id (Greece gold, USSR red, …); grey for anything out of range.
@@ -225,6 +232,9 @@ enum EffectKind {
     /// which reverses the shape sequence, `building.cpp:602-606`). Falls back to
     /// the shared explosion when the building has no MAKE art.
     Deconstruct(u32),
+    /// A chronosphere warp flash (synthetic expanding rings; no SHP needed) at a
+    /// teleport source or destination. Purely cosmetic (marquee superweapon arc).
+    Warp,
 }
 
 /// A logical sound cue the UI wants played (DESIGN.md §4.2: cosmetic, derived
@@ -258,6 +268,17 @@ pub enum SoundEvent {
     /// `building.cpp:2770`). RA plays no EVA line for building self-repair
     /// (`VOX_REPAIRING` is the service-depot path only, `building.cpp:4313`).
     Repair,
+    /// A nuclear missile was launched — EVA "Nuclear weapon launched"
+    /// (`VOX_ABOMB_LAUNCH` = `ALAUNCH1.AUD`, `house.cpp` special-blast dispatch).
+    NukeLaunch,
+    /// The nuclear strike detonated — the heavy explosion SFX (`KABOOM25.AUD`).
+    NukeImpact,
+    /// The iron curtain was applied to a unit/building — the device SFX
+    /// (`VOC_IRON1` = `IRONCUR9.AUD`, `house.cpp:2950`).
+    IronCurtain,
+    /// The chronosphere warped a unit — the teleport SFX (`VOC_CHRONO` =
+    /// `CHRONO2.AUD`, `house.cpp:3053`).
+    Chronosphere,
 }
 
 /// The logical mouse-cursor the UI wants shown, derived from the armed action
@@ -283,6 +304,11 @@ pub enum CursorKind {
     /// Repair mode, but not over a repairable own building — the prohibited
     /// wrench. `MOUSE_NO_REPAIR` (MOUSE.SHP frame 120, `mouse.cpp:361`).
     NoRepair,
+    /// Superweapon target-select mode — the targeting reticle (marquee arc).
+    /// Stands in for the original's special-weapon cursors (`MOUSE_NUCLEAR_BOMB`
+    /// / `MOUSE_IRON_CURTAIN` / `MOUSE_CHRONO*`, `mouse.cpp`), rendered as a
+    /// crosshair since our SHP decoder doesn't read the variable-size MOUSE.SHP.
+    SuperTarget,
 }
 
 /// The windowless client core: terrain raster + camera + the sim view.
@@ -425,6 +451,15 @@ pub struct AppCore {
     /// repairing building (`building.cpp:520`) and reused as the repair-mode
     /// cursor glyph. `None` = a synthetic wrench primitive is drawn instead.
     wrench_art: Option<UnitSprite>,
+
+    // --- Superweapon fire UI (marquee arc P1) ---
+    /// The superweapon the player has armed for target-select, if any (clicking a
+    /// ready SW indicator enters this mode; a tactical click fires it). Mutually
+    /// exclusive with sell/repair/placement. `None` = no SW targeting in progress.
+    sw_fire_mode: Option<SuperKind>,
+    /// Chronosphere two-click gather: the unit picked by the first click, awaiting
+    /// a destination click. Only meaningful while `sw_fire_mode == Chronosphere`.
+    sw_chrono_source: Option<Handle>,
 }
 
 /// Frame index of the wrench in `SELECT.SHP` (`SELECT_WRENCH`, `defines.h:2525`:
@@ -505,6 +540,8 @@ impl AppCore {
             sell_button_art: None,
             repair_button_art: None,
             wrench_art: None,
+            sw_fire_mode: None,
+            sw_chrono_source: None,
         }
     }
 
@@ -591,7 +628,7 @@ impl AppCore {
     /// [`CursorKind::Normal`]. This is the shell-facing accessor the shell maps
     /// to a cursor shape (and that `compose_game` draws), pinned by tests.
     pub fn cursor_kind(&self) -> CursorKind {
-        if !self.sell_mode && !self.repair_mode {
+        if !self.sell_mode && !self.repair_mode && self.sw_fire_mode.is_none() {
             return CursorKind::Normal;
         }
         // Over the sidebar strip or off-screen: the mode cursor reverts to the
@@ -599,6 +636,11 @@ impl AppCore {
         let tw = self.tactical_width() as i32;
         if !self.mouse_inside || self.mouse_x < 0 || self.mouse_x >= tw {
             return CursorKind::Normal;
+        }
+        // Superweapon target-select shows the targeting reticle everywhere over the
+        // tactical area (any cell/unit is a candidate target, per kind).
+        if self.sw_fire_mode.is_some() {
+            return CursorKind::SuperTarget;
         }
         let over_own = self.player_house.is_some_and(|house| {
             let (mx, my) = self.viewport_to_map(self.mouse_x, self.mouse_y);
@@ -620,6 +662,8 @@ impl AppCore {
         if on {
             self.repair_mode = false;
             self.placing = None;
+            self.sw_fire_mode = None;
+            self.sw_chrono_source = None;
         }
     }
 
@@ -629,6 +673,8 @@ impl AppCore {
         if on {
             self.sell_mode = false;
             self.placing = None;
+            self.sw_fire_mode = None;
+            self.sw_chrono_source = None;
         }
     }
 
@@ -642,10 +688,53 @@ impl AppCore {
         self.set_repair_mode(!self.repair_mode);
     }
 
-    /// Cancel both sell and repair mode (Esc / right-click while armed).
+    /// Cancel every tactical action mode (Esc / right-click while armed):
+    /// sell, repair, and superweapon target-select (including a half-finished
+    /// chronosphere two-click gather).
     fn cancel_action_modes(&mut self) {
         self.sell_mode = false;
         self.repair_mode = false;
+        self.sw_fire_mode = None;
+        self.sw_chrono_source = None;
+    }
+
+    // ---- Superweapon fire UI (marquee arc P1) ----
+
+    /// The superweapon the player has armed for target-select, if any. Drives the
+    /// targeting cursor + banner and the fire-on-click behaviour.
+    pub fn superweapon_fire_mode(&self) -> Option<SuperKind> {
+        self.sw_fire_mode
+    }
+
+    /// The chronosphere source unit picked by the first click, awaiting a
+    /// destination click (test/observation seam).
+    pub fn chrono_pending_source(&self) -> Option<Handle> {
+        self.sw_chrono_source
+    }
+
+    /// Whether any tactical action mode is armed (sell / repair / superweapon
+    /// target-select). The `App` layer uses this to decide whether Esc cancels a
+    /// mode or opens the pause menu, and the shell to hide the OS cursor while our
+    /// drawn mode cursor takes over.
+    pub fn action_mode_armed(&self) -> bool {
+        self.sell_mode || self.repair_mode || self.sw_fire_mode.is_some()
+    }
+
+    /// Arm a superweapon for target-select (the ready-indicator click). No-op
+    /// unless the player owns that superweapon and it is fully charged
+    /// ([`World::superweapon_ready`]); arming clears the other tactical modes.
+    pub fn arm_superweapon(&mut self, kind: SuperKind) {
+        let Some(house) = self.player_house else {
+            return;
+        };
+        if !self.world.superweapon_ready(house, kind) {
+            return;
+        }
+        self.sell_mode = false;
+        self.repair_mode = false;
+        self.placing = None;
+        self.sw_chrono_source = None;
+        self.sw_fire_mode = Some(kind);
     }
 
     /// Set the "classic radar rules" mode (M7.8 skirmish option). `true` keeps the
@@ -946,6 +1035,11 @@ impl AppCore {
                     // Sidebar click? (game mode, click in the right strip)
                     if self.sidebar_enabled && x >= self.tactical_width() as i32 {
                         self.sidebar_click(x, y);
+                    } else if self.sw_fire_mode.is_some() {
+                        // Superweapon target-select: a tactical click picks the
+                        // target (cell / unit / building, or the chrono two-click
+                        // source→dest) and fires through `Command::FireSuperWeapon`.
+                        self.try_fire_super_at(x, y);
                     } else if self.sell_mode {
                         // Sell mode: a tactical click sells the own building under
                         // it (no-op on enemy buildings, units, or empty ground).
@@ -964,8 +1058,9 @@ impl AppCore {
                     }
                 }
                 MouseButton::Right => {
-                    if self.sell_mode || self.repair_mode {
-                        // Right-click cancels sell/repair mode (like the original).
+                    if self.sell_mode || self.repair_mode || self.sw_fire_mode.is_some() {
+                        // Right-click cancels an armed sell/repair/superweapon mode
+                        // (like the original's cursor-mode cancel).
                         self.cancel_action_modes();
                     } else if self.placing.take().is_some() {
                         // Right-click cancels placement (keeps the ready building).
@@ -1032,6 +1127,7 @@ impl AppCore {
                     .and_then(|o| o.as_ref())
                     .map(|s| s.frames.len() as u64)
                     .unwrap_or(0),
+                EffectKind::Warp => WARP_FRAMES,
             };
             frames > 0 && now.saturating_sub(e.start_ms) < frames * FX_FRAME_MS
         });
@@ -1106,6 +1202,26 @@ impl AppCore {
             })
             .collect();
         let prev_bullets: Vec<Handle> = self.world.bullets.iter().map(|(h, _)| h).collect();
+        // Superweapon effect snapshots (marquee arc P2): pending nuke ground-zeros,
+        // and the set of units/buildings already under an iron curtain, so the
+        // post-tick diff can fire the launch/impact/curtain cosmetics. Cheap and
+        // empty in every world without a superweapon (so nothing changes there).
+        let prev_nuke_cells: Vec<CellCoord> =
+            self.world.nuke_strikes().iter().map(|n| n.cell).collect();
+        let prev_iron_units: Vec<Handle> = self
+            .world
+            .units
+            .iter()
+            .filter(|(_, u)| u.iron_curtain > 0)
+            .map(|(h, _)| h)
+            .collect();
+        let prev_iron_buildings: Vec<Handle> = self
+            .world
+            .buildings
+            .iter()
+            .filter(|(_, b)| b.iron_curtain > 0)
+            .map(|(h, _)| h)
+            .collect();
 
         let cmds = std::mem::take(&mut self.pending);
         // Buildings the player asked to sell this tick: a building that vanishes
@@ -1135,12 +1251,20 @@ impl AppCore {
 
         // Deaths → explosions (visual + audio).
         let mut any_death = false;
-        for (h, coord, lift) in prev_units {
+        for &(h, coord, lift) in &prev_units {
             if !self.world.units.contains(h) {
                 self.spawn_effect_lifted(EffectKind::Explosion, coord, lift);
                 any_death = true;
             }
         }
+        // Superweapon effect diffs (marquee arc P2) — all derived from sim state,
+        // spawned into the cosmetic layer only (never written back to the sim).
+        self.diff_superweapon_effects(
+            &prev_units,
+            &prev_nuke_cells,
+            &prev_iron_units,
+            &prev_iron_buildings,
+        );
         // Buildings that vanished this tick: a *sold* one deconstructs (reverse
         // buildup + cash-register SFX + EVA "Structure sold" for the player); any
         // other loss is a combat death → explosion. Faithful to the split between
@@ -1212,6 +1336,110 @@ impl AppCore {
         }
     }
 
+    /// Diff superweapon sim state across a tick and spawn the cosmetic feedback
+    /// (marquee arc P2): the nuke launch EVA + mushroom cluster + impact SFX, the
+    /// iron-curtain SFX, and the chronosphere warp flashes + SFX. Everything here
+    /// reads sim state and writes only the cosmetic effect/sound queues — it never
+    /// touches `world`, so effects on/off leaves the sim hash chain identical.
+    fn diff_superweapon_effects(
+        &mut self,
+        prev_units: &[(Handle, WorldCoord, i32)],
+        prev_nuke_cells: &[CellCoord],
+        prev_iron_units: &[Handle],
+        prev_iron_buildings: &[Handle],
+    ) {
+        // Gather everything from the (immutable) world first, then mutate the
+        // cosmetic queues — keeps the borrows disjoint.
+        let now_cells: Vec<CellCoord> = self.world.nuke_strikes().iter().map(|n| n.cell).collect();
+        let launched = now_cells.iter().any(|c| !prev_nuke_cells.contains(c));
+        let detonated: Vec<CellCoord> = prev_nuke_cells
+            .iter()
+            .copied()
+            .filter(|c| !now_cells.contains(c))
+            .collect();
+        let iron_applied = self
+            .world
+            .units
+            .iter()
+            .any(|(h, u)| u.iron_curtain > 0 && !prev_iron_units.contains(&h))
+            || self
+                .world
+                .buildings
+                .iter()
+                .any(|(h, b)| b.iron_curtain > 0 && !prev_iron_buildings.contains(&h));
+        // Chronosphere: a *surviving* unit whose position jumped more than a few
+        // cells in one tick — only the warp moves a unit that far per tick.
+        let warp_thresh = (3 * LEPTONS_PER_CELL) as i64;
+        let mut warps: Vec<WorldCoord> = Vec::new();
+        for &(h, old, _) in prev_units {
+            let Some(u) = self.world.units.get(h) else {
+                continue;
+            };
+            let dx = (u.coord.x.0 - old.x.0) as i64;
+            let dy = (u.coord.y.0 - old.y.0) as i64;
+            if dx * dx + dy * dy > warp_thresh * warp_thresh {
+                warps.push(old);
+                warps.push(u.coord);
+            }
+        }
+
+        if launched {
+            self.push_sound(SoundEvent::NukeLaunch);
+        }
+        for cell in detonated {
+            self.spawn_nuke_blast(cell);
+            self.push_sound(SoundEvent::NukeImpact);
+        }
+        if iron_applied {
+            self.push_sound(SoundEvent::IronCurtain);
+        }
+        if !warps.is_empty() {
+            for c in warps {
+                self.spawn_warp(c);
+            }
+            self.push_sound(SoundEvent::Chronosphere);
+        }
+    }
+
+    /// Spawn the nuclear-detonation cosmetic: a **cluster** of explosion fireballs
+    /// across the blast radius (a scaled-up "mushroom" — bigger than a single
+    /// combat blast), plus a couple lifted skyward for the rising column. Uses the
+    /// shared explosion SHP (`FBALL1`); no-op if that art isn't installed, so the
+    /// off/no-asset paths are unaffected (the ATOMICEXP/NUKE dedicated shape is not
+    /// in the freeware set — the coordinator-sanctioned scaled-FBALL fallback).
+    fn spawn_nuke_blast(&mut self, cell: CellCoord) {
+        let c = cell.center();
+        let step = LEPTONS_PER_CELL;
+        // Ground fireball ring across the ~3-cell radius.
+        for (ox, oy) in [
+            (0, 0),
+            (step, 0),
+            (-step, 0),
+            (0, step),
+            (0, -step),
+            (step, step),
+            (-step, -step),
+            (step, -step),
+            (-step, step),
+        ] {
+            let anchor = WorldCoord::new(c.x.0 + ox, c.y.0 + oy);
+            self.spawn_effect(EffectKind::Explosion, anchor);
+        }
+        // Rising column: two fireballs lifted above ground-zero (the mushroom stalk).
+        self.spawn_effect_lifted(EffectKind::Explosion, c, CELL_PIXELS);
+        self.spawn_effect_lifted(EffectKind::Explosion, c, CELL_PIXELS * 2);
+    }
+
+    /// Spawn a chronosphere warp flash (synthetic rings, no art) at `anchor`.
+    fn spawn_warp(&mut self, anchor: WorldCoord) {
+        self.effects.push(Effect {
+            kind: EffectKind::Warp,
+            anchor,
+            lift_px: 0,
+            start_ms: self.anim_ms,
+        });
+    }
+
     /// Queue a cosmetic sound cue (deduped against the current frame's queue so a
     /// burst of same-type events plays once).
     fn push_sound(&mut self, ev: SoundEvent) {
@@ -1254,6 +1482,8 @@ impl AppCore {
                 .and_then(|o| o.as_ref())
                 .map(|s| s.frames.len() as u32)
                 .unwrap_or(0),
+            // Synthetic warp flash needs no art — a fixed frame budget.
+            EffectKind::Warp => WARP_FRAMES as u32,
         }
     }
 
@@ -1617,6 +1847,19 @@ impl AppCore {
                         draw_sprite_centered(frame, sx, sy_d - 2, rframe, &remap, &self.palette);
                     }
                 }
+            }
+
+            // Iron-curtain tint: a pulsing blue/metallic overlay over an
+            // invulnerable unit for the curtain's duration (marquee arc P2,
+            // cosmetic — derived from the sim's `iron_curtain` countdown, never
+            // written back). The pulse is on the cosmetic clock (sim-inert).
+            if unit.iron_curtain > 0 {
+                let half = if is_inf {
+                    CELL_PIXELS / 4
+                } else {
+                    CELL_PIXELS / 2
+                };
+                self.draw_iron_tint(frame, sx, sy_d, half);
             }
 
             // Muzzle flash: a brief bright spot at the barrel tip the tick(s)
@@ -2036,6 +2279,94 @@ impl AppCore {
         }
     }
 
+    /// Any live building (of any house) whose footprint covers a map-pixel point —
+    /// for the iron-curtain target pick, which may protect any unit or building.
+    fn building_at_map(&self, mx: i64, my: i64) -> Option<Handle> {
+        let cell = CellCoord::new(
+            (mx.div_euclid(CELL_PIXELS as i64)) as i32,
+            (my.div_euclid(CELL_PIXELS as i64)) as i32,
+        );
+        self.world
+            .buildings
+            .iter()
+            .find(|(_, b)| b.is_alive() && b.covers(cell))
+            .map(|(h, _)| h)
+    }
+
+    /// Fire the armed superweapon at the tactical viewport point (marquee arc P1).
+    /// Emits `Command::FireSuperWeapon` per kind:
+    /// - **Nuclear** → the clicked cell (one click).
+    /// - **IronCurtain** → the unit (preferred) or building under the cursor (one
+    ///   click; a click on empty ground stays armed for a retry).
+    /// - **Chronosphere** → a two-click gather: the first click on a unit stores
+    ///   the warp source, the second click sets the destination cell and fires.
+    ///
+    /// Re-validates readiness each click (the granting building may have been
+    /// destroyed while the mode was armed); a click never emits for an unready
+    /// weapon. The mode exits on a successful fire (Esc/right-click cancels).
+    fn try_fire_super_at(&mut self, x: i32, y: i32) {
+        if !self.accepting_orders() {
+            return;
+        }
+        let (Some(house), Some(kind)) = (self.player_house, self.sw_fire_mode) else {
+            return;
+        };
+        if !self.world.superweapon_ready(house, kind) {
+            self.cancel_action_modes();
+            return;
+        }
+        let (mx, my) = self.viewport_to_map(x, y);
+        let cell = CellCoord::new(
+            (mx.div_euclid(CELL_PIXELS as i64)) as i32,
+            (my.div_euclid(CELL_PIXELS as i64)) as i32,
+        );
+        match kind {
+            SuperKind::Nuclear => {
+                self.emit(Command::FireSuperWeapon {
+                    house,
+                    kind,
+                    target: Target::Cell(cell),
+                    dest: None,
+                });
+                self.cancel_action_modes();
+            }
+            SuperKind::IronCurtain => {
+                let target = self
+                    .unit_at_map(mx, my)
+                    .map(Target::Unit)
+                    .or_else(|| self.building_at_map(mx, my).map(Target::Building));
+                if let Some(target) = target {
+                    self.emit(Command::FireSuperWeapon {
+                        house,
+                        kind,
+                        target,
+                        dest: None,
+                    });
+                    self.cancel_action_modes();
+                }
+                // No unit/building under the cursor → stay armed for a retry.
+            }
+            SuperKind::Chronosphere => match self.sw_chrono_source {
+                None => {
+                    // First click: pick the vehicle to warp (stay armed for dest).
+                    if let Some(u) = self.unit_at_map(mx, my) {
+                        self.sw_chrono_source = Some(u);
+                    }
+                }
+                Some(src) => {
+                    // Second click: the destination cell → fire and exit.
+                    self.emit(Command::FireSuperWeapon {
+                        house,
+                        kind,
+                        target: Target::Unit(src),
+                        dest: Some(cell),
+                    });
+                    self.cancel_action_modes();
+                }
+            },
+        }
+    }
+
     /// The SELL and REPAIR mode-button rects `(x0,y0,x1,y1)` in the sidebar header
     /// (only meaningful when the sidebar is enabled). Stacked at the header's
     /// right edge over blank background, so no other sidebar geometry moves.
@@ -2076,6 +2407,55 @@ impl AppCore {
                 (x0, y0, x1, y0 + MODE_BTN_H)
             }
         }
+    }
+
+    /// The superweapon kinds the player house currently owns (present in the sim,
+    /// charging or ready), in a stable kind order — the set the sidebar surfaces as
+    /// ready/charge indicators. Empty (and hence the whole SW indicator strip is
+    /// absent) unless the player owns a superweapon structure, so no pinned frame
+    /// is affected.
+    fn sw_owned_kinds(&self) -> Vec<SuperKind> {
+        let Some(house) = self.player_house else {
+            return Vec::new();
+        };
+        let mut kinds: Vec<SuperKind> = self
+            .world
+            .superweapons()
+            .iter()
+            .filter(|s| s.house == house)
+            .map(|s| s.kind)
+            .collect();
+        kinds.sort_by_key(|k| sw_kind_index(*k));
+        kinds.dedup();
+        kinds
+    }
+
+    /// The stacked ready/charge indicator buttons `(kind, (x0,y0,x1,y1))` at the
+    /// bottom of the sidebar strip (marquee arc P1) — one per owned superweapon.
+    fn sw_buttons(&self) -> Vec<(SuperKind, (i32, i32, i32, i32))> {
+        let kinds = self.sw_owned_kinds();
+        if kinds.is_empty() {
+            return Vec::new();
+        }
+        let x0 = self.tactical_width() as i32 + 1;
+        let x1 = self.viewport_w as i32 - 1;
+        let n = kinds.len() as i32;
+        kinds
+            .into_iter()
+            .enumerate()
+            .map(|(i, k)| {
+                let y0 = self.viewport_h as i32 - (n - i as i32) * SW_BTN_H;
+                (k, (x0, y0, x1, y0 + SW_BTN_H - 1))
+            })
+            .collect()
+    }
+
+    /// The superweapon indicator button under a sidebar point, if any.
+    fn sw_button_at(&self, x: i32, y: i32) -> Option<SuperKind> {
+        self.sw_buttons()
+            .into_iter()
+            .find(|(_, (x0, y0, x1, y1))| x >= *x0 && x < *x1 && y >= *y0 && y <= *y1)
+            .map(|(k, _)| k)
     }
 
     // ---- Build UI actions (public so tests / the verification drive them) ----
@@ -2159,6 +2539,8 @@ impl AppCore {
     /// follows the cursor until a map click).
     pub fn begin_placement(&mut self, building_id: u32) {
         self.placing = Some(building_id);
+        self.sw_fire_mode = None;
+        self.sw_chrono_source = None;
     }
 
     /// Whether a building is currently being placed.
@@ -2521,6 +2903,13 @@ impl AppCore {
             self.toggle_repair_mode();
             return;
         }
+        // Superweapon ready-indicator buttons (marquee arc P1): clicking a *ready*
+        // one enters its target-select mode; clicking one that is still charging
+        // is a no-op (the clock shows the progress).
+        if let Some(kind) = self.sw_button_at(x, y) {
+            self.arm_superweapon(kind);
+            return;
+        }
         let Some(idx) = self.sidebar_row_at(x, y) else {
             return;
         };
@@ -2607,6 +2996,21 @@ impl AppCore {
         for e in &self.effects {
             let elapsed = self.anim_ms.saturating_sub(e.start_ms);
             let fi = (elapsed / FX_FRAME_MS) as usize;
+            // Synthetic chronosphere warp flash: expanding cyan rings (no art).
+            if matches!(e.kind, EffectKind::Warp) {
+                let px = (leptons_to_pixel(e.anchor.x.0) as i64 - cam.x) as i32;
+                let py = (leptons_to_pixel(e.anchor.y.0) as i64 - cam.y) as i32 - e.lift_px;
+                let stage = (elapsed / FX_FRAME_MS) as i32;
+                let r = 3 + stage * 2;
+                let fade = 255u8.saturating_sub((stage * 26).min(230) as u8);
+                for a in 0..40 {
+                    let t = a as f32 * std::f32::consts::PI / 20.0;
+                    let rx = px + (r as f32 * t.cos()) as i32;
+                    let ry = py + (r as f32 * t.sin()) as i32;
+                    put_pixel(frame, rx, ry, [120, 230, fade.max(160)]);
+                }
+                continue;
+            }
             let (sprite, centered) = match e.kind {
                 EffectKind::Explosion => (self.explosion_sprite.first(), true),
                 EffectKind::Buildup(id) | EffectKind::Deconstruct(id) => (
@@ -2615,6 +3019,7 @@ impl AppCore {
                         .and_then(|o| o.as_ref()),
                     false,
                 ),
+                EffectKind::Warp => (None, true), // handled above
             };
             let Some(sprite) = sprite else { continue };
             // Deconstruct plays the buildup band in *reverse* (the original's
@@ -2685,6 +3090,14 @@ impl AppCore {
                 draw_line(frame, ccx, ccy, bx, by, [40, 40, 48]);
                 fill_rect(frame, bx - 1, by - 1, bx + 1, by + 1, [30, 30, 36]);
             }
+            // Iron-curtain tint over an invulnerable building (marquee arc P2).
+            if b.iron_curtain > 0 {
+                let cxp = px as i32 + b.foot_w as i32 * CELL_PIXELS / 2;
+                let cyp = py as i32 + b.foot_h as i32 * CELL_PIXELS / 2;
+                let hw = b.foot_w as i32 * CELL_PIXELS / 2;
+                let hh = b.foot_h as i32 * CELL_PIXELS / 2;
+                self.draw_iron_tint_box(frame, cxp - hw, cyp - hh, cxp + hw, cyp + hh);
+            }
             // Damage bar.
             if b.health < b.max_health {
                 draw_health_bar(
@@ -2696,6 +3109,21 @@ impl AppCore {
                 );
             }
         }
+    }
+
+    /// Iron-curtain tint centred at `(cx, cy)` with half-extent `half` — a pulsing
+    /// blue/metallic wash (marquee arc P2). Pulse amplitude rides the cosmetic
+    /// clock, so it never couples to the sim.
+    fn draw_iron_tint(&self, frame: &mut RgbaImage, cx: i32, cy: i32, half: i32) {
+        self.draw_iron_tint_box(frame, cx - half, cy - half, cx + half, cy + half);
+    }
+
+    /// Iron-curtain tint over an arbitrary box (shared by units and buildings).
+    fn draw_iron_tint_box(&self, frame: &mut RgbaImage, x0: i32, y0: i32, x1: i32, y1: i32) {
+        // Pulse the alpha 70..150 on a ~0.5s cosmetic cycle for a "shimmer".
+        let phase = (self.anim_ms / 90) % 8;
+        let a = 70 + (phase.abs_diff(4) as u8) * 18;
+        fill_rect_alpha(frame, x0, y0, x1, y1, [120, 170, 235], a);
     }
 
     /// Draw the green/red footprint preview while placing a building.
@@ -2824,10 +3252,23 @@ impl AppCore {
     /// player asked for (the cursor is the primary signal); nothing draws when no
     /// mode is armed, so no existing frame is affected.
     fn draw_mode_banner(&self, frame: &mut RgbaImage) {
+        let sw_text = self.sw_fire_mode.map(|k| match k {
+            SuperKind::Nuclear => "SELECT NUKE TARGET",
+            SuperKind::IronCurtain => "SELECT IRON CURTAIN TARGET",
+            SuperKind::Chronosphere => {
+                if self.sw_chrono_source.is_some() {
+                    "SELECT CHRONO DESTINATION"
+                } else {
+                    "SELECT CHRONO UNIT"
+                }
+            }
+        });
         let (text, rgb) = if self.sell_mode {
             ("SELL MODE", [235, 80, 70])
         } else if self.repair_mode {
             ("REPAIR MODE", [80, 205, 95])
+        } else if let Some(t) = sw_text {
+            (t, [245, 210, 80])
         } else {
             return;
         };
@@ -2885,6 +3326,51 @@ impl AppCore {
                     draw_prohibit(frame, cx, cy);
                 }
             }
+            CursorKind::SuperTarget => self.draw_target_reticle(frame, cx, cy),
+        }
+    }
+
+    /// Draw the superweapon targeting reticle at `(cx, cy)`: a crosshair inside a
+    /// ring, dark-outlined for legibility over any background. The chronosphere's
+    /// second step (destination pick) tints it cyan; other picks are red.
+    fn draw_target_reticle(&self, frame: &mut RgbaImage, cx: i32, cy: i32) {
+        let rgb = if matches!(self.sw_fire_mode, Some(SuperKind::Chronosphere))
+            && self.sw_chrono_source.is_some()
+        {
+            [90, 220, 245] // chrono destination step
+        } else {
+            [245, 70, 60]
+        };
+        let r = 8;
+        // Ring (double outline for contrast).
+        draw_rect_outline(
+            frame,
+            cx - r - 1,
+            cy - r - 1,
+            cx + r + 1,
+            cy + r + 1,
+            [12, 12, 14],
+        );
+        for a in 0..48 {
+            let t = a as f32 * std::f32::consts::PI / 24.0;
+            let px = cx + (r as f32 * t.cos()) as i32;
+            let py = cy + (r as f32 * t.sin()) as i32;
+            put_pixel(frame, px, py, rgb);
+        }
+        // Crosshair arms.
+        for d in -(r + 3)..=(r + 3) {
+            put_pixel(
+                frame,
+                cx + d,
+                cy,
+                if d.abs() <= 2 { [12, 12, 14] } else { rgb },
+            );
+            put_pixel(
+                frame,
+                cx,
+                cy + d,
+                if d.abs() <= 2 { [12, 12, 14] } else { rgb },
+            );
         }
     }
 
@@ -2935,6 +3421,107 @@ impl AppCore {
         for col in 0..SIDEBAR_COLUMNS {
             self.draw_sidebar_column(frame, col);
         }
+
+        // Superweapon ready/charge indicators at the bottom of the strip.
+        self.draw_sw_buttons(frame);
+    }
+
+    /// Draw the superweapon ready/charge indicator buttons (marquee arc P1) —
+    /// one per owned superweapon, stacked at the bottom of the sidebar. Each shows
+    /// the SW's cameo (or a text label), a **recharge clock** whose lit sweep
+    /// reflects [`World::superweapon_charge_permille`], and a bright "READY" state
+    /// when fully charged (the original's pie/clock over the special-weapon button,
+    /// `sidebar.cpp` `SuperClass`/`Flash_Clock`). Nothing draws when the player
+    /// owns no superweapon, so no existing frame is touched.
+    fn draw_sw_buttons(&self, frame: &mut RgbaImage) {
+        let Some(house) = self.player_house else {
+            return;
+        };
+        for (kind, (x0, y0, x1, y1)) in self.sw_buttons() {
+            let ready = self.world.superweapon_ready(house, kind);
+            let permille = self
+                .world
+                .superweapon_charge_permille(house, kind)
+                .unwrap_or(0);
+            // Panel: green when ready, dim slate while charging.
+            let bg = if ready { [26, 72, 30] } else { [34, 34, 42] };
+            fill_rect(frame, x0, y0, x1, y1, bg);
+            let border = if ready { [120, 240, 120] } else { [80, 80, 96] };
+            draw_rect_outline(frame, x0, y0, x1, y1, border);
+
+            // Recharge clock at the right edge (radius from the button height).
+            let r = (SW_BTN_H / 2 - 2).max(4);
+            let ccx = x1 - r - 2;
+            let ccy = (y0 + y1) / 2;
+            self.draw_charge_clock(frame, ccx, ccy, r, permille, ready);
+
+            // Label at the left: the short SW name (the full cameo already shows in
+            // the build strip; this compact indicator is text + clock).
+            let tcol = if ready {
+                [200, 245, 200]
+            } else {
+                [200, 200, 210]
+            };
+            let label = if ready {
+                match kind {
+                    SuperKind::Nuclear => "NUKE RDY",
+                    SuperKind::IronCurtain => "IRON RDY",
+                    SuperKind::Chronosphere => "CHRONO RDY",
+                }
+            } else {
+                sw_short_label(kind)
+            };
+            font::draw_text(frame, x0 + 3, ccy - font::GLYPH_H / 2, label, tcol);
+            if !ready {
+                // Percent charged, under the label.
+                font::draw_text(
+                    frame,
+                    x0 + 3,
+                    ccy + font::GLYPH_H / 2 + 1,
+                    &format!("{}%", permille / 10),
+                    [150, 150, 165],
+                );
+            }
+        }
+    }
+
+    /// Draw a recharge "clock": a filled disc whose lit sweep (clockwise from the
+    /// top) covers `permille`/1000 of the circle, the rest darkened — the original
+    /// `Flash_Clock`/`Draw_Clock` pie over a special-weapon button. Fully lit (and
+    /// a small tick highlight) when `ready`.
+    fn draw_charge_clock(
+        &self,
+        frame: &mut RgbaImage,
+        cx: i32,
+        cy: i32,
+        r: i32,
+        permille: i32,
+        ready: bool,
+    ) {
+        let frac = (permille.clamp(0, 1000) as f32) / 1000.0;
+        let lit = if ready {
+            [130, 245, 130]
+        } else {
+            [90, 170, 240]
+        };
+        let dark = [20, 22, 30];
+        for dy in -r..=r {
+            for dx in -r..=r {
+                if dx * dx + dy * dy > r * r {
+                    continue;
+                }
+                // Angle clockwise from straight up (12 o'clock), in [0,1).
+                let ang = (dx as f32).atan2(-dy as f32); // 0 at top, +→clockwise
+                let mut t = ang / (2.0 * std::f32::consts::PI);
+                if t < 0.0 {
+                    t += 1.0;
+                }
+                let rgb = if ready || t <= frac { lit } else { dark };
+                put_pixel(frame, cx + dx, cy + dy, rgb);
+            }
+        }
+        // Rim.
+        draw_rect_outline(frame, cx - r, cy - r, cx + r, cy + r, [10, 12, 16]);
     }
 
     /// Draw the SELL and REPAIR mode buttons (M7.9 P1). Each shows highlighted
@@ -3204,6 +3791,25 @@ impl AppCore {
     /// / tests). Terrain-only cores never emit any.
     pub fn drain_commands(&mut self) -> Vec<Command> {
         std::mem::take(&mut self.emitted)
+    }
+}
+
+/// Stable ordering index for a superweapon kind (for the sidebar indicator stack
+/// + owned-kind dedup). Mirrors the sim's `super_kind_tag`.
+fn sw_kind_index(kind: SuperKind) -> usize {
+    match kind {
+        SuperKind::Nuclear => 0,
+        SuperKind::IronCurtain => 1,
+        SuperKind::Chronosphere => 2,
+    }
+}
+
+/// Short font-safe label for a superweapon kind (the charging-indicator caption).
+fn sw_short_label(kind: SuperKind) -> &'static str {
+    match kind {
+        SuperKind::Nuclear => "NUKE",
+        SuperKind::IronCurtain => "IRON",
+        SuperKind::Chronosphere => "CHRONO",
     }
 }
 

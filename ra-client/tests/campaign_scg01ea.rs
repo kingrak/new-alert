@@ -602,8 +602,16 @@ fn scg01ea_einstein_dies_to_active_guards_if_the_route_is_not_cleared() {
     // the guards must catch and kill him at exactly this tick. A drift here
     // means guard reaction/engagement timing changed; re-derive, don't just
     // bump the number.
+    //
+    // Re-derived 63 → 58 for M7.20 P1.5: the pathfinder now matches the
+    // original's destination-cell-only diagonal rule (`Can_Enter_Cell`
+    // ignores its FacingType, UNIT.CPP:3208), so units squeeze diagonally
+    // between corner-touching static blockers. On scg01ea's real terrain the
+    // guard/Einstein routes shorten and the engagement lands 5 ticks earlier.
+    // Verified by bisect: restoring the pre-M7.20 corner rule alone restores
+    // tick 63 exactly.
     assert_eq!(
-        tick, 63,
+        tick, 58,
         "Einstein's death-to-active-guards must land on the same deterministic \
          tick every run"
     );

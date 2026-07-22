@@ -187,7 +187,7 @@ async fn amain_app(mut app: App, smoke_seconds: Option<f32>, sounds: Vec<(SoundE
 
         // Hide the OS cursor while a sell/repair mode is armed, so our drawn
         // mode cursor (in `compose_game`) is the sole pointer; otherwise show it.
-        let armed = app.core().is_some_and(|c| c.sell_mode() || c.repair_mode());
+        let armed = app.core().is_some_and(|c| c.action_mode_armed());
         show_mouse(!armed);
 
         let frame = app.compose();
@@ -335,9 +335,9 @@ async fn amain(mut core: AppCore, smoke_seconds: Option<f32>, sounds: Vec<(Sound
         #[cfg(not(feature = "audio"))]
         let _ = cues;
 
-        // Hide the OS cursor while a sell/repair mode is armed (our drawn mode
-        // cursor takes over); show it otherwise.
-        show_mouse(!(core.sell_mode() || core.repair_mode()));
+        // Hide the OS cursor while a sell/repair/superweapon mode is armed (our
+        // drawn mode cursor takes over); show it otherwise.
+        show_mouse(!core.action_mode_armed());
 
         // --- compose and upload ---
         let frame = core.compose_camera();

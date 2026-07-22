@@ -2236,6 +2236,10 @@ fn apply_command(world: &mut World, cmd: Command) {
                                             // (state `Idle` → `Looking`) once the unit arrives.
                     if u.is_harvester {
                         u.harvest.status = HarvStatus::Idle;
+                        // Clear any stale mining-cadence countdown so the
+                        // manual-order Idle resumes immediately on arrival (the
+                        // M7.20 rescan back-off reuses `timer` while Idle).
+                        u.harvest.timer = 0;
                     }
                 }
             }
@@ -3475,6 +3479,28 @@ fn run_combat(world: &mut World) {
                 .map(|u| u.path.is_empty() || u.dest != Some(goal))
                 .unwrap_or(false);
             if need_path {
+                // Unreachable-target throttle (M7.20 anti-gridlock, sharing the
+                // movement layer's `PathDelay`/`TryTryAgain` state): before
+                // this, a unit whose target it could not path to re-ran a
+                // *failing* full-grid A* every tick, forever — with a dozen
+                // all-out attackers aimed at a walled-in base this alone
+                // collapsed the sim rate. The original bounds the same case:
+                // approach pathing is `PathDelay`-throttled (FOOT.CPP:461) and
+                // an exhausted retry budget clears the can't-reach target and
+                // scan-limits the unit ("give this unit a range limit so that
+                // it might not pick a 'can't reach' target again",
+                // DRIVE.CPP:1003-1008 `IsScanLimited`/`Assign_Target(TARGET_NONE)`).
+                let throttled = world
+                    .units
+                    .get(handle)
+                    .map(|u| u.reroute_delay > 0)
+                    .unwrap_or(false);
+                if throttled {
+                    if let Some(u) = world.units.get_mut(handle) {
+                        u.reroute_delay -= 1;
+                    }
+                    continue;
+                }
                 let loco = world
                     .units
                     .get(handle)
@@ -3484,6 +3510,19 @@ fn run_combat(world: &mut World) {
                     if let Some(u) = world.units.get_mut(handle) {
                         u.path = path;
                         u.dest = Some(goal);
+                        u.reroute_fails = 0;
+                    }
+                } else if let Some(u) = world.units.get_mut(handle) {
+                    u.reroute_fails = u.reroute_fails.saturating_add(1);
+                    if u.reroute_fails >= PATH_RETRY {
+                        // Can't-reach target: drop it (the original's
+                        // `Assign_Target(TARGET_NONE)` + scan limit).
+                        u.target = None;
+                        u.guard_target = false;
+                        u.reroute_fails = 0;
+                        u.reroute_delay = 0;
+                    } else {
+                        u.reroute_delay = PATH_DELAY_TICKS;
                     }
                 }
             }
@@ -6197,6 +6236,26 @@ fn spawn_produced_unit(world: &mut World, unit_id: u32, house: u8, cell: CellCoo
 // Harvester system (§4.9 M5) — port of Mission_Harvest (unit.cpp:2898)
 // ===========================================================================
 
+/// Re-route throttle window in ticks for a blocked unit (M7.20): the original's
+/// `PathDelay = Rule.PathDelay * TICKS_PER_MINUTE` (FOOT.CPP:461) with the stock
+/// `[AI] PathDelay=.016` minutes (RULES.CPP:267) — `.016 × 900` ≈ 14 ticks. One
+/// expensive path recomputation per blocked unit per window, never per tick.
+pub const PATH_DELAY_TICKS: u16 = 14;
+
+/// Consecutive failed re-routes before a blocked unit abandons its move order —
+/// the original's `TryTryAgain` budget (`enum {PATH_RETRY=10};`, FOOT.H:241;
+/// decremented and finally `Assign_Destination(TARGET_NONE)`, DRIVE.CPP:988-995).
+pub const PATH_RETRY: u8 = 10;
+
+/// Ore-rescan back-off after a harvester finds no reachable ore (M7.20 P2): the
+/// original parks a useless harvester and re-runs its harvest mission only after
+/// `TICKS_PER_SECOND*7` (the `GOINGTOIDLE` no-ore branch, UNIT.CPP:2961-2965) —
+/// **not** every tick. 7 s × 15 ticks/s = 105 ticks. Without this, an ore-starved
+/// harvester oscillated Idle→Looking every other tick, re-running up to 16
+/// failed full-grid A* searches each time (a major part of the scm01ea sim-rate
+/// collapse).
+pub const HARVESTER_RESCAN_DELAY: u16 = 105;
+
 /// Harvester system: run the 5-state FSM for every harvester, in slot order.
 fn run_harvesters(world: &mut World) {
     for handle in world.units.handles() {
@@ -6238,8 +6297,15 @@ fn process_harvester(world: &mut World, handle: Handle) {
     use HarvStatus::*;
     match hs.status {
         Idle => {
-            // Resume once the unit is no longer executing a manual order.
-            if !has_path {
+            // Rescan back-off (M7.20 P2): after a failed ore scan the original
+            // re-runs the harvest mission only after `TICKS_PER_SECOND*7`
+            // (UNIT.CPP:2961-2965), so an ore-starved harvester does not burn a
+            // full scan every other tick. `timer` is 0 for a manual-order Idle,
+            // which therefore still resumes immediately.
+            if hs.timer > 0 {
+                hs.timer -= 1;
+            } else if !has_path {
+                // Resume once the unit is no longer executing a manual order.
                 hs.status = if hs.cargo >= cap { FindHome } else { Looking };
             }
         }
@@ -6251,12 +6317,27 @@ fn process_harvester(world: &mut World, handle: Handle) {
             } else if world.ore.has_ore(cell) {
                 hs.status = Harvesting;
                 hs.timer = dump_rate;
+                // Arrived on ore: the unstick escalation is spent (M7.20 P2).
+                hs.retarget = 0;
             } else {
-                // Find the nearest reachable ore and drive to it.
-                match nearest_reachable_ore(world, cell, world.catalog.econ.long_scan_cells, loco) {
+                // Find the nearest reachable ore and drive to it. `retarget`
+                // (bumped each time the movement layer abandoned a route as
+                // unreachable, P2 unstick) rotates the scan away from the
+                // nearest candidates so a pinned harvester tries a *different*
+                // ore cell instead of re-picking the one it cannot reach.
+                match nearest_reachable_ore(
+                    world,
+                    cell,
+                    world.catalog.econ.long_scan_cells,
+                    loco,
+                    hs.retarget as usize,
+                ) {
                     Some((dest, path)) => set_path(world, handle, dest, path),
                     None => {
                         hs.status = if hs.cargo > 0 { FindHome } else { Idle };
+                        if hs.status == Idle {
+                            hs.timer = HARVESTER_RESCAN_DELAY;
+                        }
                     }
                 }
             }
@@ -6289,7 +6370,12 @@ fn process_harvester(world: &mut World, handle: Handle) {
                 set_path(world, handle, dock, path);
                 hs.status = HeadingHome;
             }
-            None => hs.status = Idle,
+            None => {
+                // No reachable dock either — park with the same rescan back-off
+                // (M7.20 P2) so the dock scan is not re-run every other tick.
+                hs.status = Idle;
+                hs.timer = HARVESTER_RESCAN_DELAY;
+            }
         },
         HeadingHome => {
             if has_path {
@@ -6331,6 +6417,8 @@ fn process_harvester(world: &mut World, handle: Handle) {
                 hs.gems = 0;
                 hs.home = None;
                 hs.status = Looking;
+                // A completed dump proves the harvester is not pinned (M7.20 P2).
+                hs.retarget = 0;
             }
         }
     }
@@ -6367,11 +6455,19 @@ fn house_has_refinery(world: &World, house: u8) -> bool {
 /// `leptons_distance`, the sim's own metric); the first with a valid A* path
 /// wins. Attempts are capped so a fully walled-off cluster doesn't run A* over
 /// every ore cell in range.
+///
+/// `skip` (M7.20 P2 unstick) rotates the scan start away from the nearest
+/// candidates: a harvester whose last route was abandoned as unreachable passes
+/// its `retarget` count here so it targets a **different** ore cell instead of
+/// re-picking the one it is pinned away from. The rotation wraps
+/// (`skip % len`), so some candidate is always tried. Deterministic: the
+/// candidate order is a pure distance-then-cell-key sort.
 fn nearest_reachable_ore(
     world: &World,
     from: CellCoord,
     max_cells: i32,
     loco: Locomotor,
+    skip: usize,
 ) -> Option<(CellCoord, Vec<CellCoord>)> {
     let mut candidates: Vec<(i32, CellCoord)> = Vec::new();
     for dy in -max_cells..=max_cells {
@@ -6384,7 +6480,11 @@ fn nearest_reachable_ore(
         }
     }
     candidates.sort_by(|a, b| a.0.cmp(&b.0).then(cell_key(a.1).cmp(&cell_key(b.1))));
-    for (_, c) in candidates.into_iter().take(16) {
+    if candidates.is_empty() {
+        return None;
+    }
+    let rot = skip % candidates.len();
+    for (_, c) in candidates.into_iter().cycle().skip(rot).take(16) {
         if let Some(path) = find_path(&world.passable, from, c, loco) {
             return Some((c, path));
         }
@@ -6593,6 +6693,27 @@ fn move_units(world: &mut World) {
             if yield_to_lower {
                 continue; // hold this tick; the lower-index unit re-routes
             }
+            // Re-route throttle (M7.20 anti-gridlock): the original recomputes a
+            // blocked unit's path at most once per `PathDelay` window
+            // (`PathDelay = Rule.PathDelay * TICKS_PER_MINUTE`, FOOT.CPP:461;
+            // `[AI] PathDelay=.016` min ≈ 14 ticks, RULES.CPP:267) — never every
+            // frame. Before this throttle, every gridlocked vehicle re-ran a
+            // *failing* full-grid A* each tick, which is exactly the observed
+            // scm01ea sim-rate collapse (~14k ticks/s → ~20 ticks/s once two
+            // walled bases pinned ~50 vehicles). While the throttle is armed the
+            // unit simply holds (the cheap direct-advance retry above still runs
+            // each tick, so it moves the moment the blocker clears).
+            if world
+                .units
+                .get(handle)
+                .map(|u| u.reroute_delay > 0)
+                .unwrap_or(false)
+            {
+                if let Some(u) = world.units.get_mut(handle) {
+                    u.reroute_delay -= 1;
+                }
+                continue;
+            }
             // Re-route around the occupied cells to our destination.
             let mut rerouted = false;
             if let Some(dest) = world.units.get(handle).and_then(|u| u.dest) {
@@ -6607,6 +6728,7 @@ fn move_units(world: &mut World) {
                     if !blocked2 {
                         if let Some(u) = world.units.get_mut(handle) {
                             u.path = newpath;
+                            u.reroute_fails = 0;
                         }
                         new_coord = nc2;
                         rerouted = true;
@@ -6642,7 +6764,35 @@ fn move_units(world: &mut World) {
                 if !is_inf {
                     scatter_friendly_blockers(world, handle, new_coord.cell(), &grid);
                 }
-                continue; // hold this tick; retry next tick
+                // Failed re-route bookkeeping (M7.20): arm the `PathDelay`
+                // throttle and spend one `TryTryAgain` retry. When the
+                // `PATH_RETRY` budget is exhausted the order is abandoned —
+                // `Assign_Destination(TARGET_NONE)` (DRIVE.CPP:988-995) — so a
+                // permanently walled-in unit goes idle (and can be re-tasked)
+                // instead of burning a failing full-grid A* forever. A harvester
+                // whose route is abandoned this way bumps its `retarget`
+                // escalation so its next ore scan tries a *different* ore cell
+                // (P2 unstick).
+                let is_harv = world
+                    .units
+                    .get(handle)
+                    .map(|u| u.is_harvester)
+                    .unwrap_or(false);
+                if let Some(u) = world.units.get_mut(handle) {
+                    u.reroute_fails = u.reroute_fails.saturating_add(1);
+                    if u.reroute_fails >= PATH_RETRY {
+                        u.path.clear();
+                        u.dest = None;
+                        u.reroute_fails = 0;
+                        u.reroute_delay = 0;
+                        if is_harv {
+                            u.harvest.retarget = u.harvest.retarget.saturating_add(1);
+                        }
+                    } else {
+                        u.reroute_delay = PATH_DELAY_TICKS;
+                    }
+                }
+                continue; // hold this tick; retry after the throttle window
             }
         }
 
@@ -6658,6 +6808,12 @@ fn move_units(world: &mut World) {
         // the vehicle tie-break.
         if new_coord != unit.coord && !is_inf {
             moved_this_tick.push(handle);
+        }
+        // Real progress clears the blocked-retry state (`TryTryAgain =
+        // PATH_RETRY` on a successful move, DRIVE.CPP:1049).
+        if new_coord != unit.coord {
+            unit.reroute_fails = 0;
+            unit.reroute_delay = 0;
         }
         unit.coord = new_coord;
         for _ in 0..consumed {

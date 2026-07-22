@@ -2239,4 +2239,210 @@ AI-vs-AI golden draws differently.
 (`superweapon_ready`, `superweapon_charge_permille`, `nuke_strikes`) are the seam a
 sidebar readiness clock + click-target mode drive; the rich targeting UI + the
 sidebar special-weapon cameo/clock are a below-the-fold client follow-on (P2,
-deferred — same treatment as the aircraft/naval sidebar cameos).
+deferred — same treatment as the aircraft/naval sidebar cameos). **Closed in Q29.**
+
+---
+
+## Q29 — Specialists + superweapons made player-usable: skirmish-buildable, fire UI, effect visuals
+
+**Milestone:** Marquee arc playability close-out (P0 sidebar surfacing, P1 player
+fire UI, P2 effect visuals; P3 AI-SW-build deferred). Closes the M7.19 gap where
+the specialist + superweapon *sim* (Q27/Q28) existed but nothing in the client let
+a player build or fire them.
+
+**P0 — skirmish-buildable (client `assets.rs`, `build_content`).** SPY/THF/E7 are
+appended to the **units** buildables strip and KENN/MSLO/IRON/PDOX to the
+**structures** strip, *below the fold* — appended after every existing item, the
+same discipline as the aircraft/naval cameos (Q24.1/Q25). Verified **rendering-only,
+zero re-pins**: no pinned `compose_game` frame contains these buildings/units, and
+the default (scroll-0) view shows only the top rows, so `ui_shroud_golden`,
+`ui_menu_golden_frames`, `ui_golden_frames`, and the sidebar suites are all
+byte-identical (confirmed green). Prerequisites are enforced from rules.ini via the
+existing catalog path — `prereq_ids` gained `dome`→DOME, `stek`→STEK, `kenn`→KENN
+(atek/barr already mapped): SPY→dome, THF/E7/PDOX→atek, IRON/MSLO→stek, KENN→barr,
+DOG→kenn (extracted from the real `redalert.mix` rules.ini; the sim's
+`describe_buildable`/`apply_start_production` do the gating). Adding KENN also makes
+the M7.7 DOG (`Prerequisite=kenn`) genuinely buildable for the first time. Cameos
+load from `<NAME>ICON.SHP` in hires.mix — all six present (SPY/THF/E7/MSLO/IRON/
+PDOX-ICON), degrading to the text row if absent.
+
+**P1 — player fire UI (client `appcore.rs`, all through `handle`/`update`/`compose`).**
+- **Ready/charge indicators.** `draw_sw_buttons` renders one full-width button per
+  owned superweapon, stacked at the bottom of the sidebar strip, each with a
+  **recharge clock** (`draw_charge_clock` — a pie whose lit sweep = the sim's
+  `superweapon_charge_permille`, clockwise from 12 o'clock) and a bright "…RDY"
+  state at full charge (the original's `Flash_Clock`/pie over the special-weapon
+  button, `sidebar.cpp`). Drawn **only when the player owns a superweapon**, so no
+  existing frame is touched (same conditional-render discipline as the iron-curtain
+  hash-only-when-active rule).
+- **Target-select mode.** Clicking a *ready* indicator arms `sw_fire_mode:
+  Option<SuperKind>` (mutually exclusive with sell/repair/placement). A distinct
+  targeting-reticle cursor (`CursorKind::SuperTarget`) + a per-kind reminder banner
+  ("SELECT NUKE/IRON CURTAIN/CHRONO TARGET"). A tactical left-click fires through
+  `Command::FireSuperWeapon`: **Nuclear** → the clicked cell (one click);
+  **IronCurtain** → the unit (preferred) or building under the cursor;
+  **Chronosphere** → a **two-click** gather (`sw_chrono_source`: unit first, then
+  destination cell — the reticle tints cyan for the second step). Esc/right-click
+  cancels (`cancel_action_modes`, surfaced via the new `action_mode_armed()` the
+  `App` Esc-gate and shell cursor-hide now use). Readiness is re-validated on every
+  click, so a click never fires an unready/destroyed-building weapon.
+
+**P2 — effect visuals (client cosmetic, sim-inert).** Spawned by
+`diff_superweapon_effects`, a post-tick sim-state diff in `step_tick` (the same
+pattern as the death/sold/buildup diffs — reads sim state, writes only the cosmetic
+effect/sound queues, never `world`):
+- **Nuke** — `spawn_nuke_blast` on a strike's detonation tick: a **cluster** of
+  `FBALL1` fireballs across the 3-cell radius plus two lifted skyward for the rising
+  column (a scaled-up "mushroom", bigger than a single blast). No dedicated
+  ATOMICEXP/NUKE shape ships in the freeware set — the coordinator-sanctioned
+  scaled-FBALL fallback. Sounds: EVA "Nuclear weapon launched" (`VOX_ABOMB_LAUNCH`
+  = `ALAUNCH1.AUD`) on launch, a heavy impact boom (`KABOOM25.AUD`) on detonation.
+- **Iron curtain** — a pulsing blue/metallic tint over the curtained unit/building
+  for its duration (`draw_iron_tint`, derived from the sim's `iron_curtain`
+  countdown; the pulse rides the cosmetic clock). SFX `VOC_IRON1` = `IRONCUR9.AUD`.
+- **Chronosphere** — a synthetic expanding-ring warp flash (`EffectKind::Warp`, no
+  art) at the teleport source + destination, detected as a surviving unit whose
+  position jumped >3 cells in one tick. SFX `VOC_CHRONO` = `CHRONO2.AUD`.
+- **Determinism:** `superweapon_effects_are_sim_inert` (new) runs the same
+  FireSuperWeapon script with the cosmetic layer on vs off → identical sim-hash
+  chain, extending `ui_cosmetic_determinism`'s proof to SW effects.
+
+**P3 — AI SW-structure building: DEFERRED (documented).** As Q28 notes, the AI
+*fires* an owned superweapon but never *builds* MSLO/IRON/PDOX in its base order.
+Making them player-buildable does **not** change that — the sidebar buildables list
+is client-only; the sim AI's `next_structure` is untouched — so landlocked/skirmish
+**AI-vs-AI stays byte-identical** (all 40 ra-sim test binaries green, unchanged).
+Enabling AI SW-building would make AIs nuke each other (outcomes shift) and risk the
+golden discipline / decisiveness, so per the priority-cut rule it is deferred and
+AI SW-structure-building stays off. The player fires all three; the AI's scripted/
+owned-SW firing is unchanged.
+
+**Evidence.** `superweapon_fire_ui.rs` (always-runs, synthetic): player builds→
+charges→arms→fires all three through the click seam, asserting the emitted command,
+the sim effect (nuke strikes+detonation, `iron_curtain>0`, teleport), the cues, and
+sim-inertness. `superweapon_fire_ui_png.rs` (real assets) dumps the ready-clock,
+nuke fire-mode cursor+banner, mushroom cluster, iron-curtain glow, and chrono warp.
+
+## Q30 — AI anti-gridlock: placement scoring, path-retry bounds, diagonal-corner fidelity, unstick + runaway guards (M7.20)
+
+**Milestone:** M7.20. Trigger: M7.19-B's richer content re-rolled the lockstep
+AI-vs-AI trajectories onto stalemate/pathological runs (`scg05ea` Normal stall;
+`scm01ea` observed grinding 8+ hours). The diagnosed diseases were real and
+user-visible in playtests: first-fit dense base placement walled AI bases solid,
+pinned harvesters ran unbounded failing path searches every tick, and a
+"zombie" attack team could monopolise the AI's one team slot forever. All
+citations below are verified against the EA GPL source checkout
+(`~/dev/game/reference/CnC_Remastered_Collection/REDALERT/`).
+
+**P0 diagnosis (measured, bounded diagnostic in `ui_ai_vs_ai.rs::diag_*`).**
+- `scm01ea` was **not** an unbounded unit-count runaway: units plateaued ~93.
+  It was a **sim-rate collapse** — ~14,000 ticks/s → ~20 ticks/s (700×,
+  ~50 ms/tick) once both bases gridlocked (6 of 7 harvesters pinned) — caused
+  by every blocked/targeting unit re-running a *failing* full-grid A* every
+  tick, forever.
+- `scg05ea`/Normal was a stalemate: the stronger AI's team slot was held by a
+  stalled 2-survivor team (28,000+ ticks in Attacking), so a 60-unit army sat
+  idle with the escalation counter frozen.
+
+**Diagonal corner rule — split (P1.5).** The original's pathfinder evaluates
+only the **destination cell** of each step: `Passable_Cell` calls
+`Can_Enter_Cell(cell, face)` (FINDPATH.CPP:1281) and every `Can_Enter_Cell`
+overload **ignores** its `FacingType` parameter (e.g. UNIT.CPP:3208
+`MoveType UnitClass::Can_Enter_Cell(CELL cell, FacingType ) const`) — so units
+squeeze diagonally between corner-touching static blockers (why original walls
+must be orthogonally continuous to seal). We were strictly harsher (both
+orthogonal side cells had to be passable), which left AI bases with far fewer
+exits. Now split:
+- **Static blockers (terrain/buildings): destination-only** — squeeze allowed,
+  matching the original.
+- **Unit occupancy (`find_path_avoiding` only): corner check kept** — a
+  re-route may not corner-clip a vehicle-occupied cell. **Divergence:** the
+  original had no corner rule for units either (same ignored-facing evidence);
+  we deliberately stay stricter to protect the one-vehicle-per-cell invariant
+  and the head-on tie-break from lepton-interpolated overlap.
+Pinned in `path::tests::no_corner_cutting` (both halves). Re-pin fallout was
+exactly one real-map timing pair (see the M7.20 report's audit table):
+`campaign_scg01ea`'s Einstein-death tick 63 → 58 (bisect-verified: restoring
+the old corner rule alone restores 63).
+
+**Blocked-move retry bounds (the sim-rate fix).** Ported the original's two
+bounds and applied them at *both* failing-A* sites:
+- `PATH_DELAY_TICKS = 14`: `PathDelay = Rule.PathDelay × TICKS_PER_MINUTE`
+  (FOOT.CPP:461) with stock `[AI] PathDelay=.016` min (RULES.CPP:267) — one
+  path recomputation per blocked unit per window, never per tick.
+- `PATH_RETRY = 10`: the `TryTryAgain` budget (FOOT.H:241); when exhausted the
+  move order is abandoned (`Assign_Destination(TARGET_NONE)`,
+  DRIVE.CPP:988-995) and the unit goes idle/re-taskable.
+- The **combat approach** applies the same state; an exhausted budget drops the
+  can't-reach target, per DRIVE.CPP:1003-1008 (`IsScanLimited` +
+  `Assign_Target(TARGET_NONE)` — "give this unit a range limit so that it might
+  not pick a 'can't reach' target again"). Divergence: we don't model the
+  persistent scan-limit flag; the AI may re-issue the target later, bounded by
+  the same throttle.
+- Harvester ore rescans back off `TICKS_PER_SECOND*7` after failure — the
+  `GOINGTOIDLE` return value (UNIT.CPP:2961-2965) — instead of rescanning (up
+  to 16 A* calls) every other tick.
+The scatter request (`Incoming`) consequently fires per throttled *attempt*,
+not per tick — matching the original, where the `Incoming` call sits inside the
+`PathDelay`-gated `Basic_Path` block (DRIVE.CPP:940-1049). The
+`scatter_boundary_suite` draw-cadence pins were re-derived accordingly (silent
+RNG after abandonment, instead of the old draw-every-tick-forever).
+
+**Placement scoring (P1).** `placement_cell` replaced first-fit max-density
+spiral with deterministic integer scoring (fixed scan order, strict `>`, no
+RNG). Reference: `Find_Build_Location` (HOUSE.CPP:4575-4674) rates base zones —
+defenses to the most under-defended zone, everything else to a **random** zone
+(HOUSE.CPP:4648), then the legal cell nearest a random spot in it
+(`Find_Cell_In_Zone`, HOUSE.CPP:7874). It also *intends* combat buildings never
+to be adjacent ("spacing defensive buildings out will yield a better defense",
+HOUSE.CPP:4589-4597 — the computed `adj` flag is dead code in RA). Divergences
+(all deliberate):
+- deterministic scoring instead of `Random_Pick` zones (§4.2 — no RNG in
+  placement);
+- an explicit **corridor reservation**: each refinery's dock cell + a walked
+  line toward its nearest ore is hard-rejected (the original never packs solid,
+  so it needs no such guarantee; our bounded ring must not brick the economy);
+- adjacency penalty (doubled for defenses, honouring the dead `adj` intent) +
+  mild compactness + defenses biased toward the designated enemy (collapsed
+  form of the zone-deficit rating).
+
+**Harvester unstick (P2).** A harvester whose route the movement layer
+abandoned (`PATH_RETRY` exhausted) bumps `HarvestState::retarget`; the ore scan
+rotates that many candidates away from nearest-first, so a pinned harvester
+targets a *different* ore cell; reset on a successful mine/dump. No original
+counterpart line (the original's harvester relies on its mission delays +
+`ArchiveTarget`); documented as the minimal deterministic equivalent.
+
+**Zombie-team timeout.** `ATTACK_TIMEOUT = 3000` ticks: a team still in
+Attacking that long dissolves as a **failed** attack (bumps the escalation
+counter, retreats survivors, frees the slot). The original's `TeamClass::AI`
+dissolves stalled teams through its own mission/timer machinery; ours collapses
+that to one timeout. This was the actual scg05ea/scm01ea decider.
+
+**Runaway guard.** Rubber-band caps now include **infantry**
+(`Control.MaxInfantry` raise, HOUSE.CPP:4962-4963; `AI_Infantry` gate
+`CurInfantry >= Control.MaxInfantry`, HOUSE.CPP:6281 — previously our infantry
+lane was entirely uncapped), and **every** cap raise clamps at
+`RUBBER_BAND_CEILING = 500/6 = 83` — the original's constructor values
+`MaxUnit(Rule.UnitMax/6)` etc. (HOUSE.CPP:729-731, RULES.CPP:235-246).
+**Divergence:** the original could raise past 83 until its global 500-object
+heaps filled; we have no heaps, so the constructor value doubles as the hard
+ceiling.
+
+**P3 — Hard-mode cadence.** Verified the skirmish path delivers the menu
+difficulty to the AI (`menu.rs:413` → `SkirmishSettings.difficulty` →
+`assets.rs:2391 AiPlayer::new`). Hard now also goes **all-out earlier**:
+`Difficulty::all_out_escalation()` = Easy 5 / Normal 4 / Hard 2 (plus the
+pre-existing per-difficulty `attack_interval`). **The original has no live
+per-difficulty cadence knob to cite** — `[Easy]/[Difficult]` carry only stat
+biases + `RepairDelay`/`BuildDelay` (`Difficulty_Get`, RULES.CPP:311-327), and
+`BuildDelay`/`IsBuildSlowdown` are loaded but never consumed (no reader of
+`HouseClass::BuildDelay` beyond its assignment, HOUSE.CPP:294/304) — so the
+cadence differentiation is entirely our extension.
+
+**Pins:** `m720_antigridlock_suite.rs` (corridor-clear placement, harvester
+unstick, infantry cap + ceiling, zombie-team timeout — each proven
+revert-sensitive by disabling its mechanism), `path::tests::no_corner_cutting`
+(split corner rule, both halves), `ai_retune_depth_suite::
+hard_goes_all_out_after_exactly_two_dissolves` (P3 knob), and the re-derived
+`scatter_boundary_suite` cadence pins.

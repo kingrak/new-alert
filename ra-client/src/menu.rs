@@ -487,7 +487,7 @@ impl App {
         // mode); only when no such mode is active does it open the pause overlay.
         if matches!(ev, InputEvent::KeyDown(Key::Menu)) {
             if let Some(c) = self.core.as_mut() {
-                if c.sell_mode() || c.repair_mode() {
+                if c.action_mode_armed() {
                     c.handle(ev);
                     return;
                 }

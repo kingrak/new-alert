@@ -146,10 +146,21 @@ pub struct HarvestState {
     pub gold: u16,
     /// Gem bails carried (books at `GemValue` on unload).
     pub gems: u16,
-    /// Countdown between harvest/unload steps (`OreDumpRate` cadence).
+    /// Countdown between harvest/unload steps (`OreDumpRate` cadence). Also used
+    /// as the **rescan back-off** while `Idle` after a failed ore scan (M7.20
+    /// P2): the original returns `TICKS_PER_SECOND*7` from `Mission_Harvest`'s
+    /// no-ore branch (UNIT.CPP:2965) so a useless harvester re-scans every 7 s,
+    /// not every tick.
     pub timer: u16,
     /// The refinery being docked at, if any.
     pub home: Option<Handle>,
+    /// Unstick escalation (M7.20 P2): how many times the movement layer has
+    /// **abandoned** this harvester's route as unreachable (the
+    /// `TryTryAgain`-exhausted give-up, DRIVE.CPP:988-995). The ore scan skips
+    /// this many nearest candidates, so a repeatedly-pinned harvester targets a
+    /// **different** ore cell each attempt. Reset when it actually mines or
+    /// unloads.
+    pub retarget: u8,
 }
 
 impl Default for HarvestState {
@@ -161,6 +172,7 @@ impl Default for HarvestState {
             gems: 0,
             timer: 0,
             home: None,
+            retarget: 0,
         }
     }
 }
@@ -179,6 +191,12 @@ impl HarvestState {
                 h.write_u32(handle.gen);
             }
             None => h.write_u8(0),
+        }
+        // Unstick state (M7.20 P2): folded ONLY when non-default so any
+        // harvester world where the reflex never fires appends no bytes.
+        if self.retarget != 0 {
+            h.write_u8(0x52);
+            h.write_u8(self.retarget);
         }
     }
 }
@@ -411,6 +429,19 @@ pub struct Unit {
     /// (`techno.cpp:4102`). Ticked down by the superweapon system. Hashed **only
     /// when non-zero**, so no un-curtained unit perturbs a golden.
     pub iron_curtain: u16,
+
+    // --- Blocked-move retry state (M7.20 P2 / anti-gridlock) ---
+    /// Ticks until this blocked unit may attempt another (expensive) re-route —
+    /// the original's `PathDelay` throttle (`PathDelay = Rule.PathDelay *
+    /// TICKS_PER_MINUTE`, FOOT.CPP:461; `[AI] PathDelay=.016` min ≈ 14 ticks,
+    /// RULES.CPP:267): path recomputation for one unit runs at most once per
+    /// window, never every tick. Hashed only when non-zero.
+    pub reroute_delay: u16,
+    /// Consecutive failed re-route attempts while blocked — the original's
+    /// `TryTryAgain` budget (`PATH_RETRY=10`, FOOT.H:241): when it is exhausted
+    /// the move order is abandoned (`Assign_Destination(TARGET_NONE)`,
+    /// DRIVE.CPP:988-995) instead of retrying forever. Hashed only when non-zero.
+    pub reroute_fails: u8,
 }
 
 /// `FLIGHT_LEVEL` — full flight altitude in leptons (`ObjectClass` enum,
@@ -518,6 +549,8 @@ impl Unit {
             is_canine: false,
             disguised: false,
             iron_curtain: 0,
+            reroute_delay: 0,
+            reroute_fails: 0,
         }
     }
 
@@ -830,6 +863,16 @@ impl Unit {
         if self.iron_curtain != 0 {
             h.write_u8(0x1C);
             h.write_u16(self.iron_curtain);
+        }
+        // Blocked-move retry state (M7.20). Folded ONLY when armed, so any unit
+        // that never jams (every unobstructed golden) appends no bytes.
+        if self.reroute_delay != 0 {
+            h.write_u8(0x36);
+            h.write_u16(self.reroute_delay);
+        }
+        if self.reroute_fails != 0 {
+            h.write_u8(0x37);
+            h.write_u8(self.reroute_fails);
         }
     }
 }

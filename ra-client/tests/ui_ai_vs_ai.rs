@@ -613,6 +613,272 @@ fn real_expert_vs_legacy_ai_ab_record() {
 }
 
 // ===========================================================================
+// M7.20 P0 — bounded diagnostic harness. Runs an AI-vs-AI game with a HARD
+// WALL-CLOCK GUARD (bails and dumps the time series after `wall_secs` seconds
+// or `max_ticks` ticks, whichever first — a diagnostic must never grind for
+// hours) and prints a per-house time series at fixed tick intervals: credits,
+// unit/building counts, harvester health (moving/stuck), AI rubber-band caps,
+// and the measured sim rate. `#[ignore]`d: run on demand with
+//   cargo test -p ra-client --test ui_ai_vs_ai diag_ -- --ignored --nocapture
+// ===========================================================================
+
+/// Per-house sample row for the diagnostic dump.
+fn diag_house_row(world: &World, house: u8) -> String {
+    let mut vehicles = 0usize;
+    let mut infantry = 0usize;
+    let mut harv = 0usize;
+    let mut harv_stuck = 0usize;
+    for (_, u) in world.units.iter() {
+        if u.house != house || !u.is_alive() {
+            continue;
+        }
+        if u.is_harvester {
+            harv += 1;
+            // "Stuck": has movement intent (a path) but its FSM isn't in a
+            // stationary-by-design state — refined below by the caller's
+            // position-delta check; here we just count paths present.
+            if !u.path.is_empty() {
+                harv_stuck += 1;
+            }
+        } else if u.is_infantry() {
+            infantry += 1;
+        } else {
+            vehicles += 1;
+        }
+    }
+    let buildings = building_count(world, house);
+    let credits = world.house_credits(house);
+    let caps = world
+        .ai()
+        .iter()
+        .find(|a| a.house() == house)
+        .map(|a| a.caps())
+        .unwrap_or((0, 0));
+    format!(
+        "h{house} cr={credits} veh={vehicles} inf={infantry} harv={harv}(pathing {harv_stuck}) bld={buildings} caps={caps:?}"
+    )
+}
+
+/// Drive a game with the hard wall-clock guard, dumping samples every
+/// `sample_every` ticks. Returns the outcome if reached.
+fn diag_drive(
+    mut game: AiVsAiGame,
+    max_ticks: u32,
+    wall_secs: u64,
+    sample_every: u32,
+) -> Option<(u32, Outcome)> {
+    use std::time::Instant;
+    let start = Instant::now();
+    let mut last_sample = Instant::now();
+    // Track per-harvester cell over the interval to count genuinely pinned
+    // harvesters (position unchanged while holding a path / non-mining state).
+    let mut harv_pos: std::collections::HashMap<(u32, u32), (i32, i32)> =
+        std::collections::HashMap::new();
+    for t in 0..max_ticks {
+        game.world.tick(&[]);
+        if t % sample_every == 0 {
+            let dt = last_sample.elapsed().as_secs_f64();
+            let rate = if t == 0 {
+                0.0
+            } else {
+                sample_every as f64 / dt.max(1e-9)
+            };
+            last_sample = Instant::now();
+            // Pinned harvesters: same cell as previous sample AND not
+            // mining/unloading (those sit still legitimately).
+            let mut pinned = 0usize;
+            let mut new_pos = std::collections::HashMap::new();
+            for (h, u) in game.world.units.iter() {
+                if !u.is_harvester || !u.is_alive() {
+                    continue;
+                }
+                let key = (h.index, h.gen);
+                let cell = u.cell();
+                let stationary = harv_pos.get(&key) == Some(&(cell.x, cell.y));
+                let mining = matches!(
+                    u.harvest.status,
+                    ra_sim::unit::HarvStatus::Harvesting | ra_sim::unit::HarvStatus::Unloading
+                );
+                if stationary && !mining {
+                    pinned += 1;
+                }
+                new_pos.insert(key, (cell.x, cell.y));
+            }
+            harv_pos = new_pos;
+            let total_units = game
+                .world
+                .units
+                .iter()
+                .filter(|(_, u)| u.is_alive())
+                .count();
+            let brains: Vec<String> = game
+                .world
+                .ai()
+                .iter()
+                .map(|a| {
+                    format!(
+                        "h{}:fa={} team={:?}",
+                        a.house(),
+                        a.failed_attacks(),
+                        a.team_summary()
+                    )
+                })
+                .collect();
+            eprintln!(
+                "[diag] t={t} rate={rate:.0} t/s units={total_units} pinned_harv={pinned} | {} | {} | {}",
+                diag_house_row(&game.world, game.house_a),
+                diag_house_row(&game.world, game.house_b),
+                brains.join(" "),
+            );
+        }
+        let a_alive = game.world.house_alive(game.house_a);
+        let b_alive = game.world.house_alive(game.house_b);
+        match (a_alive, b_alive) {
+            (true, false) => return Some((t, Outcome::HouseAWins)),
+            (false, true) => return Some((t, Outcome::HouseBWins)),
+            (false, false) => return Some((t, Outcome::BothEliminated)),
+            (true, true) => {}
+        }
+        if start.elapsed().as_secs() >= wall_secs {
+            eprintln!(
+                "[diag] WALL-CLOCK GUARD hit at tick {t} after {}s — bailing",
+                start.elapsed().as_secs()
+            );
+            diag_end_state(&game);
+            return None;
+        }
+    }
+    eprintln!("[diag] tick budget {max_ticks} exhausted");
+    diag_end_state(&game);
+    None
+}
+
+/// End-state dump: per-house building roster and armed-unit disposition
+/// (distance to the enemy base), to see WHY an unresolved game is stuck.
+fn diag_end_state(game: &AiVsAiGame) {
+    let world = &game.world;
+    for house in [game.house_a, game.house_b] {
+        let mut roster: std::collections::BTreeMap<String, usize> = Default::default();
+        for (_, b) in world.buildings.iter() {
+            if b.house == house && b.is_alive() {
+                let name = world
+                    .catalog
+                    .building(b.type_id)
+                    .map(|p| p.name.clone())
+                    .unwrap_or_else(|| format!("#{}", b.type_id));
+                *roster.entry(name).or_insert(0) += 1;
+            }
+        }
+        eprintln!("[diag] h{house} buildings: {roster:?}");
+        // Armed units: how far from the NEAREST enemy building, bucketed.
+        let enemy_cells: Vec<_> = world
+            .buildings
+            .iter()
+            .filter(|(_, b)| b.house != house && b.is_alive())
+            .map(|(_, b)| b.center_cell())
+            .collect();
+        let mut near = 0;
+        let mut mid = 0;
+        let mut far = 0;
+        let mut idle = 0;
+        let mut with_target = 0;
+        for (_, u) in world.units.iter() {
+            if u.house != house || !u.is_alive() || u.weapon.is_none() || u.is_harvester {
+                continue;
+            }
+            if u.target.is_some() {
+                with_target += 1;
+            }
+            if u.target.is_none() && u.path.is_empty() {
+                idle += 1;
+            }
+            let d = enemy_cells
+                .iter()
+                .map(|c| (c.x - u.cell().x).abs().max((c.y - u.cell().y).abs()))
+                .min()
+                .unwrap_or(999);
+            if d <= 8 {
+                near += 1;
+            } else if d <= 25 {
+                mid += 1;
+            } else {
+                far += 1;
+            }
+        }
+        eprintln!(
+            "[diag] h{house} armed units: near(<=8)={near} mid(<=25)={mid} far={far} idle={idle} targeting={with_target}"
+        );
+        // Reachability probe: can each armed unit terrain-path to the nearest
+        // enemy building's adjacent ring? Counts walled-in units.
+        let mut reachable = 0;
+        let mut walled = 0;
+        for (_, u) in world.units.iter() {
+            if u.house != house || !u.is_alive() || u.weapon.is_none() || u.is_harvester {
+                continue;
+            }
+            let target = enemy_cells
+                .iter()
+                .min_by_key(|c| (c.x - u.cell().x).abs().max((c.y - u.cell().y).abs()));
+            let Some(&t) = target else { continue };
+            // Probe the ring around the enemy building centre.
+            let mut ok = false;
+            for (dx, dy) in [(0, 2), (2, 0), (0, -2), (-2, 0)] {
+                let goal = ra_sim::coords::CellCoord::new(t.x + dx, t.y + dy);
+                if ra_sim::path::find_path(world.passability(), u.cell(), goal, u.locomotor)
+                    .is_some()
+                {
+                    ok = true;
+                    break;
+                }
+            }
+            if ok {
+                reachable += 1;
+            } else {
+                walled += 1;
+            }
+        }
+        eprintln!(
+            "[diag] h{house} armed reachability to enemy: reachable={reachable} walled={walled}"
+        );
+    }
+}
+
+fn diag_scenario(scenario: &str, difficulty: Difficulty, wall_secs: u64) {
+    if !support::real_assets_available() {
+        eprintln!("SKIP: real assets not found (diagnostic)");
+        return;
+    }
+    let dir = support::assets_dir();
+    let main_bytes = std::fs::read(dir.join("main.mix")).expect("main.mix");
+    let redalert_bytes = std::fs::read(dir.join("redalert.mix")).expect("redalert.mix");
+    let game = load_ai_vs_ai_from_bytes(
+        &main_bytes,
+        &redalert_bytes,
+        scenario,
+        CREDITS,
+        difficulty,
+        difficulty,
+    )
+    .unwrap_or_else(|e| panic!("diag load failed: {e}"));
+    match diag_drive(game, MAX_TICKS, wall_secs, 1000) {
+        Some((tick, outcome)) => eprintln!("[diag] {scenario} resolved t={tick} {outcome:?}"),
+        None => eprintln!("[diag] {scenario} did NOT resolve within guard"),
+    }
+}
+
+#[test]
+#[ignore = "M7.20 P0 diagnostic — run on demand with --ignored --nocapture"]
+fn diag_scg05ea_normal() {
+    diag_scenario("scg05ea.ini", Difficulty::Normal, 420);
+}
+
+#[test]
+#[ignore = "M7.20 P0 diagnostic — run on demand with --ignored --nocapture"]
+fn diag_scm01ea_hard() {
+    diag_scenario("scm01ea.ini", Difficulty::Hard, 420);
+}
+
+// ===========================================================================
 // Audit addendum (ra-tester, post-M7.9/M7.10): pin the exact difficulty
 // handicap *values* the real `redalert.mix` rules.ini loads into
 // `Catalog::econ.difficulty`, confirming both (a) the numbers match the real

@@ -1,7 +1,11 @@
 //! Grid A* pathfinding over the map's passability grid (DESIGN.md §3.7: "Grid
 //! A* with a proper open list", replacing the original's edge-following bug
-//! algorithm). Movement is 8-directional; diagonal steps may not cut the
-//! corner of an impassable cell.
+//! algorithm). Movement is 8-directional. Diagonal steps follow the original's
+//! destination-cell-only rule for STATIC blockers (terrain/buildings) — a unit
+//! may squeeze between two corner-touching buildings, exactly as
+//! `Can_Enter_Cell` (which ignores its `FacingType` argument, UNIT.CPP:3208)
+//! permitted — but a unit-avoiding re-route may not corner-clip a cell
+//! occupied by another vehicle (our deliberate strictness, QUIRKS Q30).
 //!
 //! **Determinism.** The open list is a binary heap ordered by `f = g + h`
 //! ascending, with ties broken by **lower linear cell index first**
@@ -354,16 +358,30 @@ fn find_path_inner(
             if !passable(next) {
                 continue;
             }
-            // No corner cutting: a diagonal step needs both shared orthogonal
-            // neighbours enterable. Uses the same `passable` predicate as the step
-            // itself, so in unit-avoiding mode a vehicle beside the corner blocks
-            // the diagonal too (preventing a rerouted path from corner-clipping an
-            // occupied cell); in plain pathing this is terrain-only, unchanged.
+            // Diagonal corner rule (M7.20 P1.5, split). The original engine
+            // evaluates only the DESTINATION cell of each step — `Passable_Cell`
+            // calls `Can_Enter_Cell(cell, face)` (FINDPATH.CPP:1281) and every
+            // `Can_Enter_Cell` overload *ignores* its `FacingType` parameter
+            // (e.g. `MoveType UnitClass::Can_Enter_Cell(CELL cell, FacingType )
+            // const`, UNIT.CPP:3208) — so a unit may squeeze diagonally between
+            // two corner-touching STATIC blockers (terrain/buildings). That is
+            // why original walls must be orthogonally continuous to seal a base.
+            // We match that: no static corner check.
+            //
+            // For the **unit-avoidance** predicate (`find_path_avoiding`) we stay
+            // deliberately STRICTER than the original (which had no corner rule
+            // for units either — same ignored-facing evidence): a re-routed
+            // detour must not corner-clip a cell occupied by another vehicle,
+            // protecting the one-vehicle-per-cell invariant and the head-on
+            // tie-break from lepton-interpolated overlap (QUIRKS Q30).
             if dx != 0 && dy != 0 {
-                let side_a = CellCoord::new(cur.x + dx, cur.y);
-                let side_b = CellCoord::new(cur.x, cur.y + dy);
-                if !passable(side_a) || !passable(side_b) {
-                    continue;
+                if let Some((g, self_h)) = occ {
+                    let side_a = CellCoord::new(cur.x + dx, cur.y);
+                    let side_b = CellCoord::new(cur.x, cur.y + dy);
+                    let clips = |c: CellCoord| c != start && g.vehicle_blocked_for(c, self_h);
+                    if clips(side_a) || clips(side_b) {
+                        continue;
+                    }
                 }
             }
             let next_i = grid.linear(next) as usize;
@@ -502,15 +520,19 @@ mod tests {
 
     #[test]
     fn no_corner_cutting() {
-        // Two impassable cells forming a corner the path must not slip through.
+        // M7.20 P1.5 split-rule pin.
+        //
+        // (a) STATIC corner squeeze is ALLOWED: two impassable cells touching
+        // at a corner do not block the diagonal between them — the original's
+        // destination-cell-only step check (`Passable_Cell` →
+        // `Can_Enter_Cell(cell, face)`, FINDPATH.CPP:1281, with the FacingType
+        // ignored by every overload, UNIT.CPP:3208).
         let w = MAP_CELL_W;
         let h = MAP_CELL_H;
         let mut cells = vec![true; (w * h) as usize];
         cells[1] = false; // (1,0)
         cells[w as usize] = false; // (0,1)
         let g = Passability::new(w, h, cells);
-        // Going from (0,0) to (1,1): the direct diagonal is blocked by the
-        // corner, and both orthogonal detours are walled, so it's unreachable.
         assert_eq!(
             find_path(
                 &g,
@@ -518,7 +540,36 @@ mod tests {
                 CellCoord::new(1, 1),
                 Locomotor::Track
             ),
-            None
+            Some(vec![CellCoord::new(1, 1)]),
+            "a diagonal squeeze between corner-touching STATIC blockers must be allowed"
+        );
+
+        // (b) UNIT corner clip is still BLOCKED in unit-avoiding mode: the same
+        // corner formed by two parked vehicles must not be diagonally clipped
+        // by a re-route (our deliberate strictness over the original, QUIRKS
+        // Q30 — the reference had no corner rule for units either).
+        let g_open = Passability::all_passable();
+        let mut grid = UnitGrid::new(MAP_CELL_W, MAP_CELL_H);
+        let blocker_a = Handle { index: 10, gen: 1 };
+        let blocker_b = Handle { index: 11, gen: 1 };
+        let mover = Handle { index: 12, gen: 1 };
+        // Interior corner pair (6,5)/(5,6); mover at (5,5), goal (6,6).
+        grid.claim_vehicle(CellCoord::new(6, 5), blocker_a);
+        grid.claim_vehicle(CellCoord::new(5, 6), blocker_b);
+        let path = find_path_avoiding(
+            &g_open,
+            CellCoord::new(5, 5),
+            CellCoord::new(6, 6),
+            Locomotor::Track,
+            &grid,
+            mover,
+        )
+        .expect("goal itself is unoccupied and reachable around the corner pair");
+        // The route must go AROUND the vehicle corner (length > 1 — not the
+        // direct clip through the touching corner).
+        assert!(
+            path.len() > 1,
+            "unit-avoiding path must not corner-clip between two occupied cells: {path:?}"
         );
     }
 

@@ -1526,6 +1526,13 @@ const B_SAM: u32 = 21;
 // Naval arc P0: naval yard (Allied shipyard) + sub pen (Soviet). ids appended.
 const B_SYRD: u32 = 22;
 const B_SPEN: u32 = 23;
+
+// Marquee arc: kennel (dog prereq) + the three superweapon structures. Ids follow
+// the `bspecs` declaration order (KENN..PDOX appended after SPEN).
+const B_KENN: u32 = 24;
+const B_MSLO: u32 = 25;
+const B_IRON: u32 = 26;
+const B_PDOX: u32 = 27;
 /// Fixed unit-proto ids.
 const U_MCV: u32 = 0;
 const U_HARV: u32 = 1;
@@ -1556,6 +1563,11 @@ const U_SS: u32 = 21; // Soviet submarine (submerged, torpedoes)
 const U_DD: u32 = 22; // Allied destroyer (detector, anti-sub)
 const U_CA: u32 = 23; // Allied cruiser (long-range 8-inch guns, detector)
 
+// Marquee arc: infiltration specialists (uspecs order: SPY..E7 appended after CA).
+const U_SPY: u32 = 24; // Spy (reveal + disguise)
+const U_THF: u32 = 25; // Thief (steals credits)
+const U_E7: u32 = 26; // Tanya (Colt45 + C4 demolition)
+
 /// Map a prerequisite short-name to its building type id (only the starter set
 /// is modelled; unknown prereqs — e.g. `fix` for the MCV — are dropped, which is
 /// safe because those items are not in the sidebar).
@@ -1569,7 +1581,10 @@ fn prereq_ids(names: &[String]) -> Vec<u32> {
             "weap" => Some(B_WEAP),
             "tent" | "barr" => Some(B_TENT),
             "hpad" => Some(B_HPAD),
+            "dome" => Some(B_DOME),
             "atek" => Some(B_ATEK),
+            "stek" => Some(B_STEK),
+            "kenn" => Some(B_KENN),
             "syrd" => Some(B_SYRD),
             "spen" => Some(B_SPEN),
             _ => None,
@@ -1625,7 +1640,7 @@ pub fn load_sound_bank(dir: &Path) -> Vec<(SoundEvent, Vec<u8>)> {
     // (event, source mix, AUD name). Weapon/UI SFX live in sounds.mix; EVA voice
     // lines in speech.mix. Names verified present in the shipped archives; any
     // that are absent (e.g. a mission-failed line) are skipped.
-    let spec: [(SoundEvent, Option<&MixArchive>, &str); 10] = [
+    let spec: [(SoundEvent, Option<&MixArchive>, &str); 14] = [
         (SoundEvent::Fire, sounds.as_ref(), "CANNON1.AUD"),
         (SoundEvent::Explosion, sounds.as_ref(), "KABOOM1.AUD"),
         (SoundEvent::Select, sounds.as_ref(), "RABEEP1.AUD"),
@@ -1643,6 +1658,15 @@ pub fn load_sound_bank(dir: &Path) -> Vec<(SoundEvent, Vec<u8>)> {
         (SoundEvent::Sell, sounds.as_ref(), "CASHTURN.AUD"),
         (SoundEvent::StructureSold, speech.as_ref(), "STRUSLD1.AUD"),
         (SoundEvent::Repair, sounds.as_ref(), "RAMENU1.AUD"),
+        // Superweapon feedback (marquee arc P2). Nuke launch EVA "Nuclear weapon
+        // launched" (`VOX_ABOMB_LAUNCH` = ALAUNCH1, house.cpp special-blast); the
+        // heavy impact boom; the iron-curtain device SFX (`VOC_IRON1` = IRONCUR9,
+        // house.cpp:2950); the chronosphere teleport SFX (`VOC_CHRONO` = CHRONO2,
+        // house.cpp:3053).
+        (SoundEvent::NukeLaunch, speech.as_ref(), "ALAUNCH1.AUD"),
+        (SoundEvent::NukeImpact, sounds.as_ref(), "KABOOM25.AUD"),
+        (SoundEvent::IronCurtain, sounds.as_ref(), "IRONCUR9.AUD"),
+        (SoundEvent::Chronosphere, sounds.as_ref(), "CHRONO2.AUD"),
     ];
     let mut out = Vec::new();
     for (ev, mix, name) in spec {
@@ -2003,6 +2027,17 @@ pub fn build_content(
         BuildItem::Building(B_SBAG),
         BuildItem::Building(B_CYCL),
         BuildItem::Building(B_BRIK),
+        // Marquee arc: kennel (dog prereq) + superweapon structures (structures
+        // column, appended below the fold — same discipline as the naval/aircraft
+        // cameos, QUIRKS Q24.1/Q25. No pinned `compose_game` frame contains these
+        // buildings, so no golden moves; real-asset cameos load from
+        // KENN/MSLO/IRON/PDOX-ICON.SHP in hires.mix, degrading to text if absent).
+        // Prereqs (KENN→barr, MSLO/IRON→stek, PDOX→atek) are enforced by
+        // `describe_buildable`/`apply_start_production` from rules.ini.
+        BuildItem::Building(B_KENN),
+        BuildItem::Building(B_MSLO),
+        BuildItem::Building(B_IRON),
+        BuildItem::Building(B_PDOX),
         BuildItem::Unit(U_1TNK),
         BuildItem::Unit(U_2TNK),
         BuildItem::Unit(U_3TNK),
@@ -2033,6 +2068,13 @@ pub fn build_content(
         BuildItem::Unit(U_DOG),
         BuildItem::Unit(U_MEDI),
         BuildItem::Unit(U_E6),
+        // Marquee arc: infiltration specialists (units column, below the fold).
+        // Barracks-produced (all Foot infantry); gated by rules.ini prereqs
+        // (SPY→dome, THF/E7→atek), enforced by `describe_buildable`. Cameos load
+        // from SPY/THF/E7-ICON.SHP in hires.mix (all present), degrading to text.
+        BuildItem::Unit(U_SPY),
+        BuildItem::Unit(U_THF),
+        BuildItem::Unit(U_E7),
         // Aircraft + AA are now surfaced in both strips above (P0 aircraft arc):
         // HPAD/AGUN/SAM in structures, HELI/HIND in units. Cameos load from
         // <NAME>ICON.SHP in hires.mix (HPADICON/AGUNICON/SAMICON/HELIICON/

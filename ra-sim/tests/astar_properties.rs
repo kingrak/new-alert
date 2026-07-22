@@ -49,9 +49,12 @@ fn grid_and_endpoints() -> impl Strategy<Value = (Passability, CellCoord, CellCo
 }
 
 /// Independent reachability oracle: BFS (unweighted, so no claim about
-/// *shortest*, only *reachable*) using the same 8-direction-plus-no-corner-
-/// cutting adjacency rule `find_path` documents, but written from scratch
-/// against `Passability::is_passable` rather than calling into `path.rs`, so
+/// *shortest*, only *reachable*) using the same 8-direction,
+/// destination-cell-only adjacency rule `find_path` documents (M7.20 P1.5:
+/// diagonal squeeze between corner-touching static blockers is allowed,
+/// matching the original's `Can_Enter_Cell`-ignores-facing rule,
+/// UNIT.CPP:3208), but written from scratch against
+/// `Passability::is_passable` rather than calling into `path.rs`, so
 /// agreement with `find_path`'s `Some`/`None` is a real cross-check of
 /// completeness (does A* find a path whenever one exists?), not a tautology.
 fn bfs_reachable(grid: &Passability, start: CellCoord, goal: CellCoord) -> bool {
@@ -76,13 +79,8 @@ fn bfs_reachable(grid: &Passability, start: CellCoord, goal: CellCoord) -> bool 
             if !grid.is_passable(next) {
                 continue;
             }
-            if dx != 0 && dy != 0 {
-                let side_a = CellCoord::new(cur.x + dx, cur.y);
-                let side_b = CellCoord::new(cur.x, cur.y + dy);
-                if !grid.is_passable(side_a) || !grid.is_passable(side_b) {
-                    continue;
-                }
-            }
+            // No corner filter: plain (non-unit-avoiding) pathing is
+            // destination-cell-only, per the original (M7.20 P1.5).
             if next == goal {
                 return true;
             }
@@ -98,9 +96,12 @@ proptest! {
     #![proptest_config(ProptestConfig::with_cases(512))]
 
     /// Every path `find_path` returns is internally valid: each step
-    /// (including start -> first waypoint) is a single king-move, no
-    /// diagonal step cuts a corner, every stepped-through cell is passable,
-    /// and the path ends exactly at `goal`.
+    /// (including start -> first waypoint) is a single king-move, every
+    /// stepped-on cell is passable, and the path ends exactly at `goal`.
+    /// (M7.20 P1.5: diagonal steps are destination-cell-only for static
+    /// blockers — corner squeeze allowed — so no corner assertion here; the
+    /// unit-avoiding corner strictness is pinned in `path::tests::
+    /// no_corner_cutting`.)
     #[test]
     fn returned_path_is_valid((grid, start, goal) in grid_and_endpoints()) {
         if let Some(path) = find_path(&grid, start, goal, Locomotor::Track) {
@@ -124,14 +125,6 @@ proptest! {
                         "non-adjacent step {prev:?} -> {step:?}"
                     );
                     prop_assert!(grid.is_passable(step), "path steps onto impassable {step:?}");
-                    if dx != 0 && dy != 0 {
-                        let side_a = CellCoord::new(prev.x + dx, prev.y);
-                        let side_b = CellCoord::new(prev.x, prev.y + dy);
-                        prop_assert!(
-                            grid.is_passable(side_a) && grid.is_passable(side_b),
-                            "path cuts a corner at {prev:?} -> {step:?}"
-                        );
-                    }
                     prev = step;
                 }
             }
