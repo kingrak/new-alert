@@ -23,13 +23,23 @@ of Command & Conquer: Red Alert (1996). Repo root: `/home/cshi/dev/game/new-aler
      `BTreeMap`, or explicitly sorted keys. Systems run in one fixed, explicit
      order per tick.
    - All sim mutation flows through `apply(world, tick, &[Command])`.
-3. **Fidelity via the reference source.** The original engine is at
-   `/home/cshi/dev/game/references/vanilla-conquer/redalert/` (shared code in
-   `../common/`). When implementing game behavior (movement rates, damage math,
-   scan ranges, state machines), find and follow the original logic; put the
-   reference as a comment only when the constant or algorithm would otherwise
-   look arbitrary, e.g. `// per original FINDPATH.CPP Follow_Edge`. Game *stats*
-   come from rules.ini via `ra-data`, never hardcoded.
+3. **Fidelity via the reference source.** The original engine (EA's GPL v3
+   release) is checked out READ-ONLY at
+   `/home/cshi/dev/game/reference/CnC_Remastered_Collection/REDALERT/`
+   (uppercase filenames: HOUSE.CPP, FINDPATH.CPP, FOOT.CPP, DRIVE.CPP,
+   SIDEBAR.CPP, FACTORY.CPP, QUEUE.CPP, RULES.CPP, …). Doctrine:
+   - For any **large/complex mechanism or player-visible behavior decision**
+     (movement, damage math, AI policy, UI click semantics, timing constants,
+     state machines), you MUST grep and read the actual original code first —
+     never cite from memory, never guess behavior the source can settle.
+   - Citations are `FILE.CPP:line`, **verified against this checkout** (audits
+     re-check them byte-for-byte; drifted line numbers are audit findings).
+   - Port logic with cited comments; never paste GPL code verbatim beyond
+     short cited snippets in comments. Never edit the reference dir, never
+     commit anything from it.
+   - Divergences from what the source actually does go in `docs/QUIRKS.md`
+     quoting the original lines.
+   Game *stats* come from rules.ini via `ra-data`, never hardcoded.
 4. **Assets** (gitignored) are at `../assets/` relative to nothing — absolute
    path `/home/cshi/dev/game/new-alert/assets/`: `main.mix`, `redalert.mix`
    (both use encrypted MIX headers — Blowfish key unlocked via the Westwood

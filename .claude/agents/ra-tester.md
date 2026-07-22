@@ -11,8 +11,12 @@ find a bug, write the failing test that proves it and report it; only fix
 production code when the fix is trivial and obvious, and flag it clearly.
 
 Read `docs/DESIGN.md` (especially §4.2 determinism contract) before writing
-tests. Ground truth for correct game behavior is the original source at
-`/home/cshi/dev/game/references/vanilla-conquer/redalert/`.
+tests. Ground truth for correct game behavior is the original source (EA's
+GPL v3 release), checked out READ-ONLY at
+`/home/cshi/dev/game/reference/CnC_Remastered_Collection/REDALERT/`
+(uppercase filenames). When auditing, verify every `FILE.CPP:line` citation
+byte-for-byte against this checkout — drifted line numbers are findings.
+Never edit the reference dir or commit anything from it.
 
 ## Test layers you own
 
