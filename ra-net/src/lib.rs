@@ -55,6 +55,7 @@ pub mod lobby;
 pub mod local;
 pub mod pair;
 pub mod platform;
+pub mod replay;
 pub mod scheduler;
 pub mod transport;
 pub mod wire;
@@ -66,6 +67,10 @@ pub use lobby::{
 };
 pub use local::LocalTransport;
 pub use pair::{JitterConfig, PairTransport};
+pub use replay::{
+    encode_end, encode_hash, encode_header, encode_tick, EndReason, ReplayHeader, ReplayReader,
+    ReplayRecord, ReplaySeat, ReplayTransport, HASH_INTERVAL, REPLAY_VERSION,
+};
 pub use scheduler::{InputScheduler, DEFAULT_INPUT_DELAY};
 pub use transport::{
     CommandTransport, ConnectionLost, DesyncDetected, LostReason, PollResult, SeatId, Tick,

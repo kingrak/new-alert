@@ -307,26 +307,30 @@ impl std::error::Error for WireError {}
 // Byte-level writer / reader
 // ---------------------------------------------------------------------------
 
-struct Writer(Vec<u8>);
+// `pub(crate)` so the replay stream format ([`crate::replay`]) reuses the exact
+// same byte-level writer/reader and command codec — the "replay reader reuses
+// wire decode" contract of SERVER-DESIGN.md §8. Nothing here is part of the
+// crate's public API.
+pub(crate) struct Writer(pub(crate) Vec<u8>);
 
 impl Writer {
-    fn u8(&mut self, v: u8) {
+    pub(crate) fn u8(&mut self, v: u8) {
         self.0.push(v);
     }
-    fn u16(&mut self, v: u16) {
+    pub(crate) fn u16(&mut self, v: u16) {
         self.0.extend_from_slice(&v.to_le_bytes());
     }
-    fn u32(&mut self, v: u32) {
+    pub(crate) fn u32(&mut self, v: u32) {
         self.0.extend_from_slice(&v.to_le_bytes());
     }
-    fn u64(&mut self, v: u64) {
+    pub(crate) fn u64(&mut self, v: u64) {
         self.0.extend_from_slice(&v.to_le_bytes());
     }
-    fn i32(&mut self, v: i32) {
+    pub(crate) fn i32(&mut self, v: i32) {
         self.0.extend_from_slice(&v.to_le_bytes());
     }
     /// `u8` length prefix + bytes, truncated to `cap` (encode never fails).
-    fn str8(&mut self, s: &str, cap: usize) {
+    pub(crate) fn str8(&mut self, s: &str, cap: usize) {
         let bytes = s.as_bytes();
         let n = bytes.len().min(cap).min(255);
         // Truncate on a char boundary so decode's UTF-8 check can't fail.
@@ -339,13 +343,13 @@ impl Writer {
     }
 }
 
-struct Reader<'a> {
-    buf: &'a [u8],
-    pos: usize,
+pub(crate) struct Reader<'a> {
+    pub(crate) buf: &'a [u8],
+    pub(crate) pos: usize,
 }
 
 impl<'a> Reader<'a> {
-    fn take(&mut self, n: usize) -> Result<&'a [u8], WireError> {
+    pub(crate) fn take(&mut self, n: usize) -> Result<&'a [u8], WireError> {
         let end = self.pos.checked_add(n).ok_or(WireError::Truncated)?;
         if end > self.buf.len() {
             return Err(WireError::Truncated);
@@ -354,22 +358,22 @@ impl<'a> Reader<'a> {
         self.pos = end;
         Ok(s)
     }
-    fn u8(&mut self) -> Result<u8, WireError> {
+    pub(crate) fn u8(&mut self) -> Result<u8, WireError> {
         Ok(self.take(1)?[0])
     }
-    fn u16(&mut self) -> Result<u16, WireError> {
+    pub(crate) fn u16(&mut self) -> Result<u16, WireError> {
         Ok(u16::from_le_bytes(self.take(2)?.try_into().unwrap()))
     }
-    fn u32(&mut self) -> Result<u32, WireError> {
+    pub(crate) fn u32(&mut self) -> Result<u32, WireError> {
         Ok(u32::from_le_bytes(self.take(4)?.try_into().unwrap()))
     }
-    fn u64(&mut self) -> Result<u64, WireError> {
+    pub(crate) fn u64(&mut self) -> Result<u64, WireError> {
         Ok(u64::from_le_bytes(self.take(8)?.try_into().unwrap()))
     }
-    fn i32(&mut self) -> Result<i32, WireError> {
+    pub(crate) fn i32(&mut self) -> Result<i32, WireError> {
         Ok(i32::from_le_bytes(self.take(4)?.try_into().unwrap()))
     }
-    fn str8(&mut self, cap: usize) -> Result<String, WireError> {
+    pub(crate) fn str8(&mut self, cap: usize) -> Result<String, WireError> {
         let n = self.u8()? as usize;
         if n > cap {
             return Err(WireError::BadValue("string length over cap"));
@@ -377,7 +381,7 @@ impl<'a> Reader<'a> {
         let bytes = self.take(n)?;
         String::from_utf8(bytes.to_vec()).map_err(|_| WireError::BadValue("string not UTF-8"))
     }
-    fn done(&self) -> Result<(), WireError> {
+    pub(crate) fn done(&self) -> Result<(), WireError> {
         if self.pos == self.buf.len() {
             Ok(())
         } else {
@@ -509,7 +513,7 @@ fn get_super_kind(r: &mut Reader) -> Result<SuperKind, WireError> {
     })
 }
 
-fn put_command(w: &mut Writer, c: &Command) {
+pub(crate) fn put_command(w: &mut Writer, c: &Command) {
     match *c {
         Command::Move { unit, dest, house } => {
             w.u8(C_MOVE);
@@ -608,7 +612,7 @@ fn put_command(w: &mut Writer, c: &Command) {
     }
 }
 
-fn get_command(r: &mut Reader) -> Result<Command, WireError> {
+pub(crate) fn get_command(r: &mut Reader) -> Result<Command, WireError> {
     Ok(match r.u8()? {
         C_MOVE => Command::Move {
             unit: get_handle(r)?,

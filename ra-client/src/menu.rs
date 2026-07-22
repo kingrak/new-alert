@@ -349,6 +349,10 @@ pub struct App {
     /// Message shown on the [`AppState::NetEnded`] screen.
     net_end_message: String,
     core: Option<AppCore>,
+    /// Directory for always-on replay recording (M7.23 P1), or `None` to not
+    /// record. The real windowed shell points this at `<assets>/../replays`; the
+    /// menu test suites leave it `None` so they never touch the disk.
+    replay_dir: Option<std::path::PathBuf>,
     viewport_w: u32,
     viewport_h: u32,
     mouse_x: i32,
@@ -391,6 +395,7 @@ impl App {
             in_lan_game: false,
             net_end_message: String::new(),
             core: None,
+            replay_dir: None,
             viewport_w: 1024,
             viewport_h: 768,
             mouse_x: -1,
@@ -566,6 +571,61 @@ impl App {
         })
     }
 
+    /// Enable always-on replay recording (M7.23 P1): every interactive game
+    /// started thereafter appends its stream to
+    /// `<dir>/<scenario>-<timestamp>.rarp`. The windowed shell calls this with
+    /// the replays directory beside the assets dir; leaving it unset (the test
+    /// default) records nothing.
+    pub fn enable_recording(&mut self, dir: std::path::PathBuf) {
+        self.replay_dir = Some(dir);
+    }
+
+    /// Install a recorder on a freshly-built game core if recording is enabled.
+    /// A recording-setup failure never blocks the game — the recorder degrades
+    /// to disabled internally (see [`crate::replay::ReplayRecorder`]).
+    fn maybe_install_recorder(
+        &self,
+        core: &mut AppCore,
+        scenario: &str,
+        difficulty_u8: u8,
+        credits: i32,
+        seats: Vec<ra_net::ReplaySeat>,
+    ) {
+        let Some(dir) = self.replay_dir.as_ref() else {
+            return;
+        };
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let w = core.world();
+        // A filesystem-safe stem: drop any ".ini", keep the scenario key.
+        let stem = scenario.strip_suffix(".ini").unwrap_or(scenario);
+        let header = ra_net::ReplayHeader {
+            replay_version: ra_net::REPLAY_VERSION,
+            game_version: ra_net::wire::GAME_VERSION,
+            protocol_version: ra_net::wire::PROTOCOL_VERSION,
+            scenario: scenario.to_string(),
+            seed: w.rng_seed(),
+            difficulty: difficulty_u8,
+            credits,
+            catalog_hash: w.catalog().content_hash(),
+            start_millis: now,
+            seats,
+        };
+        let path = dir.join(format!("{stem}-{now}.rarp"));
+        core.install_recorder(crate::replay::ReplayRecorder::create(path, &header));
+    }
+
+    /// Map a [`Difficulty`] to the replay header's `u8` code.
+    fn difficulty_code(d: Difficulty) -> u8 {
+        match d {
+            Difficulty::Easy => 0,
+            Difficulty::Normal => 1,
+            Difficulty::Hard => 2,
+        }
+    }
+
     /// Build and enter a game from the current selections. Public so a scripted
     /// drive can start a game after setting the config directly.
     pub fn start_game(&mut self) {
@@ -583,6 +643,17 @@ impl App {
                 core.set_camera(
                     (start.x * crate::appcore::CELL_PIXELS) as f32 - tw as f32 / 2.0,
                     (start.y * crate::appcore::CELL_PIXELS) as f32 - self.viewport_h as f32 / 2.0,
+                );
+                self.maybe_install_recorder(
+                    &mut core,
+                    &res.map_filename,
+                    Self::difficulty_code(res.difficulty),
+                    res.credits,
+                    vec![ra_net::ReplaySeat {
+                        seat: res.player_house,
+                        house: res.player_house,
+                        color: res.color_house,
+                    }],
                 );
                 self.core = Some(core);
                 self.last_error = None;
@@ -787,6 +858,27 @@ impl App {
                 core.set_camera(
                     (start.x * crate::appcore::CELL_PIXELS) as f32 - tw as f32 / 2.0,
                     (start.y * crate::appcore::CELL_PIXELS) as f32 - self.viewport_h as f32 / 2.0,
+                );
+                // Record on both peers (M7.23 P1). Difficulty is irrelevant
+                // between two humans (code 1 = neutral); both seats are named so
+                // a viewer paints the right colours.
+                self.maybe_install_recorder(
+                    &mut core,
+                    &spec.map_filename,
+                    1,
+                    spec.credits,
+                    vec![
+                        ra_net::ReplaySeat {
+                            seat: spec.local_house,
+                            house: spec.local_house,
+                            color: spec.local_house,
+                        },
+                        ra_net::ReplaySeat {
+                            seat: spec.remote_house,
+                            house: spec.remote_house,
+                            color: spec.remote_house,
+                        },
+                    ],
                 );
                 self.core = Some(core);
                 self.in_lan_game = true;

@@ -23,6 +23,7 @@ pub mod input;
 pub mod menu;
 pub mod platform;
 pub mod png;
+pub mod replay;
 pub mod terrain;
 pub mod unit_render;
 

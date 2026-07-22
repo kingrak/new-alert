@@ -72,6 +72,8 @@ fn run(args: &[String]) -> Result<(), BoxErr> {
         "battle" => cmd_battle(args),
         "econ" => cmd_econ(args),
         "skirmish" => cmd_skirmish(args),
+        "replay-verify" => cmd_replay_verify(args),
+        "replay-dump" => cmd_replay_dump(args),
         "verify-m76" => cmd_verify_m76(args),
         "verify-m77" => cmd_verify_m77(args),
         "verify-m77b" => cmd_verify_m77b(args),
@@ -80,7 +82,7 @@ fn run(args: &[String]) -> Result<(), BoxErr> {
         "verify-terrain" => cmd_verify_terrain(args),
         _ => {
             eprintln!(
-                "usage:\n  ra-client dump     [--assets DIR] [--scenario NAME] [--out PATH.png] [--rect CX CY CW CH] [--playable]\n  ra-client window   [--assets DIR] [--scenario NAME] [--smoke-seconds N]\n  ra-client sim      [--assets DIR] [--scenario NAME] [--out-dir DIR]\n  ra-client battle   [--assets DIR] [--scenario NAME] [--out-dir DIR]\n  ra-client econ     [--assets DIR] [--scenario NAME] [--out-dir DIR] [--credits N]\n  ra-client skirmish [--assets DIR] [--scenario NAME] [--out-dir DIR] [--credits N] [--difficulty easy|normal|hard] [--ticks N]"
+                "usage:\n  ra-client dump     [--assets DIR] [--scenario NAME] [--out PATH.png] [--rect CX CY CW CH] [--playable]\n  ra-client window   [--assets DIR] [--scenario NAME] [--smoke-seconds N] [--replay FILE.rarp]\n  ra-client sim      [--assets DIR] [--scenario NAME] [--out-dir DIR]\n  ra-client battle   [--assets DIR] [--scenario NAME] [--out-dir DIR]\n  ra-client econ     [--assets DIR] [--scenario NAME] [--out-dir DIR] [--credits N]\n  ra-client skirmish [--assets DIR] [--scenario NAME] [--out-dir DIR] [--credits N] [--difficulty easy|normal|hard] [--ticks N] [--record FILE.rarp]\n  ra-client replay-verify <FILE.rarp> [--assets DIR]\n  ra-client replay-dump   <FILE.rarp> [--at-tick N] [--assets DIR]"
             );
             Err("unknown or missing subcommand".into())
         }
@@ -202,10 +204,26 @@ fn cmd_window(mut args: Vec<String>) -> Result<(), BoxErr> {
         .map_err(|_| "--smoke-seconds needs a number")?;
     // Audio off flag (M7): `--mute` boots with an empty sound bank.
     let muted = has_flag(&mut args, "--mute");
+    let replay_flag = take_flag(&mut args, "--replay");
     let assets_flag = take_flag(&mut args, "--assets");
     let dir = platform::resolve_assets_dir(assets_flag.as_deref())
         .ok_or("could not find an assets directory (try --assets DIR or RA_ASSETS_DIR)")?;
     eprintln!("assets: {}", dir.display());
+
+    // M7.23 P3: watchable playback. `--replay FILE` reconstructs the world and
+    // drives it from a ReplayTransport (recorded bundles on schedule); live
+    // input is ignored except the window's quit key.
+    if let Some(replay_path) = replay_flag {
+        let core = build_replay_playback(&replay_path, assets_flag.as_deref())?;
+        let sounds = if muted {
+            Vec::new()
+        } else {
+            assets::load_sound_bank(&dir)
+        };
+        eprintln!("playing replay: {replay_path}");
+        ra_client::shell::run_window(core, smoke, sounds);
+        return Ok(());
+    }
 
     // M7.8: boot the main-menu state machine. `load_menu` scans the archive's
     // multiplayer maps + the user maps folder and returns a factory.
@@ -220,7 +238,10 @@ fn cmd_window(mut args: Vec<String>) -> Result<(), BoxErr> {
         .or_else(|| std::env::var("USER").ok())
         .unwrap_or_else(|| "COMMANDER".to_string());
 
-    let app = ra_client::menu::App::new(maps, Box::new(factory));
+    let mut app = ra_client::menu::App::new(maps, Box::new(factory));
+    // M7.23 P1: always-on recording for every interactive game started from the
+    // windowed client. Replays land in a `replays/` dir beside the assets dir.
+    app.enable_recording(replays_dir(&dir));
     // Enable the single-player Allied campaign (scg*ea.ini) if the archives are
     // readable — the factory scans/builds missions on demand — and the LAN
     // multiplayer flow (M8-B), which needs its own archive-backed factory.
@@ -256,6 +277,33 @@ fn cmd_window(_args: Vec<String>) -> Result<(), BoxErr> {
         "this build was compiled without the `window` feature; rebuild with default features"
             .into(),
     )
+}
+
+/// The replays directory beside the assets dir (`<assets>/../replays`), created
+/// lazily by the recorder. Falls back to `<assets>/replays` if the assets dir
+/// has no parent.
+#[cfg(feature = "window")]
+fn replays_dir(assets: &std::path::Path) -> std::path::PathBuf {
+    match assets.parent() {
+        Some(p) => p.join("replays"),
+        None => assets.join("replays"),
+    }
+}
+
+/// Reconstruct a playable core from a replay file and install a
+/// [`ra_net::ReplayTransport`] so the windowed shell replays it (M7.23 P3).
+#[cfg(feature = "window")]
+fn build_replay_playback(path: &str, assets_flag: Option<&str>) -> Result<AppCore, BoxErr> {
+    let bytes = std::fs::read(path).map_err(|e| format!("reading {path}: {e}"))?;
+    let (header, reader) =
+        ra_net::ReplayReader::open(&bytes).map_err(|e| format!("{path}: {e}"))?;
+    let transport = ra_net::ReplayTransport::from_reader(&header, reader)
+        .map_err(|e| format!("{path}: {e}"))?;
+    let game = reload_for_replay(&header, assets_flag)?;
+    let mut core = game.core;
+    // Win/lose read follows the single-player convention during playback.
+    core.install_replay(transport, None);
+    Ok(core)
 }
 
 /// Load a fully playable scenario (terrain + units) from the resolved assets.
@@ -1082,6 +1130,7 @@ fn cmd_skirmish(mut args: Vec<String>) -> Result<(), BoxErr> {
         Some("hard") => ra_sim::Difficulty::Hard,
         _ => ra_sim::Difficulty::Normal,
     };
+    let record_path = take_flag(&mut args, "--record");
     let assets_flag = take_flag(&mut args, "--assets");
     let scenario = take_flag(&mut args, "--scenario").unwrap_or_else(|| "scm01ea.ini".to_string());
     let dir = platform::resolve_assets_dir(assets_flag.as_deref())
@@ -1103,8 +1152,21 @@ fn cmd_skirmish(mut args: Vec<String>) -> Result<(), BoxErr> {
         g1.ai_start.y
     );
 
-    let (report, hashes1) = drive_skirmish(g1, &out_dir, true, ticks)?;
-    let (_r2, hashes2) = drive_skirmish(g2, &out_dir, false, ticks)?;
+    // M7.23 P1: optional always-on recording of the first (PNG-writing) game.
+    let recorder = record_path.as_deref().map(|p| {
+        let header = replay_header_for(
+            &g1,
+            &scenario,
+            credits,
+            difficulty_to_u8(difficulty),
+            now_millis(),
+        );
+        eprintln!("recording replay -> {p}");
+        ra_client::replay::ReplayRecorder::create(std::path::PathBuf::from(p), &header)
+    });
+
+    let (report, hashes1) = drive_skirmish(g1, &out_dir, true, ticks, recorder)?;
+    let (_r2, hashes2) = drive_skirmish(g2, &out_dir, false, ticks, None)?;
     eprintln!("--- skirmish ---\n{report}");
 
     if hashes1 == hashes2 {
@@ -1122,6 +1184,319 @@ fn cmd_skirmish(mut args: Vec<String>) -> Result<(), BoxErr> {
             .unwrap_or(hashes1.len());
         Err(format!("determinism FAILED: skirmish hash chains diverge at tick {first}").into())
     }
+}
+
+// ===========================================================================
+// M7.23: replay recording helpers + post-mortem CLI (replay-verify / -dump).
+// ===========================================================================
+
+/// Unix-epoch milliseconds (shell layer only — the sim/net core never reads a
+/// clock, §4.2). `0` if the clock is before the epoch (never, in practice).
+fn now_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Difficulty → the header's `u8` code (Easy=0, Normal=1, Hard=2).
+fn difficulty_to_u8(d: ra_sim::Difficulty) -> u8 {
+    match d {
+        ra_sim::Difficulty::Easy => 0,
+        ra_sim::Difficulty::Normal => 1,
+        ra_sim::Difficulty::Hard => 2,
+    }
+}
+
+/// The header `u8` code → Difficulty (inverse of [`difficulty_to_u8`]).
+fn difficulty_from_u8(d: u8) -> ra_sim::Difficulty {
+    match d {
+        0 => ra_sim::Difficulty::Easy,
+        2 => ra_sim::Difficulty::Hard,
+        _ => ra_sim::Difficulty::Normal,
+    }
+}
+
+/// Build a replay header for a loaded skirmish: versions + scenario + seed +
+/// settings + catalog content-hash (asset-drift flag) + the caller's timestamp.
+fn replay_header_for(
+    game: &assets::SkirmishGame,
+    scenario: &str,
+    credits: i32,
+    difficulty: u8,
+    start_millis: u64,
+) -> ra_net::ReplayHeader {
+    let w = game.core.world();
+    ra_net::ReplayHeader {
+        replay_version: ra_net::REPLAY_VERSION,
+        game_version: ra_net::wire::GAME_VERSION,
+        protocol_version: ra_net::wire::PROTOCOL_VERSION,
+        scenario: scenario.to_string(),
+        seed: w.rng_seed(),
+        difficulty,
+        credits,
+        catalog_hash: w.catalog().content_hash(),
+        start_millis,
+        seats: vec![
+            ra_net::ReplaySeat {
+                seat: game.player_house,
+                house: game.player_house,
+                color: game.player_house,
+            },
+            ra_net::ReplaySeat {
+                seat: game.ai_house,
+                house: game.ai_house,
+                color: game.ai_house,
+            },
+        ],
+    }
+}
+
+/// Read a replay file, parse the header, and collect its records — the shared
+/// front end for `replay-verify` and `replay-dump`.
+fn load_replay(path: &str) -> Result<(ra_net::ReplayHeader, Vec<ra_net::ReplayRecord>), BoxErr> {
+    let bytes = std::fs::read(path).map_err(|e| format!("reading {path}: {e}"))?;
+    let (header, reader) =
+        ra_net::ReplayReader::open(&bytes).map_err(|e| format!("{path}: {e}"))?;
+    let records = reader
+        .collect_records()
+        .map_err(|e| format!("{path}: {e}"))?;
+    Ok((header, records))
+}
+
+/// Rebuild the initial skirmish world a replay was recorded against, from its
+/// header (scenario + credits + difficulty; the loader's seed is deterministic).
+/// Warns on catalog/seed drift but proceeds — the hash chain is the real check.
+fn reload_for_replay(
+    header: &ra_net::ReplayHeader,
+    assets_flag: Option<&str>,
+) -> Result<assets::SkirmishGame, BoxErr> {
+    let dir = platform::resolve_assets_dir(assets_flag)
+        .ok_or("could not find an assets directory (try --assets DIR or RA_ASSETS_DIR)")?;
+    let game = assets::load_skirmish_from_dir(
+        &dir,
+        &header.scenario,
+        header.credits,
+        difficulty_from_u8(header.difficulty),
+    )?;
+    let w = game.core.world();
+    if w.rng_seed() != header.seed {
+        eprintln!(
+            "warning: reloaded seed {:#010x} != recorded {:#010x} (replay may diverge)",
+            w.rng_seed(),
+            header.seed
+        );
+    }
+    if w.catalog().content_hash() != header.catalog_hash {
+        eprintln!(
+            "warning: catalog content-hash differs from the recording — assets may have drifted"
+        );
+    }
+    Ok(game)
+}
+
+/// `replay-verify <file>`: re-simulate the recorded game and check every hash
+/// record. Prints PASS, or FAIL with the first divergent tick.
+fn cmd_replay_verify(mut args: Vec<String>) -> Result<(), BoxErr> {
+    let assets_flag = take_flag(&mut args, "--assets");
+    let path = args
+        .iter()
+        .find(|a| !a.starts_with("--"))
+        .cloned()
+        .ok_or("usage: ra-client replay-verify <file.rarp> [--assets DIR]")?;
+
+    let (header, records) = load_replay(&path)?;
+    eprintln!(
+        "replay: scenario={} seed={:#010x} difficulty={} credits={} seats={}",
+        header.scenario,
+        header.seed,
+        header.difficulty,
+        header.credits,
+        header.seats.len()
+    );
+
+    // Index the stream: non-empty tick bundles + the hash chain + the end tick.
+    let mut bundles: std::collections::BTreeMap<u32, ra_net::TickBundle> =
+        std::collections::BTreeMap::new();
+    let mut hash_records: std::collections::BTreeMap<u32, u64> = std::collections::BTreeMap::new();
+    let mut final_tick = 0u32;
+    let mut end_reason = None;
+    for rec in &records {
+        match rec {
+            ra_net::ReplayRecord::Tick { tick, bundle } => {
+                final_tick = final_tick.max(*tick);
+                bundles.insert(*tick, bundle.clone());
+            }
+            ra_net::ReplayRecord::Hash { tick, hash } => {
+                final_tick = final_tick.max(*tick);
+                hash_records.insert(*tick, *hash);
+            }
+            ra_net::ReplayRecord::End {
+                reason,
+                final_tick: ft,
+            } => {
+                final_tick = final_tick.max(*ft);
+                end_reason = Some(*reason);
+            }
+        }
+    }
+    if hash_records.is_empty() {
+        return Err("replay has no hash records — nothing to verify (corrupt or empty)".into());
+    }
+
+    let mut game = reload_for_replay(&header, assets_flag.as_deref())?;
+
+    // Re-simulate tick by tick, feeding the recorded bundles (empty otherwise),
+    // and check each hash record as we pass its tick.
+    let mut checked = 0usize;
+    for t in 0..=final_tick {
+        let cmds = match bundles.get(&t) {
+            Some(b) => b.flatten(),
+            None => Vec::new(),
+        };
+        let hash = game.core.world_mut().tick(&cmds);
+        if let Some(&expected) = hash_records.get(&t) {
+            if hash != expected {
+                println!(
+                    "FAIL: replay diverged at tick {t}: recorded {expected:#018x}, re-sim {hash:#018x} \
+                     (checked {checked} earlier hash records OK)"
+                );
+                return Err(format!("replay verification failed at tick {t}").into());
+            }
+            checked += 1;
+        }
+    }
+
+    println!(
+        "PASS: {checked} hash record(s) matched over {final_tick} ticks; end={:?}",
+        end_reason.unwrap_or(ra_net::EndReason::Quit)
+    );
+    Ok(())
+}
+
+/// `replay-dump <file> [--at-tick N]`: re-simulate to N (default: end) and print
+/// a structured world report — the tool that answers "why didn't the game end".
+fn cmd_replay_dump(mut args: Vec<String>) -> Result<(), BoxErr> {
+    let assets_flag = take_flag(&mut args, "--assets");
+    let at_tick = take_flag(&mut args, "--at-tick")
+        .map(|s| s.parse::<u32>())
+        .transpose()
+        .map_err(|_| "--at-tick needs an integer")?;
+    let path = args
+        .iter()
+        .find(|a| !a.starts_with("--"))
+        .cloned()
+        .ok_or("usage: ra-client replay-dump <file.rarp> [--at-tick N] [--assets DIR]")?;
+
+    let (header, records) = load_replay(&path)?;
+    let mut bundles: std::collections::BTreeMap<u32, ra_net::TickBundle> =
+        std::collections::BTreeMap::new();
+    let mut recorded_end = 0u32;
+    let mut end_reason = None;
+    for rec in &records {
+        match rec {
+            ra_net::ReplayRecord::Tick { tick, bundle } => {
+                recorded_end = recorded_end.max(*tick);
+                bundles.insert(*tick, bundle.clone());
+            }
+            ra_net::ReplayRecord::Hash { tick, .. } => recorded_end = recorded_end.max(*tick),
+            ra_net::ReplayRecord::End { final_tick, reason } => {
+                recorded_end = recorded_end.max(*final_tick);
+                end_reason = Some(*reason);
+            }
+        }
+    }
+    // Default to the recorded end; a requested tick beyond it is clamped (there
+    // are no recorded commands past the end to re-simulate faithfully).
+    let target = at_tick.unwrap_or(recorded_end).min(recorded_end);
+
+    let mut game = reload_for_replay(&header, assets_flag.as_deref())?;
+    for t in 0..target {
+        let cmds = bundles.get(&t).map(|b| b.flatten()).unwrap_or_default();
+        game.core.world_mut().tick(&cmds);
+    }
+
+    let report = render_world_report(&game.core, &header, target, recorded_end, end_reason);
+    print!("{report}");
+    Ok(())
+}
+
+/// Render the structured post-mortem: per house (alive?, credits, units with
+/// type/pos/health, buildings), plus the game-over state.
+fn render_world_report(
+    core: &AppCore,
+    header: &ra_net::ReplayHeader,
+    at_tick: u32,
+    recorded_end: u32,
+    end_reason: Option<ra_net::EndReason>,
+) -> String {
+    use std::fmt::Write as _;
+    let w = core.world();
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "=== replay-dump: {} @ tick {at_tick} (recorded end tick {recorded_end}, reason {:?}) ===",
+        header.scenario, end_reason
+    );
+    let _ = writeln!(out, "game_over: {:?}", w.game_over());
+
+    // Houses that appear in the header, plus any that own live objects.
+    let mut houses: Vec<u8> = header.seats.iter().map(|s| s.house).collect();
+    for (_, u) in w.units.iter() {
+        if !houses.contains(&u.house) {
+            houses.push(u.house);
+        }
+    }
+    for (_, b) in w.buildings.iter() {
+        if !houses.contains(&b.house) {
+            houses.push(b.house);
+        }
+    }
+    houses.sort_unstable();
+    houses.dedup();
+
+    for h in houses {
+        let units: Vec<_> = w.units.iter().filter(|(_, u)| u.house == h).collect();
+        let buildings: Vec<_> = w
+            .buildings
+            .iter()
+            .filter(|(_, b)| b.house == h && b.is_alive())
+            .collect();
+        let alive = !units.is_empty() || !buildings.is_empty();
+        let credits = w.house(h).map(|hs| hs.available()).unwrap_or(0);
+        let _ = writeln!(
+            out,
+            "\n-- house {h}: alive={alive}  credits={credits}  units={}  buildings={}",
+            units.len(),
+            buildings.len()
+        );
+        for (_, u) in &units {
+            let name = w
+                .catalog()
+                .unit(u.type_id)
+                .map(|p| p.name.as_str())
+                .unwrap_or("?");
+            let c = u.cell();
+            let _ = writeln!(
+                out,
+                "   unit  {name:<6} id={:<3} cell=({:>3},{:>3}) hp={}",
+                u.type_id, c.x, c.y, u.health
+            );
+        }
+        for (_, b) in &buildings {
+            let name = w
+                .catalog()
+                .building(b.type_id)
+                .map(|p| p.name.as_str())
+                .unwrap_or("?");
+            let _ = writeln!(
+                out,
+                "   bldg  {name:<6} id={:<3} cell=({:>3},{:>3}) hp={}",
+                b.type_id, b.cell.x, b.cell.y, b.health
+            );
+        }
+    }
+    out
 }
 
 /// Nearest live enemy (AI) building to a cell, prioritising its **production
@@ -1179,6 +1554,7 @@ fn drive_skirmish(
     out_dir: &str,
     write_png: bool,
     max_ticks: u32,
+    recorder: Option<ra_client::replay::ReplayRecorder>,
 ) -> Result<(String, Vec<u64>), BoxErr> {
     use ra_sim::GameOver;
     let assets::SkirmishGame {
@@ -1188,6 +1564,12 @@ fn drive_skirmish(
         ai_house,
         ai_start,
     } = game;
+    // M7.23 P1: install the always-on recorder before the first tick so it taps
+    // the entire game (the scripted player commands cross the same transport the
+    // recorder observes; the AI runs in-sim and re-derives on replay).
+    if let Some(rec) = recorder {
+        core.install_recorder(rec);
+    }
     let mut hashes: Vec<u64> = Vec::new();
     let mut report = String::new();
 
@@ -1469,6 +1851,11 @@ fn drive_skirmish(
          AI start ({},{})",
         ai_base_tick, ai_attack_tick, outcome, ai_start.x, ai_start.y
     ));
+
+    // Finalize the replay. A victory/defeat during the drive already wrote the
+    // end record (finish is idempotent); otherwise this closes the stream as a
+    // clean Quit so the file is never left open-ended.
+    core.finish_recording(ra_net::EndReason::Quit);
 
     Ok((report, hashes))
 }

@@ -15,7 +15,12 @@ use std::collections::BTreeMap;
 
 use ra_data::house::{identity_remap, RemapTable};
 use ra_formats::tmpl::ICON_WIDTH;
-use ra_net::{CommandTransport, LanTransport, LocalTransport, LostReason, PollResult, ResyncEvent};
+use ra_net::{
+    CommandTransport, LanTransport, LocalTransport, LostReason, PollResult, ReplayTransport,
+    ResyncEvent,
+};
+
+use crate::replay::ReplayRecorder;
 use ra_sim::coords::{CellCoord, Facing, WorldCoord, LEPTONS_PER_CELL};
 use ra_sim::{BuildItem, GameOver, Handle, Passability, ProdKind, SuperKind, Target, World};
 
@@ -374,6 +379,9 @@ enum NetTransport {
     /// LAN peer lockstep (M8-B). Boxed: the socketed transport is much
     /// larger than the loopback, and this enum lives inside `AppCore`.
     Lan(Box<LanTransport>),
+    /// Watchable replay playback (M7.23 P3): recorded bundles fed back on
+    /// schedule; live input is ignored.
+    Replay(Box<ReplayTransport>),
 }
 
 impl CommandTransport for NetTransport {
@@ -381,18 +389,21 @@ impl CommandTransport for NetTransport {
         match self {
             NetTransport::Local(t) => t.submit(cmd),
             NetTransport::Lan(t) => t.submit(cmd),
+            NetTransport::Replay(t) => t.submit(cmd),
         }
     }
     fn poll(&mut self, tick: u32) -> PollResult {
         match self {
             NetTransport::Local(t) => t.poll(tick),
             NetTransport::Lan(t) => t.poll(tick),
+            NetTransport::Replay(t) => t.poll(tick),
         }
     }
     fn report_hash(&mut self, tick: u32, hash: u64) {
         match self {
             NetTransport::Local(t) => t.report_hash(tick, hash),
             NetTransport::Lan(t) => t.report_hash(tick, hash),
+            NetTransport::Replay(t) => t.report_hash(tick, hash),
         }
     }
 }
@@ -460,6 +471,11 @@ pub struct AppCore {
     /// A LAN game swaps in [`LanTransport`] via [`AppCore::install_lan`]
     /// (M8-B): same seam, input-delayed lockstep instead of loopback.
     transport: NetTransport,
+    /// Always-on replay recorder (M7.23 P1), installed for every interactive
+    /// game. Taps the same `(tick, TickBundle)` + post-tick hash the sim
+    /// consumes; `None` for a non-recording context (headless probes, playback).
+    /// Never feeds back into the sim, so recording on/off yields identical hashes.
+    recorder: Option<ReplayRecorder>,
     /// The remote player's house in a LAN game (`None` = single player). Set
     /// by [`AppCore::install_lan`]; drives the multiplayer win/lose read
     /// ([`AppCore::game_over`]) without touching sim state.
@@ -640,6 +656,7 @@ impl AppCore {
             selected: Vec::new(),
             drag: None,
             transport: NetTransport::Local(LocalTransport::new()),
+            recorder: None,
             mp_remote_house: None,
             net_end: None,
             net_waiting: false,
@@ -1146,6 +1163,51 @@ impl AppCore {
         self.mp_remote_house = Some(remote_house);
     }
 
+    /// Install the always-on replay recorder (M7.23 P1). The shell builds it
+    /// from the wall-clock timestamp + a `<scenario>-<timestamp>.rarp` path and
+    /// hands it over; the recorder taps the `step_tick` seam thereafter. A
+    /// disabled recorder (I/O failure at create time) is fine to install — every
+    /// tap is then a no-op and the game is unaffected.
+    pub fn install_recorder(&mut self, recorder: ReplayRecorder) {
+        self.recorder = Some(recorder);
+    }
+
+    /// Whether an installed recorder is actively writing.
+    pub fn is_recording(&self) -> bool {
+        self.recorder.as_ref().is_some_and(|r| r.is_recording())
+    }
+
+    /// Finalize recording with an explicit end reason (the shell calls this on
+    /// window close / quit; game-over is handled automatically in `update`).
+    /// Idempotent.
+    pub fn finish_recording(&mut self, reason: ra_net::EndReason) {
+        let final_tick = self.world.tick_count();
+        if let Some(rec) = self.recorder.as_mut() {
+            rec.finish(reason, final_tick);
+        }
+    }
+
+    /// Swap in a replay-playback transport (M7.23 P3): the sim re-executes the
+    /// recorded command stream (`ReplayTransport` feeds bundles on schedule) and
+    /// halts at the recorded final tick. `remote_house` (if the replay was a LAN
+    /// game) drives the win/lose read; `None` for single player. No recorder is
+    /// installed — a replay does not record itself.
+    pub fn install_replay(&mut self, transport: ReplayTransport, remote_house: Option<u8>) {
+        self.transport = NetTransport::Replay(Box::new(transport));
+        self.mp_remote_house = remote_house;
+        self.recorder = None;
+    }
+
+    /// During replay playback, whether the sim has reached the recorded final
+    /// tick (so the shell can stop advancing / show an end frame). `false` for
+    /// any non-replay context.
+    pub fn replay_finished(&self) -> bool {
+        match &self.transport {
+            NetTransport::Replay(t) => self.world.tick_count() > t.final_tick(),
+            _ => false,
+        }
+    }
+
     /// The remote player's house in a LAN game.
     pub fn remote_house(&self) -> Option<u8> {
         self.mp_remote_house
@@ -1195,6 +1257,7 @@ impl AppCore {
             NetTransport::Lan(t) => t.is_host(),
             _ => {
                 self.net_end.get_or_insert(NetEnd::Desync);
+                self.finish_recording(ra_net::EndReason::Desync);
                 return;
             }
         };
@@ -1260,6 +1323,7 @@ impl AppCore {
             ResyncEvent::Failed => {
                 self.net_resync = false;
                 self.net_end.get_or_insert(NetEnd::Desync);
+                self.finish_recording(ra_net::EndReason::Desync);
             }
         }
     }
@@ -1492,8 +1556,15 @@ impl AppCore {
         let go = self.game_over();
         if go != self.prev_game_over {
             match go {
-                GameOver::Victory => self.push_sound(SoundEvent::Victory),
-                GameOver::Defeat => self.push_sound(SoundEvent::Defeat),
+                GameOver::Victory => {
+                    self.push_sound(SoundEvent::Victory);
+                    // Finalize the replay at the moment of victory (M7.23 P1).
+                    self.finish_recording(ra_net::EndReason::Victory);
+                }
+                GameOver::Defeat => {
+                    self.push_sound(SoundEvent::Defeat);
+                    self.finish_recording(ra_net::EndReason::Defeat);
+                }
                 GameOver::Ongoing => {}
             }
             self.prev_game_over = go;
@@ -1523,9 +1594,19 @@ impl AppCore {
         // the zero-delay LocalTransport; this seam is where M8-B's
         // LanTransport will stall at the tick barrier).
         let tick = self.world.tick_count();
+        // Replay playback halts cleanly at the recorded final tick — do not
+        // free-run the AI past the recording.
+        if self.replay_finished() {
+            return;
+        }
         let cmds = match self.transport.poll(tick) {
             PollResult::Ready(bundle) => {
                 self.net_waiting = false;
+                // Recording tap (M7.23 P1): capture exactly what the sim is
+                // about to execute — the polled bundle — before flattening.
+                if let Some(rec) = self.recorder.as_mut() {
+                    rec.on_tick(tick, &bundle);
+                }
                 bundle.flatten()
             }
             PollResult::Waiting => {
@@ -1555,6 +1636,10 @@ impl AppCore {
                         LostReason::PeerQuit => NetEnd::PeerLeft,
                         LostReason::Timeout => NetEnd::ConnectionLost,
                     });
+                    // The peer is gone: finalize the replay (the closest of the
+                    // four end reasons is Quit — a clean session end, not a
+                    // determinism failure).
+                    self.finish_recording(ra_net::EndReason::Quit);
                 }
                 return;
             }
@@ -1645,6 +1730,11 @@ impl AppCore {
         // Feed the hash chain back to the transport (§4.6: hashes are chained
         // even in single player, so stages 2/3 inherit a battle-tested core).
         self.transport.report_hash(tick, hash);
+        // Recording tap (M7.23 P1): the post-tick hash, on the HASH_INTERVAL
+        // cadence — the chain `replay-verify` re-simulates and asserts.
+        if let Some(rec) = self.recorder.as_mut() {
+            rec.on_hash(tick, hash);
+        }
 
         // Fire cues (M7.22 Fix 3). The original plays each weapon's own
         // `Report=` sound on every shot — projectile *and* hitscan — at the fire
