@@ -12,8 +12,17 @@
 //! tick T") and re-pushes its own recent window, so both directions heal.
 //! This mirrors the original's posture: its comm layer re-sent unacked
 //! packets while `Wait_For_Players` sat in the frame-sync loop resending
-//! FRAMESYNC packets (QUEUE.CPP:1748-1817) rather than ever advancing
-//! without data.
+//! FRAMESYNC packets on a retry timer to break wait deadlocks
+//! (QUEUE.CPP:960-976, "Resend a frame-sync packet if longer than one
+//! propagation delay goes by; this prevents a 'deadlock'") rather than ever
+//! advancing without data.
+//!
+//! **Layering (audit-verified):** the redundant carry is a pure *jitter/loss
+//! absorber* for in-flight traffic — it provides ZERO stall recovery on its
+//! own, because a stalled pair sends nothing new to carry history on. NACK
+//! is the sole stall-recovery mechanism; disabling it makes blackout
+//! recovery impossible, not merely slower (M8-B depth audit, lan_torture.rs
+//! revert drills).
 //!
 //! **Timing discipline (determinism note).** All wall-clock here is
 //! transport-layer only — keepalive cadence, peer timeout, NACK pacing. None
