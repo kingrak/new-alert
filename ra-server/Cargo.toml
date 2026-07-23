@@ -1,0 +1,31 @@
+[package]
+name = "ra-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+description = "Red Alert relay sequencer: an authoritative command-ordering server for internet play. Never a sim host (SERVER-DESIGN.md §1)."
+
+[dependencies]
+# The sequencer moves opaque command blobs, tick numbers, and 64-bit state
+# hashes over the wire v2 protocol. It depends on `ra-net` for that wire format
+# and the replay encoding, and — structurally — on NOTHING ELSE: it MUST NOT
+# depend on `ra-sim` (SERVER-DESIGN.md §3 "never a sim host"; command payloads
+# are opaque validated bytes, the house field read via `ra_net::wire::command_house`).
+ra-net = { path = "../ra-net" }
+
+[lib]
+name = "ra_server"
+path = "src/lib.rs"
+
+[[bin]]
+name = "ra-server"
+path = "src/main.rs"
+
+[dev-dependencies]
+# Test-only: the in-process CI harness (§11) drives real `RelayTransport`
+# clients, which move `ra_sim::Command` values. This is a dev-dependency ONLY —
+# the production `ra-server` graph never touches `ra-sim` (the "never a sim host"
+# structural guarantee holds for the shipped binary). No cycle: `ra-sim` does not
+# depend on `ra-server`.
+ra-sim = { path = "../ra-sim" }

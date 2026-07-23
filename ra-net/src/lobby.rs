@@ -667,6 +667,7 @@ impl JoinLobby {
                     RejectReason::GameVersion => "rejected: game version mismatch",
                     RejectReason::SessionFull => "rejected: session is full",
                     RejectReason::AlreadyStarted => "rejected: game already started",
+                    RejectReason::ServerFull => "rejected: server is full",
                 };
                 self.fail(msg);
             }

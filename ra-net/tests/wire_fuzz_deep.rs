@@ -7,11 +7,21 @@
 //! is a P0 finding per the audit brief.
 
 use ra_net::wire::{
-    self, Datagram, RejectReason, WireError, GAME_VERSION, MAX_CMDS_PER_TICK, MAX_MAP_NAME,
-    MAX_NAME, MAX_TICK_ENTRIES, PROTOCOL_VERSION, WIRE_MAGIC,
+    self, BundleEntry, CtrlRecord, Datagram, HashVerdict, RejectReason, SessListEntry, SessSeat,
+    SessionPhase, WireError, GAME_VERSION, MAX_CMDS_PER_TICK, MAX_MAP_NAME, MAX_NAME,
+    MAX_TICK_ENTRIES, PROTOCOL_VERSION, WIRE_MAGIC,
 };
 use ra_sim::coords::CellCoord;
 use ra_sim::{Command, Handle, ProdKind, RandomLcg};
+
+/// One command as its opaque wire blob (the v2 TICK payload shape).
+fn blob(house: u8, n: u32) -> Vec<u8> {
+    wire::encode_command(&Command::Move {
+        unit: Handle { index: n, gen: 1 },
+        dest: CellCoord::new(n as i32, house as i32),
+        house,
+    })
+}
 
 fn handle(rng: &mut RandomLcg) -> Handle {
     Handle {
@@ -100,6 +110,157 @@ fn representative_datagrams(rng: &mut RandomLcg) -> Vec<(&'static str, Datagram)
         ("nack", Datagram::Nack { from: 42 }),
         ("keepalive", Datagram::KeepAlive { tick: 42 }),
         ("quit", Datagram::Quit),
+        // --- wire v2 (M9-A relay): every new message (audit: fuzz EVERY one) ---
+        (
+            "srv_hello",
+            Datagram::SrvHello {
+                game_version: GAME_VERSION,
+                client_nonce: 0xABCD_1234,
+            },
+        ),
+        (
+            "srv_welcome",
+            Datagram::SrvWelcome {
+                server_nonce: 0x1111_2222,
+                conn_id: 0x3333_4444,
+            },
+        ),
+        (
+            "sess_create",
+            Datagram::SessCreate {
+                conn_id: 0xDEAD_BEEF,
+                name: "GAME".to_string(),
+                map: "scm01ea.ini".to_string(),
+                seats: 4,
+                credits: 8000,
+                seed: 0x5EED,
+                catalog_hash: 0xCAFE_F00D_1234_5678,
+            },
+        ),
+        ("sess_list_req", Datagram::SessListReq { conn_id: 0x99 }),
+        (
+            "sess_list",
+            Datagram::SessList {
+                entries: (0..3)
+                    .map(|i| SessListEntry {
+                        session_id: 100 + i,
+                        name: format!("s{i}"),
+                        map: "m.ini".to_string(),
+                        seats_taken: i as u8,
+                        seats: 4,
+                        in_progress: i % 2 == 0,
+                    })
+                    .collect(),
+            },
+        ),
+        (
+            "sess_join",
+            Datagram::SessJoin {
+                conn_id: 0x1234,
+                session_id: 7,
+                name: "JOINER".to_string(),
+            },
+        ),
+        (
+            "sess_state",
+            Datagram::SessState {
+                session_id: 7,
+                phase: SessionPhase::Lobby,
+                host_seat: 1,
+                delay: 6,
+                seed: 0x5EED,
+                credits: 8000,
+                map: "scm01ea.ini".to_string(),
+                seats: vec![
+                    SessSeat {
+                        seat: 1,
+                        name: "host".to_string(),
+                        house: 1,
+                        ready: true,
+                    },
+                    SessSeat {
+                        seat: 2,
+                        name: "p2".to_string(),
+                        house: 2,
+                        ready: false,
+                    },
+                ],
+            },
+        ),
+        (
+            "sess_ready",
+            Datagram::SessReady {
+                conn_id: 0x1234,
+                ready: true,
+            },
+        ),
+        (
+            "sess_leave",
+            Datagram::SessLeave {
+                conn_id: 0x1234,
+                reason: 2,
+            },
+        ),
+        (
+            "sess_start",
+            Datagram::SessStart {
+                session_id: 7,
+                start_tick: 0,
+                input_delay: 6,
+                seat_map: vec![(1, 1), (2, 2)],
+            },
+        ),
+        (
+            "tick_cmds",
+            Datagram::TickCmds {
+                conn_id: 0x1234,
+                entries: (0..4)
+                    .map(|t| (10 + t, vec![blob(1, t), blob(1, t + 100)]))
+                    .collect(),
+            },
+        ),
+        (
+            "tick_bundle",
+            Datagram::TickBundle {
+                entries: (0..3)
+                    .map(|t| BundleEntry {
+                        tick: 10 + t,
+                        ctrl: if t == 0 {
+                            vec![
+                                CtrlRecord::Timing {
+                                    new_delay: 8,
+                                    effective_tick: 20,
+                                },
+                                CtrlRecord::Unknown {
+                                    tag: 99,
+                                    bytes: vec![1, 2, 3],
+                                },
+                            ]
+                        } else {
+                            Vec::new()
+                        },
+                        seats: vec![(1, vec![blob(1, t)]), (2, vec![blob(2, t)])],
+                    })
+                    .collect(),
+            },
+        ),
+        (
+            "tick_hash",
+            Datagram::TickHash {
+                conn_id: 0x1234,
+                entries: (0..4)
+                    .map(|t| (10 + t, 0xAABB_CCDD_0000_0000 + t as u64))
+                    .collect(),
+            },
+        ),
+        (
+            "hash_verdict",
+            Datagram::HashVerdictMsg {
+                tick: 42,
+                verdict: HashVerdict::YouDiverged,
+                majority_hash: 0x1234_5678_9ABC_DEF0,
+            },
+        ),
     ]
 }
 
@@ -552,4 +713,52 @@ fn trailing_bytes_after_a_fully_valid_datagram_are_rejected() {
         checked >= 40,
         "too few trailing-byte cases checked ({checked})"
     );
+}
+
+// ---------------------------------------------------------------------------
+// (9) Wire v2 round-trip identity for EVERY new relay message, plus the
+// control-record forward-compatibility contract.
+// ---------------------------------------------------------------------------
+
+/// Every v2 relay message encodes → decodes back to itself byte-for-byte
+/// (identity), including nested command blobs and the embedded control records.
+#[test]
+fn v2_messages_round_trip_identity() {
+    let mut rng = RandomLcg::new(0x0FF5_E7A3);
+    for (name, d) in representative_datagrams(&mut rng) {
+        let bytes = wire::encode(&d);
+        let back = wire::decode(&bytes).unwrap_or_else(|e| panic!("{name}: decode failed: {e:?}"));
+        assert_eq!(back, d, "{name}: must round-trip to an identical value");
+    }
+}
+
+/// An unknown control-record tag decodes opaquely as [`CtrlRecord::Unknown`] and
+/// re-encodes byte-for-byte — the forward-compatibility slot (§6.2) that lets a
+/// later server add control records without a wire bump.
+#[test]
+fn unknown_control_record_round_trips_opaquely() {
+    let d = Datagram::TickBundle {
+        entries: vec![BundleEntry {
+            tick: 5,
+            ctrl: vec![CtrlRecord::Unknown {
+                tag: 0x7E,
+                bytes: vec![9, 8, 7, 6, 5],
+            }],
+            seats: vec![(1, vec![])],
+        }],
+    };
+    let bytes = wire::encode(&d);
+    assert_eq!(wire::decode(&bytes).unwrap(), d);
+}
+
+/// The seat-house accessor reads the issuing house of an opaque blob without a
+/// sim dependency at the call site (§7.3), for every command shape.
+#[test]
+fn command_house_accessor_reads_every_command_shape() {
+    for house in 0u8..=6 {
+        assert_eq!(wire::command_house(&blob(house, 3)).unwrap(), house);
+    }
+    // Malformed blob → error, never a panic.
+    assert!(wire::command_house(&[0xFF, 0x00]).is_err());
+    assert!(wire::command_house(&[]).is_err());
 }

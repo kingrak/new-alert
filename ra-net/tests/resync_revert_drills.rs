@@ -9,16 +9,17 @@
 //!     is rejected and the session retries/falls back; without it, the wrong
 //!     world is silently adopted.
 //!
-//! `RESYNC_CONFIRM_GRACE` (the host's optimistic-resume-without-DONE
-//! backstop) has **no** test-injectable disable, unlike `peer_timeout`/
-//! `carry`/`resume_clear_windows`/(implicitly, wire-level attempt behavior) —
-//! so a true "disable it and watch the all-dropped-DONE case change
-//! behavior" drill cannot be written without a production code change, which
-//! is out of scope for this audit. What CAN be verified without one: that
-//! the documented backstop actually fires and is bounded when every DONE is
-//! lost (positive-side proof) — see
-//! `all_done_dropped_still_resumes_via_the_optimistic_grace` below. This
-//! asymmetry is called out explicitly in the audit report.
+//! (b) `RESYNC_CONFIRM_GRACE` (the host's optimistic-resume-without-DONE
+//!     backstop) is now test-injectable via
+//!     `LanTransport::set_resync_confirm_grace_for_test` (M9-A pre-flight —
+//!     matching the `peer_timeout`/`carry`/`resume_clear_windows` knob
+//!     pattern), so both sides of the drill exist: the positive-side proof
+//!     that the backstop fires and is bounded when every DONE is lost
+//!     (`all_done_dropped_still_resumes_via_the_optimistic_grace`), and the
+//!     disable-drill proving it is load-bearing — with the grace disabled the
+//!     identical all-DONE-lost transfer does *not* resume in the window the
+//!     grace would have
+//!     (`all_done_dropped_without_the_grace_does_not_resume`).
 
 use std::net::UdpSocket;
 use std::time::{Duration, Instant};
@@ -356,5 +357,94 @@ fn all_done_dropped_still_resumes_via_the_optimistic_grace() {
         "took {elapsed:?} — suspiciously close to the 8s RESYNC_TIMEOUT; \
          is the optimistic grace actually firing, or did this fall through \
          to the per-attempt timeout instead?"
+    );
+}
+
+/// (b-disable) The revert side of the drill above (M9-A pre-flight): with the
+/// optimistic grace **disabled** (set to an hour via
+/// `set_resync_confirm_grace_for_test`), the identical all-DONE-dropped transfer
+/// does NOT resume the host within a window several times the real 600ms grace
+/// yet well under the 8s per-attempt timeout. Since the loser has ACKed a
+/// complete set (so the host is only waiting on the terminal DONE, which is
+/// dropped), the *only* thing that resumes it in that window is the grace — so
+/// its absence leaving the host un-resumed proves the backstop is load-bearing,
+/// not decorative.
+#[test]
+fn all_done_dropped_without_the_grace_does_not_resume() {
+    let sa = loopback_socket();
+    let relay_a = loopback_socket(); // faces the host
+    let relay_b = loopback_socket(); // faces the loser
+    let sb = loopback_socket();
+    let a_real = sa.local_addr().unwrap();
+    let b_real = sb.local_addr().unwrap();
+    let relay_a_addr = relay_a.local_addr().unwrap();
+    let relay_b_addr = relay_b.local_addr().unwrap();
+
+    let mut ta = LanTransport::new(sa, relay_a_addr, 1, 2, DEFAULT_INPUT_DELAY, true).unwrap();
+    let mut tb = LanTransport::new(sb, relay_b_addr, 2, 1, DEFAULT_INPUT_DELAY, false).unwrap();
+    // Disable the optimistic-resume backstop.
+    ta.set_resync_confirm_grace_for_test(Duration::from_secs(3600));
+
+    let (mut w, mover) = build_world();
+    advance(&mut w, mover, 3);
+    let snapshot = w.save_snapshot();
+    let declared_hash = w.state_hash();
+    let resume_tick = w.tick_count();
+    ta.begin_resync_host(snapshot, resume_tick, declared_hash);
+    tb.begin_resync_loser();
+
+    let mut buf = [0u8; 65536];
+    let mut pump_relay = || {
+        while let Ok((n, _)) = relay_a.recv_from(&mut buf) {
+            let _ = relay_b.send_to(&buf[..n], b_real);
+        }
+        while let Ok((n, _)) = relay_b.recv_from(&mut buf) {
+            match wire::decode(&buf[..n]) {
+                Ok(Datagram::SnapshotDone { .. }) => {} // dropped
+                _ => {
+                    let _ = relay_a.send_to(&buf[..n], a_real);
+                }
+            }
+        }
+    };
+
+    // Drive for 2.5s — >4x the real 600ms grace, but far under the 8s attempt
+    // timeout, so a retry/fail cannot confound the result.
+    let start = Instant::now();
+    let mut got_needs_load = false;
+    while start.elapsed() < Duration::from_millis(2500) {
+        pump_relay();
+        if let ResyncEvent::Resumed { .. } = ta.resync_poll() {
+            panic!(
+                "host resumed with the grace disabled — the optimistic backstop \
+                 was NOT the thing resuming it, so this drill (and the positive \
+                 test) proves nothing"
+            );
+        }
+        if tb.resync_active() {
+            if let ResyncEvent::NeedsLoad {
+                bytes,
+                declared_hash: dh,
+                ..
+            } = tb.resync_poll()
+            {
+                got_needs_load = true;
+                let loaded =
+                    World::load_snapshot(&bytes, w.catalog().clone(), w.passability().clone())
+                        .expect("must decode");
+                tb.resync_report_loaded(loaded.state_hash() == dh);
+            }
+        }
+    }
+
+    // The loser did reach + pass the load (so the host really is only waiting on
+    // the dropped DONE), yet the host stayed un-resumed the whole window.
+    assert!(
+        got_needs_load,
+        "loser must have reached the load step (else the host isn't waiting on DONE)"
+    );
+    assert!(
+        !matches!(ta.resync_poll(), ResyncEvent::Resumed { .. }),
+        "with the grace disabled and every DONE dropped, the host must not resume"
     );
 }

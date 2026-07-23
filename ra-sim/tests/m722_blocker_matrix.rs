@@ -182,6 +182,59 @@ fn open_field_blocker_in_every_direction_is_passable() {
     }
 }
 
+/// Same as [`run_cell`] but with the corner-graze nudge disabled — the
+/// revert-drill seam (M9-A pre-flight): re-exposes the pre-M7.22 behaviour where
+/// `is_blocked` floor-rounds a diagonal graze into a building cell.
+fn run_cell_no_nudge(
+    dir: (i32, i32),
+    blocker: Blocker,
+    corridor: bool,
+    budget: u32,
+) -> Option<u32> {
+    let (mut world, mover, dest) = setup(dir, blocker, corridor);
+    world.set_corner_graze_nudge_for_test(false);
+    world.tick(&[Command::Move {
+        unit: mover,
+        dest,
+        house: 1,
+    }]);
+    for t in 0..budget {
+        world.tick(&[]);
+        let cur = world.units.get(mover)?.cell();
+        if cur == dest {
+            return Some(t);
+        }
+    }
+    None
+}
+
+/// EXECUTABLE REVERT-DRILL (M9-A pre-flight): the claim in
+/// `open_field_blocker_in_every_direction_is_passable` — "dropping the
+/// `nudge_corner_graze` call re-STUCKs the diagonal-building cells" — is now a
+/// live test rather than a comment. With the nudge **off**, a pure-diagonal move
+/// (NE/SW) past a *building* corner never arrives; with it **on** (production),
+/// the identical scenario arrives. The nudge is therefore proven load-bearing:
+/// its removal reintroduces exactly the stuck cells the fix closed.
+#[test]
+fn corner_graze_nudge_is_load_bearing_for_diagonal_building_grazes() {
+    // The pin names NE/SW as the diagonals whose A*-chosen path steps through the
+    // building's shared corner (the geometry that grazes); the other two diagonals
+    // route around it and never depended on the nudge.
+    for (dx, dy, dname) in [(1, -1, "NE"), (-1, 1, "SW")] {
+        // With the nudge disabled, the diagonal graze past a building re-sticks.
+        assert!(
+            run_cell_no_nudge((dx, dy), Blocker::Building, false, 400).is_none(),
+            "revert-drill {dname}/building: with the nudge OFF the mover must \
+             re-stick on the building corner (proving the nudge is load-bearing)"
+        );
+        // Production (nudge on) arrives — the pin this drill guards.
+        assert!(
+            run_cell((dx, dy), Blocker::Building, false, 400).is_some(),
+            "{dname}/building: with the nudge ON the mover must reach past the corner"
+        );
+    }
+}
+
 /// PIN (Fix 2, corridor): in a 1-wide lane, a *friendly* blocker (idle or guard)
 /// scatters and the mover passes. An *unarmed* mover cannot pass an enemy unit
 /// or a friendly building that fully walls the only route — matching the

@@ -252,6 +252,11 @@ pub struct LanTransport {
     /// bundle by protocol (a fresh scheduler's earliest stamp lands at
     /// `resume_base + delay`), exactly as ticks `0..delay` are empty at start.
     resume_base: Tick,
+    /// Optimistic-resume grace after the loser ACKs a complete chunk set but
+    /// before its explicit DONE arrives (revert-drill knob; default
+    /// [`RESYNC_CONFIRM_GRACE`]). Tests set this huge to disable the backstop and
+    /// prove it is load-bearing when the whole DONE burst is lost.
+    resync_confirm_grace: Duration,
 }
 
 impl LanTransport {
@@ -306,6 +311,7 @@ impl LanTransport {
             resyncs_completed: 0,
             resume_clear_windows: true,
             resume_base: 0,
+            resync_confirm_grace: RESYNC_CONFIRM_GRACE,
         })
     }
 
@@ -578,7 +584,8 @@ impl LanTransport {
                 }
                 None => {
                     // Optimistic-resume backstop (all-dropped DONE burst).
-                    if all_acked_at.map(|t| t.elapsed() >= RESYNC_CONFIRM_GRACE) == Some(true) {
+                    if all_acked_at.map(|t| t.elapsed() >= self.resync_confirm_grace) == Some(true)
+                    {
                         resume = Some(resume_tick);
                     } else if pace {
                         rs.last_action = Instant::now();
@@ -720,6 +727,14 @@ impl LanTransport {
     /// calls this.
     pub fn set_resume_clear_windows_for_test(&mut self, clear: bool) {
         self.resume_clear_windows = clear;
+    }
+
+    /// Revert-drill knob (M9-A pre-flight): override the optimistic-resume grace.
+    /// Setting it very large disables the all-DONE-lost backstop, so a test can
+    /// prove that grace is load-bearing (the host cannot resume from a fully-lost
+    /// DONE burst without it). Production code never calls this.
+    pub fn set_resync_confirm_grace_for_test(&mut self, grace: Duration) {
+        self.resync_confirm_grace = grace;
     }
 
     // -- internals ----------------------------------------------------------
@@ -953,13 +968,28 @@ impl LanTransport {
                     }
                 }
             }
-            // Lobby leftovers / stray discovery traffic: ignore in-game.
+            // Lobby leftovers / stray discovery traffic, and any v2 relay
+            // messages that reach a LAN socket: ignore in-game.
             Datagram::Announce { .. }
             | Datagram::Join { .. }
             | Datagram::Welcome { .. }
             | Datagram::Reject { .. }
             | Datagram::Start
-            | Datagram::Leave => {}
+            | Datagram::Leave
+            | Datagram::SrvHello { .. }
+            | Datagram::SrvWelcome { .. }
+            | Datagram::SessCreate { .. }
+            | Datagram::SessListReq { .. }
+            | Datagram::SessList { .. }
+            | Datagram::SessJoin { .. }
+            | Datagram::SessState { .. }
+            | Datagram::SessReady { .. }
+            | Datagram::SessLeave { .. }
+            | Datagram::SessStart { .. }
+            | Datagram::TickCmds { .. }
+            | Datagram::TickBundle { .. }
+            | Datagram::TickHash { .. }
+            | Datagram::HashVerdictMsg { .. } => {}
         }
     }
 

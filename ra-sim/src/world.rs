@@ -238,6 +238,13 @@ pub struct World {
     /// Nuclear strikes in flight (launched, awaiting detonation). Hashed only while
     /// non-empty.
     nuke_strikes: Vec<NukeStrike>,
+    /// Revert-drill knob (M7.22 Fix 2a): when `false`, [`nudge_corner_graze`]
+    /// returns its input unchanged, re-exposing the pre-fix diagonal-corner stuck
+    /// behaviour so a test can prove the nudge is load-bearing. Defaults `true`
+    /// (production); **never** serialized (not game state — it is `true` in every
+    /// production and loaded world) and never read into `state_hash`, so worlds
+    /// stay byte-identical to pre-M9-A regardless of this flag's presence.
+    corner_graze_nudge: bool,
 }
 
 /// Terminal outcome of a skirmish, from the player's point of view (M6, item 4).
@@ -305,7 +312,16 @@ impl World {
             enemy_activation: None,
             superweapons: Vec::new(),
             nuke_strikes: Vec::new(),
+            corner_graze_nudge: true,
         }
+    }
+
+    /// Revert-drill knob (M7.22 Fix 2a): disable the corner-graze nudge so a test
+    /// can prove it is load-bearing (diagonal moves past a building corner re-stick
+    /// without it). Production code never calls this; the flag is not serialized
+    /// and never enters `state_hash`.
+    pub fn set_corner_graze_nudge_for_test(&mut self, on: bool) {
+        self.corner_graze_nudge = on;
     }
 
     /// Install a campaign's scenario-scripting state (M7.5). Presence flips
@@ -1067,6 +1083,9 @@ impl World {
             enemy_activation,
             superweapons,
             nuke_strikes,
+            // Test-only revert knob, never serialized: a loaded (production)
+            // world always runs with the nudge on.
+            corner_graze_nudge: true,
         })
     }
 }
@@ -7488,6 +7507,11 @@ fn nudge_corner_graze(
     handle: Handle,
     loco: Locomotor,
 ) -> WorldCoord {
+    // Revert-drill: with the nudge disabled the raw (floor-rounded) landing is
+    // returned, re-exposing the pre-fix diagonal-corner stuck behaviour.
+    if !world.corner_graze_nudge {
+        return nc;
+    }
     let land = nc.cell();
     if land == start_cell || path.contains(&land) {
         return nc;

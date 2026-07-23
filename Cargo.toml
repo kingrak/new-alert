@@ -6,6 +6,7 @@ members = [
     "ra-sim",
     "ra-client",
     "ra-net",
+    "ra-server",
 ]
 
 [workspace.package]

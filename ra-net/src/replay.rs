@@ -316,6 +316,30 @@ pub fn encode_tick(tick: Tick, bundle: &TickBundle) -> Vec<u8> {
     frame(b.0)
 }
 
+/// Encode a tick record from **opaque command blobs** — the relay server's path
+/// (SERVER-DESIGN.md §8), which holds each command as the exact bytes
+/// [`crate::wire::encode_command`] produced and never decodes them into a
+/// `Command` (it depends on no `ra-sim`). A command blob *is* one `put_command`
+/// output, so the bytes this writes are identical to [`encode_tick`]'s and the
+/// same [`ReplayReader`] (which runs `get_command`) decodes them back. The
+/// caller records only ticks that carried commands (empty ticks are omitted).
+pub fn encode_tick_blobs(tick: Tick, seats: &[(SeatId, Vec<Vec<u8>>)]) -> Vec<u8> {
+    let mut b = Writer(Vec::with_capacity(32));
+    b.u8(R_TICK);
+    b.u32(tick);
+    let nseats = seats.len().min(MAX_TICK_ENTRIES);
+    b.u8(nseats as u8);
+    for (seat, blobs) in seats.iter().take(MAX_TICK_ENTRIES) {
+        b.u8(*seat);
+        let m = blobs.len().min(MAX_CMDS_PER_TICK);
+        b.u16(m as u16);
+        for blob in blobs.iter().take(MAX_CMDS_PER_TICK) {
+            b.0.extend_from_slice(blob);
+        }
+    }
+    frame(b.0)
+}
+
 /// Encode a periodic hash record.
 pub fn encode_hash(tick: Tick, hash: u64) -> Vec<u8> {
     let mut b = Writer(Vec::with_capacity(16));

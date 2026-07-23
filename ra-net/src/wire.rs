@@ -31,7 +31,7 @@
 
 use ra_sim::{coords::CellCoord, BuildItem, Command, Handle, ProdKind, SuperKind, Target};
 
-use crate::transport::Tick;
+use crate::transport::{SeatId, Tick};
 
 /// Wire magic: little-endian `0x4152` = the bytes `"RA"`.
 pub const WIRE_MAGIC: u16 = 0x4152;
@@ -39,7 +39,7 @@ pub const WIRE_MAGIC: u16 = 0x4152;
 /// The wire protocol version. Bump on ANY change to the datagram layout or to
 /// the meaning of a field; peers with different values reject each other at
 /// the handshake (and cannot decode each other's datagrams at all).
-pub const PROTOCOL_VERSION: u16 = 1;
+pub const PROTOCOL_VERSION: u16 = 2;
 
 /// The game build version carried in handshake datagrams (major.minor.patch
 /// packed as `major << 16 | minor << 8 | patch`). Two builds with the same
@@ -86,6 +86,28 @@ const T_SNAP_OFFER: u8 = 0x20;
 const T_SNAP_CHUNK: u8 = 0x21;
 const T_SNAP_ACK: u8 = 0x22;
 const T_SNAP_DONE: u8 = 0x23;
+// Wire v2 (M9-A relay, SERVER-DESIGN.md §4). C→S messages after SRV_WELCOME echo
+// `conn_id` as a cheap off-path spoof guard (§7.2). `Reject` (0x04) is reused for
+// the SRV_HELLO refusal path.
+const T_SRV_HELLO: u8 = 0x30;
+const T_SRV_WELCOME: u8 = 0x31;
+const T_SESS_CREATE: u8 = 0x33;
+const T_SESS_LIST_REQ: u8 = 0x34;
+const T_SESS_LIST: u8 = 0x35;
+const T_SESS_JOIN: u8 = 0x36;
+const T_SESS_STATE: u8 = 0x37;
+const T_SESS_READY: u8 = 0x38;
+const T_SESS_LEAVE: u8 = 0x39;
+const T_SESS_START: u8 = 0x3A;
+const T_TICK_CMDS: u8 = 0x3B;
+const T_TICK_BUNDLE: u8 = 0x3C;
+const T_TICK_HASH: u8 = 0x3D;
+const T_HASH_VERDICT: u8 = 0x3E;
+
+/// Embedded control-record tag: `SESS_TIMING` (§6.2 adaptive delay). Reserved in
+/// M9-A (never emitted; fixed delay); decoded generically so M9-B can populate
+/// it without a wire bump.
+const CTRL_TIMING: u8 = 1;
 
 /// Max snapshot payload a chunk carries — kept comfortably under a 1500-byte
 /// Ethernet MTU (minus IP/UDP + our header) so a CHUNK datagram is not IP
@@ -99,6 +121,26 @@ pub const MAX_SNAPSHOT_LEN: usize = 16 * 1024 * 1024;
 /// more than this, which never happens at realistic loss rates).
 pub const MAX_SNAP_MISSING: usize = 2048;
 
+// --- Wire v2 (M9-A relay) caps (SERVER-DESIGN.md §4) --------------------------
+
+/// Cap on sessions listed in one `SESS_LIST` page (§4: "capped page (≤ 32)").
+pub const MAX_SESSIONS_IN_LIST: usize = 32;
+/// Cap on seats named in a session (`SESS_STATE`/`SESS_START`; the original tops
+/// out at 8 MP houses — SERVER-DESIGN.md §9 "seats ≤ 8/game").
+pub const MAX_SEATS: usize = 8;
+/// Hard decode cap on one encoded command blob carried opaquely in a
+/// `TICK_CMDS`/`TICK_BUNDLE` (the largest `Command` — `FireSuperWeapon` with a
+/// cell dest — encodes well under this; a malformed length must never
+/// over-read). Command *semantic* validity is the sim's job; the relay only
+/// moves these bytes and reads the house field (§7).
+pub const MAX_CMD_BLOB: usize = 64;
+/// Cap on control records embedded in one tick's bundle (the `SESS_TIMING` hook
+/// slot, §6.2). M9-A never emits any; the slot exists so M9-B's adaptive-delay
+/// control record needs no wire bump.
+pub const MAX_CTRL_PER_TICK: usize = 8;
+/// Cap on one control record's opaque payload.
+pub const MAX_CTRL_PAYLOAD: usize = 64;
+
 /// Why a JOIN was refused.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RejectReason {
@@ -110,6 +152,8 @@ pub enum RejectReason {
     SessionFull,
     /// The session already started.
     AlreadyStarted,
+    /// Relay server is at capacity (max sessions/connections, §9). Wire v2.
+    ServerFull,
 }
 
 impl RejectReason {
@@ -119,6 +163,7 @@ impl RejectReason {
             RejectReason::GameVersion => 2,
             RejectReason::SessionFull => 3,
             RejectReason::AlreadyStarted => 4,
+            RejectReason::ServerFull => 5,
         }
     }
 
@@ -128,12 +173,144 @@ impl RejectReason {
             2 => RejectReason::GameVersion,
             3 => RejectReason::SessionFull,
             4 => RejectReason::AlreadyStarted,
+            5 => RejectReason::ServerFull,
             _ => return Err(WireError::BadValue("reject reason")),
         })
     }
 }
 
-/// Everything that crosses the LAN, discovery and lobby included.
+/// A relay session's lifecycle phase (SERVER-DESIGN.md §5), carried in
+/// `SESS_STATE`. `u8` on the wire.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SessionPhase {
+    /// Accepting joins/ready toggles; seat-0 owns settings.
+    Lobby,
+    /// The game is running (sequencing tick bundles).
+    Running,
+    /// Finished / dissolved (replay finalized).
+    Closed,
+}
+
+impl SessionPhase {
+    fn to_byte(self) -> u8 {
+        match self {
+            SessionPhase::Lobby => 0,
+            SessionPhase::Running => 1,
+            SessionPhase::Closed => 2,
+        }
+    }
+    fn from_byte(b: u8) -> Result<SessionPhase, WireError> {
+        Ok(match b {
+            0 => SessionPhase::Lobby,
+            1 => SessionPhase::Running,
+            2 => SessionPhase::Closed,
+            _ => return Err(WireError::BadValue("session phase")),
+        })
+    }
+}
+
+/// Hash-arbitration verdict (SERVER-DESIGN.md §6.3), carried in `HASH_VERDICT`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HashVerdict {
+    /// This seat is in the majority (only sent on an explicit query).
+    Ok,
+    /// This seat diverged from the majority — enter resync (M9-B) / terminal
+    /// desync end (M9-A).
+    YouDiverged,
+    /// Arbitration pending (not enough seats have reported yet).
+    Wait,
+}
+
+impl HashVerdict {
+    fn to_byte(self) -> u8 {
+        match self {
+            HashVerdict::Ok => 0,
+            HashVerdict::YouDiverged => 1,
+            HashVerdict::Wait => 2,
+        }
+    }
+    fn from_byte(b: u8) -> Result<HashVerdict, WireError> {
+        Ok(match b {
+            0 => HashVerdict::Ok,
+            1 => HashVerdict::YouDiverged,
+            2 => HashVerdict::Wait,
+            _ => return Err(WireError::BadValue("hash verdict")),
+        })
+    }
+}
+
+/// One entry in a `SESS_LIST` page.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SessListEntry {
+    /// Server-assigned session id.
+    pub session_id: u32,
+    /// Session display name.
+    pub name: String,
+    /// Scenario filename.
+    pub map: String,
+    /// Seats currently occupied.
+    pub seats_taken: u8,
+    /// Total seats.
+    pub seats: u8,
+    /// Whether the session has already started (Running/Closed).
+    pub in_progress: bool,
+}
+
+/// One seat's authoritative lobby state in a `SESS_STATE`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SessSeat {
+    /// The seat id (== house id: the canonical bundle order).
+    pub seat: SeatId,
+    /// The player's display name.
+    pub name: String,
+    /// The house this seat plays.
+    pub house: u8,
+    /// Whether the seat has confirmed READY.
+    pub ready: bool,
+}
+
+/// A control record embedded in a `TICK_BUNDLE` tick (SERVER-DESIGN.md §6.2).
+/// Ordered with the command stream so every client applies it at the same tick.
+/// M9-A only reserves the slot; the sole typed record is the adaptive-delay
+/// `Timing` hook M9-B will emit. Unknown tags decode opaquely so a newer server
+/// can add records without a wire bump.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CtrlRecord {
+    /// Adaptive input-delay retune (§6.2, QUEUE.CPP:1440-1461): raise every
+    /// client's scheduler delay to `new_delay` at `effective_tick`.
+    Timing {
+        /// The new input delay in ticks.
+        new_delay: u8,
+        /// The tick the new delay takes effect on (all clients shift together).
+        effective_tick: Tick,
+    },
+    /// A control record whose tag this build does not know — carried opaquely
+    /// (forward compatibility for later relay control records).
+    Unknown {
+        /// The record's tag byte.
+        tag: u8,
+        /// Its opaque payload.
+        bytes: Vec<u8>,
+    },
+}
+
+/// One tick's canonical bundle inside a `TICK_BUNDLE` datagram: the tick, any
+/// embedded control records, and every seat's opaque command blobs in
+/// seat-ascending order. The relay assembles this; the client decodes the blobs
+/// into `Command`s to feed the sim.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BundleEntry {
+    /// The execution tick.
+    pub tick: Tick,
+    /// Ordered control records (empty in M9-A).
+    pub ctrl: Vec<CtrlRecord>,
+    /// Per-seat command blobs (`(seat, blobs)`), ascending by seat.
+    pub seats: Vec<(SeatId, Vec<Vec<u8>>)>,
+}
+
+/// Everything that crosses the wire: LAN v1 (discovery/lobby/lockstep/resync)
+/// and the v2 relay message set (SRV/SESS/TICK/HASH). LAN v1 layouts are
+/// unchanged from M8; the whole set shares one never-panic decode path.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Datagram {
     /// Host → broadcast: "a session exists here". `game_port` is the UDP port
@@ -261,6 +438,136 @@ pub enum Datagram {
         attempt: u8,
         /// Whether the loser loaded and hash-verified the snapshot.
         ok: bool,
+    },
+
+    // --- Wire v2 (M9-A relay, SERVER-DESIGN.md §4) --------------------------
+    /// C→S first contact. The server replies [`Datagram::SrvWelcome`] or
+    /// [`Datagram::Reject`].
+    SrvHello {
+        /// Client build version (server rejects mismatches).
+        game_version: u32,
+        /// Client-chosen nonce (echoed context; diagnostic).
+        client_nonce: u32,
+    },
+    /// S→C: connection accepted. `conn_id` is echoed in every later C→S message
+    /// (off-path spoof guard, §7.2).
+    SrvWelcome {
+        /// Server-chosen nonce.
+        server_nonce: u32,
+        /// The connection id the client must echo.
+        conn_id: u32,
+    },
+    /// C→S: create a lobby session; the creator gets seat 0 (settings authority).
+    SessCreate {
+        /// The client's `conn_id` (spoof guard).
+        conn_id: u32,
+        /// Session display name.
+        name: String,
+        /// Scenario filename.
+        map: String,
+        /// Seat count.
+        seats: u8,
+        /// Starting credits.
+        credits: i32,
+        /// World RNG seed.
+        seed: u32,
+        /// Content-catalog hash (rejects content-mismatched joiners, §4).
+        catalog_hash: u64,
+    },
+    /// C→S: request the session list.
+    SessListReq {
+        /// The client's `conn_id`.
+        conn_id: u32,
+    },
+    /// S→C: a capped page of open/known sessions.
+    SessList {
+        /// Up to [`MAX_SESSIONS_IN_LIST`] entries.
+        entries: Vec<SessListEntry>,
+    },
+    /// C→S: join a session; the server assigns the next free seat.
+    SessJoin {
+        /// The client's `conn_id`.
+        conn_id: u32,
+        /// The session to join.
+        session_id: u32,
+        /// The joiner's display name.
+        name: String,
+    },
+    /// S→C: authoritative lobby state, re-broadcast on every change (idempotent,
+    /// loss-tolerant — clients render it verbatim, §5).
+    SessState {
+        /// The session id.
+        session_id: u32,
+        /// Lifecycle phase.
+        phase: SessionPhase,
+        /// The settings-authority seat (seat 0 / creator).
+        host_seat: SeatId,
+        /// Lockstep input delay in ticks.
+        delay: u8,
+        /// World seed.
+        seed: u32,
+        /// Starting credits.
+        credits: i32,
+        /// Scenario filename.
+        map: String,
+        /// Every occupied seat's state, ascending by seat.
+        seats: Vec<SessSeat>,
+    },
+    /// C→S: ready toggle.
+    SessReady {
+        /// The client's `conn_id`.
+        conn_id: u32,
+        /// Ready or not.
+        ready: bool,
+    },
+    /// C→S or S→C: leave / kick / dissolve. `reason` reuses the leave/kick codes.
+    SessLeave {
+        /// The client's `conn_id` (0 when server-originated).
+        conn_id: u32,
+        /// Why (0 = player left; other codes = kick/dissolve reasons).
+        reason: u8,
+    },
+    /// S→C: all-ready → the game begins. Carries the seat→house map and the
+    /// initial (fixed, M9-A) input delay.
+    SessStart {
+        /// The session id.
+        session_id: u32,
+        /// The tick the game starts on (0 in M9-A).
+        start_tick: Tick,
+        /// Initial input delay in ticks.
+        input_delay: u8,
+        /// `(seat, house)` for every seat, ascending by seat.
+        seat_map: Vec<(SeatId, u8)>,
+    },
+    /// C→S: this client's own commands (redundant window), each command an
+    /// opaque blob stamped by the client's `InputScheduler` exactly as on LAN.
+    TickCmds {
+        /// The client's `conn_id`.
+        conn_id: u32,
+        /// `(tick, command blobs)` ascending by tick.
+        entries: Vec<(Tick, Vec<Vec<u8>>)>,
+    },
+    /// S→C: the canonical sequenced bundle (redundant window), all seats,
+    /// seat-ascending, with the embedded control-record slot (§6.1/§6.2).
+    TickBundle {
+        /// One [`BundleEntry`] per tick, ascending.
+        entries: Vec<BundleEntry>,
+    },
+    /// C→S: per-tick state hashes (redundant window), for arbitration (§6.3).
+    TickHash {
+        /// The client's `conn_id`.
+        conn_id: u32,
+        /// `(tick, hash)` ascending by tick.
+        entries: Vec<(Tick, u64)>,
+    },
+    /// S→C: arbitration result — only sent on dispute or explicit query (§6.3).
+    HashVerdictMsg {
+        /// The tick arbitrated.
+        tick: Tick,
+        /// The verdict for the recipient seat.
+        verdict: HashVerdict,
+        /// The winning (majority) hash.
+        majority_hash: u64,
     },
 }
 
@@ -681,6 +988,140 @@ pub(crate) fn get_command(r: &mut Reader) -> Result<Command, WireError> {
 }
 
 // ---------------------------------------------------------------------------
+// Wire v2 opaque command blobs + house accessor (SERVER-DESIGN.md §7)
+// ---------------------------------------------------------------------------
+
+/// Encode one `Command` to its opaque wire blob. The relay moves these bytes
+/// without decoding them; only the house field is read, via [`command_house`].
+pub fn encode_command(c: &Command) -> Vec<u8> {
+    let mut w = Writer(Vec::with_capacity(24));
+    put_command(&mut w, c);
+    w.0
+}
+
+/// Decode one command blob back into a `Command` (client side). Exact
+/// consumption — a blob holds exactly one command.
+pub fn decode_command(blob: &[u8]) -> Result<Command, WireError> {
+    let mut r = Reader { buf: blob, pos: 0 };
+    let c = get_command(&mut r)?;
+    r.done()?;
+    Ok(c)
+}
+
+/// The issuing house of an encoded command blob — the seat-house binding check
+/// the relay performs per command (§7.3) **without a `ra-sim` dependency at the
+/// call site** (the caller gets a `u8`). The per-tag offset knowledge stays here,
+/// in one place, per the M9-A brief.
+pub fn command_house(blob: &[u8]) -> Result<u8, WireError> {
+    let c = decode_command(blob)?;
+    Ok(match c {
+        Command::Move { house, .. }
+        | Command::Stop { house, .. }
+        | Command::Attack { house, .. }
+        | Command::Deploy { house, .. }
+        | Command::StartProduction { house, .. }
+        | Command::PlaceBuilding { house, .. }
+        | Command::CancelProduction { house, .. }
+        | Command::HoldProduction { house, .. }
+        | Command::Sell { house, .. }
+        | Command::Repair { house, .. }
+        | Command::Load { house, .. }
+        | Command::Unload { house, .. }
+        | Command::FireSuperWeapon { house, .. } => house,
+    })
+}
+
+/// Write a length-prefixed list of opaque command blobs (`TICK_CMDS`/
+/// `TICK_BUNDLE` per-seat payload).
+fn put_cmd_blobs(w: &mut Writer, blobs: &[Vec<u8>]) {
+    let m = blobs.len().min(MAX_CMDS_PER_TICK);
+    w.u16(m as u16);
+    for b in blobs.iter().take(MAX_CMDS_PER_TICK) {
+        let n = b.len().min(MAX_CMD_BLOB);
+        w.u16(n as u16);
+        w.0.extend_from_slice(&b[..n]);
+    }
+}
+
+fn get_cmd_blobs(r: &mut Reader) -> Result<Vec<Vec<u8>>, WireError> {
+    let m = r.u16()? as usize;
+    if m > MAX_CMDS_PER_TICK {
+        return Err(WireError::BadValue("cmd blob count"));
+    }
+    let mut blobs = Vec::with_capacity(m.min(256));
+    for _ in 0..m {
+        let n = r.u16()? as usize;
+        if n > MAX_CMD_BLOB {
+            return Err(WireError::BadValue("cmd blob len over cap"));
+        }
+        blobs.push(r.take(n)?.to_vec());
+    }
+    Ok(blobs)
+}
+
+/// Write a tick's embedded control records. Every record is length-prefixed so a
+/// decoder that does not know a tag can skip it (forward compatibility, §6.2).
+fn put_ctrl(w: &mut Writer, ctrl: &[CtrlRecord]) {
+    let n = ctrl.len().min(MAX_CTRL_PER_TICK);
+    w.u8(n as u8);
+    for c in ctrl.iter().take(MAX_CTRL_PER_TICK) {
+        match c {
+            CtrlRecord::Timing {
+                new_delay,
+                effective_tick,
+            } => {
+                w.u8(CTRL_TIMING);
+                w.u16(5); // payload: u8 + u32
+                w.u8(*new_delay);
+                w.u32(*effective_tick);
+            }
+            CtrlRecord::Unknown { tag, bytes } => {
+                w.u8(*tag);
+                let n = bytes.len().min(MAX_CTRL_PAYLOAD);
+                w.u16(n as u16);
+                w.0.extend_from_slice(&bytes[..n]);
+            }
+        }
+    }
+}
+
+fn get_ctrl(r: &mut Reader) -> Result<Vec<CtrlRecord>, WireError> {
+    let n = r.u8()? as usize;
+    if n > MAX_CTRL_PER_TICK {
+        return Err(WireError::BadValue("ctrl count over cap"));
+    }
+    let mut out = Vec::with_capacity(n);
+    for _ in 0..n {
+        let tag = r.u8()?;
+        let len = r.u16()? as usize;
+        if len > MAX_CTRL_PAYLOAD {
+            return Err(WireError::BadValue("ctrl payload over cap"));
+        }
+        let payload = r.take(len)?;
+        match tag {
+            CTRL_TIMING => {
+                let mut pr = Reader {
+                    buf: payload,
+                    pos: 0,
+                };
+                let new_delay = pr.u8()?;
+                let effective_tick = pr.u32()?;
+                pr.done()?;
+                out.push(CtrlRecord::Timing {
+                    new_delay,
+                    effective_tick,
+                });
+            }
+            _ => out.push(CtrlRecord::Unknown {
+                tag,
+                bytes: payload.to_vec(),
+            }),
+        }
+    }
+    Ok(out)
+}
+
+// ---------------------------------------------------------------------------
 // Datagram encode/decode
 // ---------------------------------------------------------------------------
 
@@ -803,6 +1244,166 @@ pub fn encode_with_protocol(d: &Datagram, protocol: u16) -> Vec<u8> {
             w.u8(T_SNAP_DONE);
             w.u8(*attempt);
             w.u8(*ok as u8);
+        }
+        Datagram::SrvHello {
+            game_version,
+            client_nonce,
+        } => {
+            w.u8(T_SRV_HELLO);
+            w.u32(*game_version);
+            w.u32(*client_nonce);
+        }
+        Datagram::SrvWelcome {
+            server_nonce,
+            conn_id,
+        } => {
+            w.u8(T_SRV_WELCOME);
+            w.u32(*server_nonce);
+            w.u32(*conn_id);
+        }
+        Datagram::SessCreate {
+            conn_id,
+            name,
+            map,
+            seats,
+            credits,
+            seed,
+            catalog_hash,
+        } => {
+            w.u8(T_SESS_CREATE);
+            w.u32(*conn_id);
+            w.str8(name, MAX_NAME);
+            w.str8(map, MAX_MAP_NAME);
+            w.u8(*seats);
+            w.i32(*credits);
+            w.u32(*seed);
+            w.u64(*catalog_hash);
+        }
+        Datagram::SessListReq { conn_id } => {
+            w.u8(T_SESS_LIST_REQ);
+            w.u32(*conn_id);
+        }
+        Datagram::SessList { entries } => {
+            w.u8(T_SESS_LIST);
+            let n = entries.len().min(MAX_SESSIONS_IN_LIST);
+            w.u8(n as u8);
+            for e in entries.iter().take(MAX_SESSIONS_IN_LIST) {
+                w.u32(e.session_id);
+                w.str8(&e.name, MAX_NAME);
+                w.str8(&e.map, MAX_MAP_NAME);
+                w.u8(e.seats_taken);
+                w.u8(e.seats);
+                w.u8(e.in_progress as u8);
+            }
+        }
+        Datagram::SessJoin {
+            conn_id,
+            session_id,
+            name,
+        } => {
+            w.u8(T_SESS_JOIN);
+            w.u32(*conn_id);
+            w.u32(*session_id);
+            w.str8(name, MAX_NAME);
+        }
+        Datagram::SessState {
+            session_id,
+            phase,
+            host_seat,
+            delay,
+            seed,
+            credits,
+            map,
+            seats,
+        } => {
+            w.u8(T_SESS_STATE);
+            w.u32(*session_id);
+            w.u8(phase.to_byte());
+            w.u8(*host_seat);
+            w.u8(*delay);
+            w.u32(*seed);
+            w.i32(*credits);
+            w.str8(map, MAX_MAP_NAME);
+            let n = seats.len().min(MAX_SEATS);
+            w.u8(n as u8);
+            for s in seats.iter().take(MAX_SEATS) {
+                w.u8(s.seat);
+                w.str8(&s.name, MAX_NAME);
+                w.u8(s.house);
+                w.u8(s.ready as u8);
+            }
+        }
+        Datagram::SessReady { conn_id, ready } => {
+            w.u8(T_SESS_READY);
+            w.u32(*conn_id);
+            w.u8(*ready as u8);
+        }
+        Datagram::SessLeave { conn_id, reason } => {
+            w.u8(T_SESS_LEAVE);
+            w.u32(*conn_id);
+            w.u8(*reason);
+        }
+        Datagram::SessStart {
+            session_id,
+            start_tick,
+            input_delay,
+            seat_map,
+        } => {
+            w.u8(T_SESS_START);
+            w.u32(*session_id);
+            w.u32(*start_tick);
+            w.u8(*input_delay);
+            let n = seat_map.len().min(MAX_SEATS);
+            w.u8(n as u8);
+            for (seat, house) in seat_map.iter().take(MAX_SEATS) {
+                w.u8(*seat);
+                w.u8(*house);
+            }
+        }
+        Datagram::TickCmds { conn_id, entries } => {
+            w.u8(T_TICK_CMDS);
+            w.u32(*conn_id);
+            let n = entries.len().min(MAX_TICK_ENTRIES);
+            w.u8(n as u8);
+            for (tick, blobs) in entries.iter().take(MAX_TICK_ENTRIES) {
+                w.u32(*tick);
+                put_cmd_blobs(&mut w, blobs);
+            }
+        }
+        Datagram::TickBundle { entries } => {
+            w.u8(T_TICK_BUNDLE);
+            let n = entries.len().min(MAX_TICK_ENTRIES);
+            w.u8(n as u8);
+            for e in entries.iter().take(MAX_TICK_ENTRIES) {
+                w.u32(e.tick);
+                put_ctrl(&mut w, &e.ctrl);
+                let ns = e.seats.len().min(MAX_SEATS);
+                w.u8(ns as u8);
+                for (seat, blobs) in e.seats.iter().take(MAX_SEATS) {
+                    w.u8(*seat);
+                    put_cmd_blobs(&mut w, blobs);
+                }
+            }
+        }
+        Datagram::TickHash { conn_id, entries } => {
+            w.u8(T_TICK_HASH);
+            w.u32(*conn_id);
+            let n = entries.len().min(MAX_TICK_ENTRIES);
+            w.u8(n as u8);
+            for (tick, hash) in entries.iter().take(MAX_TICK_ENTRIES) {
+                w.u32(*tick);
+                w.u64(*hash);
+            }
+        }
+        Datagram::HashVerdictMsg {
+            tick,
+            verdict,
+            majority_hash,
+        } => {
+            w.u8(T_HASH_VERDICT);
+            w.u32(*tick);
+            w.u8(verdict.to_byte());
+            w.u64(*majority_hash);
         }
     }
     w.0
@@ -929,6 +1530,170 @@ pub fn decode(buf: &[u8]) -> Result<Datagram, WireError> {
                 1 => true,
                 _ => return Err(WireError::BadValue("snapshot done flag")),
             },
+        },
+        T_SRV_HELLO => Datagram::SrvHello {
+            game_version: r.u32()?,
+            client_nonce: r.u32()?,
+        },
+        T_SRV_WELCOME => Datagram::SrvWelcome {
+            server_nonce: r.u32()?,
+            conn_id: r.u32()?,
+        },
+        T_SESS_CREATE => Datagram::SessCreate {
+            conn_id: r.u32()?,
+            name: r.str8(MAX_NAME)?,
+            map: r.str8(MAX_MAP_NAME)?,
+            seats: r.u8()?,
+            credits: r.i32()?,
+            seed: r.u32()?,
+            catalog_hash: r.u64()?,
+        },
+        T_SESS_LIST_REQ => Datagram::SessListReq { conn_id: r.u32()? },
+        T_SESS_LIST => {
+            let n = r.u8()? as usize;
+            if n > MAX_SESSIONS_IN_LIST {
+                return Err(WireError::BadValue("session list count"));
+            }
+            let mut entries = Vec::with_capacity(n);
+            for _ in 0..n {
+                entries.push(SessListEntry {
+                    session_id: r.u32()?,
+                    name: r.str8(MAX_NAME)?,
+                    map: r.str8(MAX_MAP_NAME)?,
+                    seats_taken: r.u8()?,
+                    seats: r.u8()?,
+                    in_progress: match r.u8()? {
+                        0 => false,
+                        1 => true,
+                        _ => return Err(WireError::BadValue("in_progress flag")),
+                    },
+                });
+            }
+            Datagram::SessList { entries }
+        }
+        T_SESS_JOIN => Datagram::SessJoin {
+            conn_id: r.u32()?,
+            session_id: r.u32()?,
+            name: r.str8(MAX_NAME)?,
+        },
+        T_SESS_STATE => {
+            let session_id = r.u32()?;
+            let phase = SessionPhase::from_byte(r.u8()?)?;
+            let host_seat = r.u8()?;
+            let delay = r.u8()?;
+            let seed = r.u32()?;
+            let credits = r.i32()?;
+            let map = r.str8(MAX_MAP_NAME)?;
+            let n = r.u8()? as usize;
+            if n > MAX_SEATS {
+                return Err(WireError::BadValue("sess_state seat count"));
+            }
+            let mut seats = Vec::with_capacity(n);
+            for _ in 0..n {
+                seats.push(SessSeat {
+                    seat: r.u8()?,
+                    name: r.str8(MAX_NAME)?,
+                    house: r.u8()?,
+                    ready: match r.u8()? {
+                        0 => false,
+                        1 => true,
+                        _ => return Err(WireError::BadValue("ready flag")),
+                    },
+                });
+            }
+            Datagram::SessState {
+                session_id,
+                phase,
+                host_seat,
+                delay,
+                seed,
+                credits,
+                map,
+                seats,
+            }
+        }
+        T_SESS_READY => Datagram::SessReady {
+            conn_id: r.u32()?,
+            ready: match r.u8()? {
+                0 => false,
+                1 => true,
+                _ => return Err(WireError::BadValue("ready flag")),
+            },
+        },
+        T_SESS_LEAVE => Datagram::SessLeave {
+            conn_id: r.u32()?,
+            reason: r.u8()?,
+        },
+        T_SESS_START => {
+            let session_id = r.u32()?;
+            let start_tick = r.u32()?;
+            let input_delay = r.u8()?;
+            let n = r.u8()? as usize;
+            if n > MAX_SEATS {
+                return Err(WireError::BadValue("sess_start seat count"));
+            }
+            let mut seat_map = Vec::with_capacity(n);
+            for _ in 0..n {
+                seat_map.push((r.u8()?, r.u8()?));
+            }
+            Datagram::SessStart {
+                session_id,
+                start_tick,
+                input_delay,
+                seat_map,
+            }
+        }
+        T_TICK_CMDS => {
+            let conn_id = r.u32()?;
+            let n = r.u8()? as usize;
+            if n > MAX_TICK_ENTRIES {
+                return Err(WireError::BadValue("tick_cmds entry count"));
+            }
+            let mut entries = Vec::with_capacity(n);
+            for _ in 0..n {
+                let tick = r.u32()?;
+                entries.push((tick, get_cmd_blobs(&mut r)?));
+            }
+            Datagram::TickCmds { conn_id, entries }
+        }
+        T_TICK_BUNDLE => {
+            let n = r.u8()? as usize;
+            if n > MAX_TICK_ENTRIES {
+                return Err(WireError::BadValue("tick_bundle entry count"));
+            }
+            let mut entries = Vec::with_capacity(n);
+            for _ in 0..n {
+                let tick = r.u32()?;
+                let ctrl = get_ctrl(&mut r)?;
+                let ns = r.u8()? as usize;
+                if ns > MAX_SEATS {
+                    return Err(WireError::BadValue("tick_bundle seat count"));
+                }
+                let mut seats = Vec::with_capacity(ns);
+                for _ in 0..ns {
+                    let seat = r.u8()?;
+                    seats.push((seat, get_cmd_blobs(&mut r)?));
+                }
+                entries.push(BundleEntry { tick, ctrl, seats });
+            }
+            Datagram::TickBundle { entries }
+        }
+        T_TICK_HASH => {
+            let conn_id = r.u32()?;
+            let n = r.u8()? as usize;
+            if n > MAX_TICK_ENTRIES {
+                return Err(WireError::BadValue("tick_hash entry count"));
+            }
+            let mut entries = Vec::with_capacity(n);
+            for _ in 0..n {
+                entries.push((r.u32()?, r.u64()?));
+            }
+            Datagram::TickHash { conn_id, entries }
+        }
+        T_HASH_VERDICT => Datagram::HashVerdictMsg {
+            tick: r.u32()?,
+            verdict: HashVerdict::from_byte(r.u8()?)?,
+            majority_hash: r.u64()?,
         },
         t => return Err(WireError::UnknownType(t)),
     };
